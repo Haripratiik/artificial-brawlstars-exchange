@@ -28,6 +28,9 @@ POLICY = DataPolicy(min_sample_size=1_000, min_stratum_battles=200, min_strata_c
 
 SPIKE = Single(MetricRef(metric="adjusted_win_rate", subject="SPIKE"))
 CROW = Single(MetricRef(metric="adjusted_win_rate", subject="CROW"))
+# Performance relative to each stratum's mechanically-pinned baseline. Zero means
+# "exactly average wherever it was played", under any weighting and any rotation.
+LIFT = Single(MetricRef(metric="adjusted_win_rate_lift", subject="SPIKE"))
 
 
 def spec(contract_id, underlying, payoff, window) -> ContractSpec:
@@ -82,10 +85,14 @@ def main() -> None:
         )
         diagnostics = dict(future.resolutions[0].diagnostics)
 
+        lift = settle(
+            spec("SPIKE_WR_LIFT", LIFT, Linear(scale=10_000.0), window), oracle
+        )
         print(
             f"{label}  future {future.settlement_value:>9}"
             f"   binary(>0.54) {binary.settlement_value:>4}"
             f"   spread {spread.settlement_value:>9}"
+            f"   lift {lift.settlement_value:>8}"
         )
         print(
             f"            level {future.underlying_level:.6f}"

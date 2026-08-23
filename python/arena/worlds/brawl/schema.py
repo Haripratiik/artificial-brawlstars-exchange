@@ -36,6 +36,7 @@ FIELDS = (
     "trophy_bucket",
     "brawler_battles",
     "brawler_wins",
+    "brawler_draws",
     "stratum_battles",
     "stratum_slots",
     "source_id",
@@ -83,6 +84,12 @@ class AggregateRow:
     trophy_bucket: str
     brawler_battles: int
     brawler_wins: int
+    # Draws are stored separately rather than folded into wins or losses,
+    # because the scoring convention is a decision the metric makes, not one
+    # the collector should bake in. Scoring them as half a win is what keeps a
+    # mode's pooled rate independent of its draw rate -- see
+    # :mod:`arena.worlds.brawl.modes`.
+    brawler_draws: int
     stratum_battles: int
     stratum_slots: int
     source_id: str
@@ -100,12 +107,18 @@ class AggregateRow:
                 f"{self.window_end.isoformat()}; an aggregate cannot be knowable "
                 "before the battles it summarizes have happened"
             )
-        if self.brawler_wins > self.brawler_battles:
+        if self.brawler_wins + self.brawler_draws > self.brawler_battles:
             raise ValueError(
-                f"{self.brawler_id}: {self.brawler_wins} wins in "
-                f"{self.brawler_battles} battles"
+                f"{self.brawler_id}: {self.brawler_wins} wins and {self.brawler_draws} "
+                f"draws in only {self.brawler_battles} battles"
             )
-        for label in ("brawler_battles", "brawler_wins", "stratum_battles", "stratum_slots"):
+        for label in (
+            "brawler_battles",
+            "brawler_wins",
+            "brawler_draws",
+            "stratum_battles",
+            "stratum_slots",
+        ):
             if getattr(self, label) < 0:
                 raise ValueError(f"{label} cannot be negative")
         if self.brawler_battles > self.stratum_slots:
@@ -130,6 +143,7 @@ class AggregateRow:
             trophy_bucket=record["trophy_bucket"],
             brawler_battles=int(record["brawler_battles"]),
             brawler_wins=int(record["brawler_wins"]),
+            brawler_draws=int(record["brawler_draws"]),
             stratum_battles=int(record["stratum_battles"]),
             stratum_slots=int(record["stratum_slots"]),
             source_id=record["source_id"],
@@ -146,6 +160,7 @@ class AggregateRow:
             "trophy_bucket": self.trophy_bucket,
             "brawler_battles": self.brawler_battles,
             "brawler_wins": self.brawler_wins,
+            "brawler_draws": self.brawler_draws,
             "stratum_battles": self.stratum_battles,
             "stratum_slots": self.stratum_slots,
             "source_id": self.source_id,

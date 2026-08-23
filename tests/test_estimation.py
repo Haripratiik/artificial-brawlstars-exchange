@@ -18,6 +18,7 @@ from arena.worlds.brawl.estimation import (
     estimate_priors,
     estimate_prior_strength,
     estimate_weights,
+    mechanical_gaps,
     sweep_prior_strength,
 )
 from arena.worlds.brawl.schema import StratumKey
@@ -119,19 +120,81 @@ def test_weights_need_slots():
 # --------------------------------------------------------------------------
 
 
-def test_mode_prior_recovers_the_modes_own_baseline(dataset):
-    """Nobody tells the estimator that Showdown scores 'top four of ten'.
+def test_mode_priors_come_from_the_rules_not_the_data(dataset):
+    """A 3v3 puts 3 of 6 slots on the winning side. That is arithmetic.
 
-    The fixture generates Showdown around 0.4 and team modes around 0.5. The
-    estimator has to find that from the data, which is the whole reason priors
-    are estimated rather than asserted.
+    Because a battlelog names every participant, the pooled win rate over all
+    brawlers is forced by the mode's rules: 0.500 for 3v3, 0.450 for Showdown
+    under the half-draw convention. An exact constant beats any estimate of the
+    same quantity, so it is used directly rather than fitted.
     """
     rows = [row for row in dataset if row.observed_at <= AS_OF]
     _stratum_priors, mode_priors = estimate_priors(rows)
 
-    assert mode_priors["showdown"] == pytest.approx(0.41, abs=0.03)
-    assert mode_priors["gemGrab"] == pytest.approx(0.52, abs=0.03)
-    assert mode_priors["showdown"] < mode_priors["gemGrab"] - 0.05
+    assert mode_priors["gemGrab"] == 0.5
+    assert mode_priors["brawlBall"] == 0.5
+    assert mode_priors["soloShowdown"] == 0.45
+
+
+def test_observed_baseline_can_be_recovered_for_comparison(dataset):
+    """``use_mechanical=False`` falls back to the data, which is how the gap is seen."""
+    rows = [row for row in dataset if row.observed_at <= AS_OF]
+    _stratum, observed = estimate_priors(rows, use_mechanical=False)
+
+    # The fixture holds four deliberately above-average brawlers, not the whole
+    # roster, so its pooled rate must sit above the mechanical 0.5. On a corpus
+    # covering every brawler the two would coincide.
+    assert observed["gemGrab"] > 0.5
+    assert observed["soloShowdown"] < observed["gemGrab"]
+
+
+def test_mechanical_gap_is_reported(dataset):
+    """The gap is a free, exact check on the whole aggregation pipeline.
+
+    Over a corpus covering every brawler it must be ~0. A non-zero gap means
+    participants dropped from battles, battles double counted, or draws scored
+    as losses -- and nothing else in the project catches those.
+    """
+    rows = [row for row in dataset if row.observed_at <= AS_OF]
+    gaps = mechanical_gaps(rows)
+
+    assert set(gaps) == {"gemGrab", "brawlBall", "soloShowdown"}
+    # Positive here precisely because the fixture is a partial, above-average
+    # roster. That is the diagnostic working, not failing.
+    assert gaps["gemGrab"] > 0.0
+
+
+def test_unknown_mode_has_no_mechanical_baseline():
+    """A mode we have not characterized falls back to an estimate, not a guess."""
+    from arena.worlds.brawl.modes import mechanical_baseline
+
+    assert mechanical_baseline("gemGrab") == 0.5
+    assert mechanical_baseline("someFutureMode") is None
+
+    # Solo and Duo Showdown do NOT share a baseline, which is easy to assume and
+    # wrong. Both seat ten players, but Solo draws exactly one slot (rank 5)
+    # while Duo draws a whole team of two (3rd of five), so:
+    #   solo  (4 wins + 1 draw / 2) / 10 = 0.450
+    #   duo   (4 wins + 2 draws / 2) / 10 = 0.500
+    assert mechanical_baseline("soloShowdown") == 0.45
+    assert mechanical_baseline("duoShowdown") == 0.50
+
+
+def test_half_draw_scoring_is_invariant_to_the_draw_rate():
+    """The reason draws are scored as half a win rather than as a loss.
+
+    Under the half-draw convention a 3v3 population scores exactly 0.5 however
+    often draws occur. Scoring them as losses gives (1-d)/2, so a brawler's
+    measured performance would move when the meta turned defensive even though
+    the brawler had not changed.
+    """
+    from arena.worlds.brawl.modes import score
+
+    for draw_rate in (0.0, 0.05, 0.2, 0.5):
+        battles = 1_000
+        draws = int(battles * draw_rate)
+        wins = (battles - draws) // 2
+        assert score(wins, draws, battles) == pytest.approx(0.5)
 
 
 def test_stratum_priors_are_pooled_toward_their_mode(dataset):

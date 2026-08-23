@@ -105,7 +105,20 @@ class _Cell:
     stratum: StratumKey
     battles: int
     wins: int
+    draws: int
     slots: int
+
+    @property
+    def scored_wins(self) -> float:
+        """Wins under the half-draw convention.
+
+        Scoring a draw as half a win is what makes a mode's pooled rate
+        independent of how often draws occur. Under the alternative -- draw
+        counts as a loss -- a 3v3 mode's population win rate is (1-d)/2, so a
+        brawler's measured performance would move when the meta got more
+        defensive even though the brawler had not changed.
+        """
+        return self.wins + 0.5 * self.draws
 
 
 def _collapse(rows: Iterable[AggregateRow]) -> dict[StratumKey, _Cell]:
@@ -116,17 +129,17 @@ def _collapse(rows: Iterable[AggregateRow]) -> dict[StratumKey, _Cell]:
     sub-window ratios, and the former is correct: every battle should carry
     equal weight regardless of which week it landed in.
     """
-    totals: dict[StratumKey, tuple[int, int, int]] = {}
+    totals: dict[StratumKey, tuple[int, int, int, int]] = {}
     for row in rows:
-        battles, wins, slots = totals.get(row.stratum, (0, 0, 0))
+        battles, wins, draws, slots = totals.get(row.stratum, (0, 0, 0, 0))
         totals[row.stratum] = (
             battles + row.brawler_battles,
             wins + row.brawler_wins,
+            draws + row.brawler_draws,
             slots + row.stratum_slots,
         )
     return {
-        stratum: _Cell(stratum, values[0], values[1], values[2])
-        for stratum, values in totals.items()
+        stratum: _Cell(stratum, *values) for stratum, values in totals.items()
     }
 
 
@@ -149,13 +162,14 @@ def raw_win_rate(
     battles = sum(cell.battles for cell in cells.values())
     if battles == 0:
         raise InsufficientEvidence("no battles observed")
-    wins = sum(cell.wins for cell in cells.values())
+    scored = sum(cell.scored_wins for cell in cells.values())
     return MetricOutcome(
-        value=wins / battles,
+        value=scored / battles,
         sample_size=battles,
         diagnostics=(
             ("metric", "raw_win_rate"),
             ("strata_observed", len(cells)),
+            ("draws", sum(cell.draws for cell in cells.values())),
             ("standardized", False),
         ),
     )
@@ -204,7 +218,7 @@ def adjusted_win_rate(
             # Shrink toward the stratum's neutral point. With strength 0 this is
             # the plain rate; as strength grows a thin cell is pulled to the
             # prior and stops contributing spurious signal.
-            value = (cell.wins + strength * prior) / (cell.battles + strength)
+            value = (cell.scored_wins + strength * prior) / (cell.battles + strength)
             covered_weight += weight
             battles_used += cell.battles
             evidenced += 1
@@ -215,7 +229,7 @@ def adjusted_win_rate(
         else:
             continue
 
-        contributing.append((stratum.key, weight, value))
+        contributing.append((stratum.key, weight, value, prior))
 
     if not contributing:
         raise InsufficientEvidence(
@@ -231,8 +245,15 @@ def adjusted_win_rate(
             f"{min_coverage:.4f} required",
         )
 
-    numerator = stable_sum(weight * value for _key, weight, value in sorted(contributing))
-    denominator = stable_sum(weight for _key, weight, _value in sorted(contributing))
+    ordered = sorted(contributing)
+    denominator = stable_sum(weight for _key, weight, _value, _prior in ordered)
+    numerator = stable_sum(weight * value for _key, weight, value, _prior in ordered)
+
+    # What an exactly-average brawler would have scored, over precisely the
+    # strata that contributed. Computed here rather than reconstructed later so
+    # that the lift metric can subtract it exactly under either missing-strata
+    # policy, including the one where the contributing subset is data-dependent.
+    neutral = stable_sum(weight * prior for _key, weight, _value, prior in ordered) / denominator
 
     # The reported sample size counts ONLY battles that carried evidence.
     # Counting imputed or out-of-universe strata here would let a contract clear
@@ -249,6 +270,8 @@ def adjusted_win_rate(
             ("coverage", coverage),
             ("battles_used", battles_used),
             ("battles_observed", sum(cell.battles for cell in observed.values())),
+            ("draws_observed", sum(cell.draws for cell in observed.values())),
+            ("neutral_level", neutral),
             ("prior_strength", reference.prior_strength),
             ("standardized", True),
         ),
@@ -338,10 +361,71 @@ def use_rate(
     )
 
 
+def adjusted_win_rate_lift(
+    rows: Sequence[AggregateRow],
+    reference: ReferenceSnapshot,
+    *,
+    min_stratum_battles: int = 0,
+    min_coverage: float = 0.0,
+    missing_strata: str = MissingStrata.IMPUTE_FROM_PRIOR,
+) -> MetricOutcome:
+    """Standardized performance *relative to each stratum's baseline*.
+
+        lift = sum_s omega_s * (p_hat_s - m_s)
+
+    Zero means "exactly average wherever it was played". Positive means the
+    brawler beat the baseline of the strata it appeared in.
+
+    **Why this exists, and why it is the better settlement metric.**
+
+    Mode baselines are not equal and not arbitrary: the rules force a 3v3
+    pooled win rate of 0.500 and a Showdown one of 0.450. So a plain adjusted
+    win rate has a neutral point of ``sum_s omega_s * m_s`` -- a number that
+    moves whenever the *mode mix* moves. Since Supercell rotates maps and modes
+    continuously, a contract written on the plain rate would have its par level
+    drift with the rotation, and a trader holding it would be partly pricing
+    the event schedule rather than the brawler.
+
+    Subtracting each stratum's baseline removes that entirely. A brawler who is
+    exactly average scores 0 under *any* weighting and *any* rotation, so the
+    contract isolates the thing it claims to measure. It also makes the
+    slots-versus-battles weight basis a second-order choice: the basis still
+    scales how much each stratum contributes, but it can no longer move the
+    neutral point.
+
+    The trade-off is interpretability -- "+0.021" is less immediately readable
+    than "0.531" -- which a Linear payoff scale fixes at contract level.
+    """
+    base = adjusted_win_rate(
+        rows,
+        reference,
+        min_stratum_battles=min_stratum_battles,
+        min_coverage=min_coverage,
+        missing_strata=missing_strata,
+    )
+
+    # ``adjusted_win_rate`` reports the neutral point over exactly the strata
+    # that contributed, so the subtraction is exact under either missing-strata
+    # policy -- including the one where the contributing subset depends on which
+    # strata happened to be observed.
+    neutral = dict(base.diagnostics)["neutral_level"]
+
+    return MetricOutcome(
+        value=base.value - neutral,
+        sample_size=base.sample_size,
+        diagnostics=(
+            ("metric", "adjusted_win_rate_lift"),
+            ("absolute_level", base.value),
+            *(pair for pair in base.diagnostics if pair[0] != "metric"),
+        ),
+    )
+
+
 # The registry the oracle dispatches on. A contract naming a metric outside this
 # mapping fails at resolution rather than silently measuring something adjacent.
 METRICS = {
     "raw_win_rate": raw_win_rate,
     "adjusted_win_rate": adjusted_win_rate,
+    "adjusted_win_rate_lift": adjusted_win_rate_lift,
     "use_rate": use_rate,
 }

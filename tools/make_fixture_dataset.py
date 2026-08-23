@@ -43,6 +43,7 @@ FIELDS = (
     "trophy_bucket",
     "brawler_battles",
     "brawler_wins",
+    "brawler_draws",
     "stratum_battles",
     "stratum_slots",
     "source_id",
@@ -51,12 +52,21 @@ FIELDS = (
 # Slots offered per battle. A 3v3 battle puts six brawlers on the field; a
 # showdown puts ten. This is the use-rate denominator and getting it wrong
 # rescales every use rate in the mode.
-SLOTS_PER_BATTLE = {"gemGrab": 6, "brawlBall": 6, "showdown": 10}
+SLOTS_PER_BATTLE = {"gemGrab": 6, "brawlBall": 6, "soloShowdown": 10}
+
+# How often a battle ends without a decisive result for a given brawler. In 3v3
+# a genuine draw is uncommon; in Solo Showdown exactly one of ten slots (rank 5)
+# is scored as a draw by the game's own rules, so it is far from rare.
+#
+# The fixture emits draws because the metric scores them as half a win, and
+# that convention is what makes a mode's pooled rate independent of its draw
+# rate. A fixture with no draws could not exercise it.
+DRAW_RATE = {"gemGrab": 0.035, "brawlBall": 0.045, "soloShowdown": 0.10}
 
 MAPS = {
     "gemGrab": ("HardRockMine", "DoubleSwoosh", "UndermineGG"),
     "brawlBall": ("BackyardBowl", "PinholePunt", "SneakySneak"),
-    "showdown": ("SkullCreek", "FeastOrFamine", "RockwallBrawl"),
+    "soloShowdown": ("SkullCreek", "FeastOrFamine", "RockwallBrawl"),
 }
 
 TROPHY_BUCKETS = ("low", "mid", "high")
@@ -72,16 +82,16 @@ BRAWLERS = ("SPIKE", "CROW", "ELPRIMO", "PIPER")
 BASE_WIN_RATE = {
     ("SPIKE", "gemGrab"): 0.558,
     ("SPIKE", "brawlBall"): 0.531,
-    ("SPIKE", "showdown"): 0.421,
+    ("SPIKE", "soloShowdown"): 0.421,
     ("CROW", "gemGrab"): 0.512,
     ("CROW", "brawlBall"): 0.487,
-    ("CROW", "showdown"): 0.446,
+    ("CROW", "soloShowdown"): 0.446,
     ("ELPRIMO", "gemGrab"): 0.494,
     ("ELPRIMO", "brawlBall"): 0.547,
-    ("ELPRIMO", "showdown"): 0.388,
+    ("ELPRIMO", "soloShowdown"): 0.388,
     ("PIPER", "gemGrab"): 0.523,
     ("PIPER", "brawlBall"): 0.502,
-    ("PIPER", "showdown"): 0.412,
+    ("PIPER", "soloShowdown"): 0.412,
 }
 
 # Per-map deviation, so standardization weights actually change the answer.
@@ -136,11 +146,11 @@ COLLECTION_LAG = timedelta(days=2)
 # either side of it, which is what makes the fixture usable for an event study
 # rather than only for settlement tests.
 PATCH_WEEK = ESTIMATION_WEEKS + 4
-PATCH_EFFECT = {"gemGrab": -0.032, "brawlBall": -0.024, "showdown": -0.006}
+PATCH_EFFECT = {"gemGrab": -0.032, "brawlBall": -0.024, "soloShowdown": -0.006}
 
 # A stratum kept deliberately starved so coverage and per-stratum thresholds
 # have something real to exclude.
-STARVED = ("showdown", "RockwallBrawl", "high")
+STARVED = ("soloShowdown", "RockwallBrawl", "high")
 
 # A map that enters rotation only once the trading period starts, so it does not
 # exist during the estimation window and therefore carries no weight in any
@@ -203,7 +213,16 @@ def main() -> None:
                 if appearances == 0:
                     continue
                 rate = true_win_rate(brawler, mode, map_id, bucket, week)
-                wins = rng.binomialvariate(appearances, rate)
+                # Draws first, then wins among the decisive battles. The
+                # conditional win probability is set so that the half-draw
+                # score -- (wins + draws/2) / battles -- recovers `rate`,
+                # which is what makes the fixture's true rates comparable to
+                # what the metric reports.
+                draw_rate = DRAW_RATE[mode]
+                draws = rng.binomialvariate(appearances, draw_rate)
+                decisive = appearances - draws
+                conditional = (rate - 0.5 * draw_rate) / (1.0 - draw_rate)
+                wins = rng.binomialvariate(decisive, min(max(conditional, 0.0), 1.0))
                 rows.append(
                     {
                         "observed_at": _fmt(observed_at),
@@ -215,6 +234,7 @@ def main() -> None:
                         "trophy_bucket": bucket,
                         "brawler_battles": appearances,
                         "brawler_wins": wins,
+                        "brawler_draws": draws,
                         "stratum_battles": stratum_battles,
                         "stratum_slots": stratum_slots,
                         "source_id": SOURCE_ID,

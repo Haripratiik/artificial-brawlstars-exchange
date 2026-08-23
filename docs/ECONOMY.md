@@ -122,6 +122,33 @@ for comparison, is part of the contract's digest, and is not recommended.
 would assert the brawler is never picked there, and unlike a win rate there is no mechanically
 pinned baseline to shrink toward.
 
+### `adjusted_win_rate_lift` — the recommended settlement metric
+
+```
+lift = Σ_s ω_s (p̂_s − m_s)
+```
+
+Zero means "exactly average wherever it was played."
+
+**Why it should carry the flagship contract.** Mode baselines are unequal and pinned by the rules
+(0.500 for 3v3, 0.450 for Solo Showdown). So a plain adjusted rate has a neutral point of
+`Σ ω_s m_s` — a number that moves whenever the *mode mix* moves. Supercell rotates maps and modes
+continuously, so a contract on the plain rate would have its par level drift with the rotation, and
+a trader holding it would be partly pricing the event schedule rather than the brawler.
+
+Subtracting each stratum's baseline removes that. A brawler who is exactly average scores 0 under
+any weighting and any rotation, so the contract isolates what it claims to measure. It also demotes
+the slots-versus-battles question: the basis still scales each stratum's contribution, but can no
+longer move the neutral point.
+
+On the fixture the difference is stark. Across the patch, the absolute future moves 4838 → 4669,
+mixing Spike's nerf with the mode composition. The lift moves **+110.75 → −58.25** — Spike crossing
+cleanly from above-average to below.
+
+The neutral point is computed inside `adjusted_win_rate` over exactly the strata that contributed
+and exposed as the `neutral_level` diagnostic, so the subtraction is exact under either
+missing-strata policy rather than reconstructed approximately afterwards.
+
 The order matters. Shrink first — each stratum's estimate is improved using its own evidence.
 Then weight — composition is imposed from outside.
 
@@ -151,6 +178,49 @@ picked it — not the noise artifact a zero win rate would be. Shrinking it woul
 separately as `battles_observed`. This matters because the engine checks `min_sample_size`
 against it: counting excluded evidence would let a contract clear its evidential bar on data the
 metric deliberately threw away. (In the fixture that gap is ~22,000 battles out of ~271,000.)
+
+---
+
+## 3b. What the game's rules pin exactly
+
+Most of a metagame is empirical. A few things are not, and separating them out turns out to matter
+more than anything else in this layer.
+
+A battlelog names **every** participant, not just the player whose log it is. So for any battle we
+observe, we observe the full outcome distribution across its slots:
+
+| Mode | Slots | Win | Draw | Lose | Pooled rate |
+|---|---:|---:|---:|---:|---:|
+| 3v3 (all objectives) | 6 | 3 | — | 3 | **0.500** |
+| Solo Showdown | 10 | ranks 1–4 | rank 5 | 6–10 | **0.450** |
+| Duo Showdown | 10 (5 teams) | top 2 teams | 3rd team | 4th–5th | **0.500** |
+
+Pooled over *all* brawlers, the win rate is arithmetic, not an estimate.
+
+Solo and Duo do **not** share a baseline, which is easy to assume and wrong: both seat ten
+players, but Solo draws exactly one slot while Duo draws a whole team of two.
+
+### The half-draw convention
+
+Draws are scored as half a win. This is not a preference — it is the only scoring under which a
+mode's pooled rate is independent of its draw rate. Scoring a draw as a loss gives 3v3 a pooled
+rate of `(1−d)/2`, so a brawler's measured performance would move when the metagame turned more
+defensive *even though the brawler had not changed*. A settlement metric may not have that
+property. Draws are therefore stored as their own column, and the scoring convention lives in the
+metric rather than in the collector.
+
+### Two consequences
+
+**Mode priors are taken from the rules, not fitted.** An exact constant beats any estimate of the
+same quantity, and it means a thin or skewed estimation window cannot drag the shrinkage target
+around. `use_mechanical=False` falls back to the observed rate, which is how the gap below is
+measured.
+
+**The gap is a free, exact correctness check.** Recompute the pooled rate from real data and
+compare. Over a corpus covering every brawler it must be ~0; a material gap means participants are
+being dropped from battles, battles are being double-counted, or draws are being mis-scored.
+Nothing else in this project catches those failure modes. `build_reference.py` reports it and
+flags gaps above 0.02. (On the deliberately partial fixture the gap is large, and should be.)
 
 ---
 
@@ -400,20 +470,30 @@ suspicion.
 | 5 | Shrink toward a mode-level prior | Hierarchical: stratum-level priors partially pooled toward mode-level |
 | 12 | `as_of ≤ window.start` by convention | Enforced in `settle()`, raises `ReferenceLookahead` |
 
+| 3 | Clustering unaccounted for | `design_effect` parameter divides each cell's count in the κ fit. Default 1.0 (independence) — see below |
+| — | Weight basis unresolved | Made second-order by the **lift** metric, which fixes the neutral point at 0 under any basis |
+| — | Draws silently scored as losses | Stored separately, scored as half a win, which makes mode baselines draw-rate invariant |
+
 ### Still open
 
-**3. Battles are not independent, and nothing accounts for it.** The same player appears in many
-battles; both teams in one battle are correlated; the crawl oversamples players it has already
-seen. Effective sample size is therefore materially below the battle count, which makes shrinkage
-under-aggressive and would make any future confidence interval overconfident. A design-effect
-correction, or clustering by player, is the honest fix. **This is now the largest open statistical
-issue** — and it is one the collector can help with, since it records which player's log surfaced
-each battle.
+**3. The design effect is a parameter, not yet a measurement.** The correction is in place but
+defaults to 1.0, which asserts independence — wrong, but honest, since DEFF cannot be estimated
+without real clustered data.
 
-**3b. The weight basis is a live modelling choice.** Slots versus battles moves the settlement
-value materially, because Showdown offers ten slots per battle and has a much lower baseline. It is
-explicit and recorded rather than hidden, but which one is *right* deserves an argument rather than
-a default.
+The direction of the bias is worth stating precisely, because it is not obvious. The crawler
+fetches a player's last 25 battles at once, so those share a pilot and therefore a skill level;
+matchmaking correlates opponents further. Clustering inflates true sampling variance above the
+binomial formula by `DEFF = 1 + (m−1)·ICC`. Understating the binomial component makes the residual
+look like real between-cell variation, which inflates the between term, which makes **κ come out
+too small** — so the metric shrinks thin cells too little and is noisier than it reports.
+
+The collector already stores what's needed: every battle records `surfaced_by`, the player whose
+log produced it. Estimating ICC by clustering on that is a first-real-data task.
+
+**Note on within-battle dependence:** the six slots of one battle are *perfectly* dependent —
+exactly three win. But that constrains the aggregate across brawlers, not a single brawler's rate,
+where each battle contributes about one observation. The clustering that actually bites a single
+brawler's rate is by pilot, not by battle.
 
 **6. Rows must fit entirely inside the window; partial overlap is excluded, not pro-rated.**
 Honest (a row is an already-aggregated count, and splitting one assumes uniform distribution

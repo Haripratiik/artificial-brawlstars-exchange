@@ -91,6 +91,7 @@ def test_aggregate_row_cannot_be_knowable_before_its_window_closes(dataset):
             trophy_bucket=row.trophy_bucket,
             brawler_battles=row.brawler_battles,
             brawler_wins=row.brawler_wins,
+            brawler_draws=row.brawler_draws,
             stratum_battles=row.stratum_battles,
             stratum_slots=row.stratum_slots,
             source_id=row.source_id,

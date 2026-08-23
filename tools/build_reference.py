@@ -95,11 +95,22 @@ def main() -> int:
     print(f"  cells used         {report.cells_used}")
     print()
 
-    modes = dict(snapshot.mode_priors)
-    print("mode priors (estimated, not asserted):")
-    for mode, prior in sorted(modes.items()):
-        print(f"  {mode:<14} {prior:.4f}")
-    print()
+    gaps = dict(dict(snapshot.estimation).get("mechanical_gaps", []))
+    print("mode priors (from the game's rules where they pin the value):")
+    for mode, prior in sorted(dict(snapshot.mode_priors).items()):
+        gap = gaps.get(mode)
+        if gap is None:
+            print(f"  {mode:<14} {prior:.4f}   (estimated -- mode not characterized)")
+        else:
+            flag = "  <-- CHECK" if abs(gap) > 0.02 else ""
+            print(f"  {mode:<14} {prior:.4f}   observed gap {gap:+.4f}{flag}")
+    print(
+        "\n  The pooled win rate over ALL brawlers is arithmetic, not an estimate:\n"
+        "  3v3 puts 3 of 6 slots on the winning side, Showdown 4 of 10 plus a\n"
+        "  drawn 5th. A large gap means the corpus does not cover every brawler\n"
+        "  (expected on a partial fixture) or the aggregation is dropping\n"
+        "  participants, double counting battles, or mis-scoring draws.\n"
+    )
 
     weights = sorted(snapshot.weights, key=lambda kv: -kv[1])
     print("heaviest strata:")

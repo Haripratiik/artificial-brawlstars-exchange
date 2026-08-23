@@ -56,6 +56,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from arena.determinism import stable_sum
+from arena.worlds.brawl.modes import baseline_gap, mechanical_baseline
 from arena.worlds.brawl.reference import ReferenceSnapshot
 from arena.worlds.brawl.schema import AggregateRow, StratumKey
 
@@ -64,6 +65,7 @@ __all__ = [
     "estimate_weights",
     "estimate_priors",
     "estimate_prior_strength",
+    "mechanical_gaps",
     "build_snapshot",
     "sweep_prior_strength",
 ]
@@ -186,44 +188,87 @@ def estimate_weights(
     return {key: total / grand_total for key, total in sorted(totals.items())}
 
 
+def _pooled(rows: Sequence[AggregateRow]) -> tuple[dict[str, float], dict[str, int]]:
+    """Observed pooled score and battle count, per mode, under half-draw scoring."""
+    scored: dict[str, float] = {}
+    battles: dict[str, int] = {}
+    for row in rows:
+        scored[row.mode_id] = (
+            scored.get(row.mode_id, 0.0) + row.brawler_wins + 0.5 * row.brawler_draws
+        )
+        battles[row.mode_id] = battles.get(row.mode_id, 0) + row.brawler_battles
+    return (
+        {mode: scored[mode] / n for mode, n in battles.items() if n > 0},
+        battles,
+    )
+
+
+def mechanical_gaps(rows: Sequence[AggregateRow]) -> dict[str, float]:
+    """Deviation of each mode's observed pooled rate from the value its rules force.
+
+    A free, exact correctness check on the whole aggregation pipeline. Because a
+    battlelog names every participant, the pooled rate over *all* brawlers is
+    arithmetic, not an estimate: 0.500 for 3v3, 0.450 for Showdown. A material
+    gap means participants are being dropped from battles, battles are being
+    double counted, or draws are being scored as losses.
+
+    Only meaningful over a corpus that covers essentially every brawler. A
+    deliberately partial fixture will show a large gap, and should.
+    """
+    observed, _battles = _pooled(rows)
+    gaps: dict[str, float] = {}
+    for mode, rate in sorted(observed.items()):
+        gap = baseline_gap(mode, rate)
+        if gap is not None:
+            gaps[mode] = gap
+    return gaps
+
+
 def estimate_priors(
-    rows: Sequence[AggregateRow], pooling_strength: float = DEFAULT_PRIOR_POOLING
+    rows: Sequence[AggregateRow],
+    pooling_strength: float = DEFAULT_PRIOR_POOLING,
+    *,
+    use_mechanical: bool = True,
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Hierarchical neutral win rates: per stratum, pooled toward per mode.
 
-    The mode-level rate is what a symmetric game mechanically pins -- in a 3v3
-    exactly half of all appearances are on the winning side, so it lands near
-    0.5 without being told to, and a mode scored as "top four of ten" lands
-    near 0.4 without being told that either. Estimating rather than asserting
-    means the metric self-calibrates to whatever "win" means in each mode.
+    **Mode baselines are taken from the rules, not from the data, wherever the
+    rules pin them.** A 3v3 battle puts three of six brawlers on the winning
+    side, so the population win rate is exactly 0.500; Showdown awards wins to
+    ranks 1-4 and a draw to 5th, so it is exactly 0.450. An exact constant
+    beats any estimate of the same quantity, and using it means a thin or
+    skewed estimation window cannot drag the shrinkage target around.
 
-    The stratum-level rate then captures real deviation -- a map where the
-    first team to score usually holds -- and is pooled back toward its mode so
-    a thin stratum cannot invent a baseline from a handful of battles.
+    ``use_mechanical=False`` falls back to the observed pooled rate. Useful for
+    checking the estimator against the constant, and necessary for any mode
+    whose rules are not characterized in :mod:`arena.worlds.brawl.modes`.
+
+    The stratum-level rate then captures real deviation -- a map where the team
+    that scores first usually holds -- and is pooled back toward its mode so a
+    thin stratum cannot invent a baseline from a handful of battles.
 
     Returns ``(stratum_priors, mode_priors)``.
     """
-    mode_wins: dict[str, int] = {}
-    mode_battles: dict[str, int] = {}
-    stratum_wins: dict[str, int] = {}
+    stratum_scored: dict[str, float] = {}
     stratum_battles: dict[str, int] = {}
     stratum_mode: dict[str, str] = {}
 
     for row in rows:
         key = row.stratum.key
-        stratum_wins[key] = stratum_wins.get(key, 0) + row.brawler_wins
+        stratum_scored[key] = (
+            stratum_scored.get(key, 0.0) + row.brawler_wins + 0.5 * row.brawler_draws
+        )
         stratum_battles[key] = stratum_battles.get(key, 0) + row.brawler_battles
         stratum_mode[key] = row.mode_id
-        mode_wins[row.mode_id] = mode_wins.get(row.mode_id, 0) + row.brawler_wins
-        mode_battles[row.mode_id] = mode_battles.get(row.mode_id, 0) + row.brawler_battles
 
-    mode_priors = {
-        mode: mode_wins[mode] / battles
-        for mode, battles in sorted(mode_battles.items())
-        if battles > 0
-    }
-    if not mode_priors:
+    observed, _battles = _pooled(rows)
+    if not observed:
         raise ValueError("cannot estimate priors: no battles observed in the window")
+
+    mode_priors: dict[str, float] = {}
+    for mode, rate in sorted(observed.items()):
+        forced = mechanical_baseline(mode) if use_mechanical else None
+        mode_priors[mode] = rate if forced is None else forced
 
     stratum_priors: dict[str, float] = {}
     for key in sorted(stratum_battles):
@@ -234,8 +279,8 @@ def estimate_priors(
         if n <= 0:
             stratum_priors[key] = mode_prior
             continue
-        observed = stratum_wins[key] / n
-        stratum_priors[key] = (n * observed + pooling_strength * mode_prior) / (
+        rate = stratum_scored[key] / n
+        stratum_priors[key] = (n * rate + pooling_strength * mode_prior) / (
             n + pooling_strength
         )
 
@@ -247,27 +292,54 @@ def estimate_prior_strength(
     stratum_priors: dict[str, float],
     mode_priors: dict[str, float],
     min_cell_battles: int = DEFAULT_MIN_CELL_BATTLES,
+    design_effect: float = 1.0,
 ) -> tuple[float, dict[str, float]]:
     """Method-of-moments kappa for the beta-binomial. See the module docstring.
 
+    ``design_effect`` corrects for the fact that battles are not independent
+    draws. The crawler fetches a player's last 25 battles at once, so those
+    share a pilot and therefore a skill level; matchmaking further correlates
+    opponents. Clustering inflates the true sampling variance above the
+    binomial formula by a factor DEFF = 1 + (m - 1) * ICC.
+
+    The direction of the resulting bias is worth stating precisely, because it
+    is not obvious. Understating the binomial component makes the *residual*
+    look like real between-cell variation, which inflates the between term,
+    which makes kappa come out **too small** -- so the metric shrinks thin
+    cells too little and is noisier than it reports. Dividing each cell's
+    battle count by DEFF restores the correct decomposition.
+
+    The default of 1.0 asserts independence, which is wrong but honest: DEFF
+    cannot be estimated without real clustered data. The collector already
+    records which player's log surfaced each battle, so it is estimable as soon
+    as a corpus exists.
+
     Returns ``(kappa, diagnostics)``.
     """
+    if design_effect < 1.0:
+        raise ValueError(
+            f"design_effect must be at least 1.0 (independence), got {design_effect}"
+        )
+
     # Collapse to one cell per (brawler, stratum): kappa describes how much a
     # brawler's true rate in a stratum deviates from that stratum's baseline,
     # so sub-windows must be pooled first or the same deviation is counted
     # once per week and kappa comes out far too small.
-    cells: dict[tuple[str, str], tuple[int, int]] = {}
+    cells: dict[tuple[str, str], tuple[int, float]] = {}
     for row in rows:
         key = (row.brawler_id, row.stratum.key)
-        battles, wins = cells.get(key, (0, 0))
-        cells[key] = (battles + row.brawler_battles, wins + row.brawler_wins)
+        battles, scored = cells.get(key, (0, 0.0))
+        cells[key] = (
+            battles + row.brawler_battles,
+            scored + row.brawler_wins + 0.5 * row.brawler_draws,
+        )
 
     second_moment = 0.0
     sum_a = 0.0
     sum_a_over_n = 0.0
     used = 0
 
-    for (_brawler, stratum_key), (battles, wins) in sorted(cells.items()):
+    for (_brawler, stratum_key), (battles, scored) in sorted(cells.items()):
         if battles < min_cell_battles:
             continue
         prior = stratum_priors.get(stratum_key)
@@ -277,11 +349,12 @@ def estimate_prior_strength(
         if prior is None:
             continue
 
-        observed = wins / battles
+        observed = scored / battles
+        effective = battles / design_effect
         amplitude = prior * (1.0 - prior)
         second_moment += (observed - prior) ** 2
         sum_a += amplitude
-        sum_a_over_n += amplitude / battles
+        sum_a_over_n += amplitude / effective
         used += 1
 
     diagnostics = {
@@ -289,6 +362,7 @@ def estimate_prior_strength(
         "second_moment": second_moment,
         "binomial_component": sum_a_over_n,
         "between_component": max(second_moment - sum_a_over_n, 0.0),
+        "design_effect": design_effect,
     }
 
     if used < 2:
@@ -314,6 +388,7 @@ def build_snapshot(
     min_cell_battles: int = DEFAULT_MIN_CELL_BATTLES,
     prior_pooling: float = DEFAULT_PRIOR_POOLING,
     weight_basis: str = WEIGHT_BASIS_SLOTS,
+    design_effect: float = 1.0,
 ) -> tuple[ReferenceSnapshot, EstimationReport]:
     """Derive a complete, immutable snapshot from data available at ``as_of``."""
     rows = _visible_rows(dataset, as_of, lookback)
@@ -326,8 +401,9 @@ def build_snapshot(
     weights = estimate_weights(rows, weight_basis)
     stratum_priors, mode_priors = estimate_priors(rows, prior_pooling)
     kappa, diagnostics = estimate_prior_strength(
-        rows, stratum_priors, mode_priors, min_cell_battles
+        rows, stratum_priors, mode_priors, min_cell_battles, design_effect
     )
+    gaps = mechanical_gaps(rows)
 
     snapshot = ReferenceSnapshot(
         reference_id=reference_id,
@@ -344,9 +420,18 @@ def build_snapshot(
             ("lookback_days", float(lookback.days)),
             ("min_cell_battles", float(min_cell_battles)),
             ("prior_pooling", prior_pooling),
+            ("design_effect", design_effect),
             ("rows_used", float(len(rows))),
             ("cells_used", diagnostics["cells_used"]),
             ("between_component", diagnostics["between_component"]),
+            # Recorded, not acted on: a large gap means the corpus does not
+            # cover every brawler (expected on a fixture) or the aggregation is
+            # defective (never expected). Either way the snapshot should carry
+            # the evidence rather than quietly discard it.
+            # A mapping, not a list of pairs: JSON round-trips an object back to
+            # a dict, but turns a list of tuples into a list of lists, which
+            # would make a reloaded snapshot compare unequal to the one written.
+            ("mechanical_gaps", dict(sorted(gaps.items()))),
         ),
     )
 
@@ -388,14 +473,17 @@ def sweep_prior_strength(
 
     Returns ``[(kappa, weighted_mse), ...]``.
     """
-    train: dict[tuple[str, str], tuple[int, int]] = {}
-    test: dict[tuple[str, str], tuple[int, int]] = {}
+    train: dict[tuple[str, str], tuple[int, float]] = {}
+    test: dict[tuple[str, str], tuple[int, float]] = {}
 
     for row in rows:
         bucket = train if row.window_end <= split_at else test
         key = (row.brawler_id, row.stratum.key)
-        battles, wins = bucket.get(key, (0, 0))
-        bucket[key] = (battles + row.brawler_battles, wins + row.brawler_wins)
+        battles, scored = bucket.get(key, (0, 0.0))
+        bucket[key] = (
+            battles + row.brawler_battles,
+            scored + row.brawler_wins + 0.5 * row.brawler_draws,
+        )
 
     shared = sorted(set(train) & set(test))
     results: list[tuple[float, float]] = []
@@ -404,15 +492,15 @@ def sweep_prior_strength(
         errors: list[float] = []
         weights: list[float] = []
         for key in shared:
-            train_battles, train_wins = train[key]
-            test_battles, test_wins = test[key]
+            train_battles, train_scored = train[key]
+            test_battles, test_scored = test[key]
             if train_battles < min_cell_battles or test_battles < min_cell_battles:
                 continue
             prior = stratum_priors.get(key[1]) or mode_priors.get(key[1].split("/", 1)[0])
             if prior is None:
                 continue
-            predicted = (train_wins + kappa * prior) / (train_battles + kappa)
-            realized = test_wins / test_battles
+            predicted = (train_scored + kappa * prior) / (train_battles + kappa)
+            realized = test_scored / test_battles
             errors.append(test_battles * (predicted - realized) ** 2)
             weights.append(float(test_battles))
         if not weights:
