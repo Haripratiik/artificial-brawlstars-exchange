@@ -230,6 +230,24 @@ class BrawlClient:
         return await self._get("/events/rotation")
 
 
+async def current_public_ip(timeout: float = 5.0) -> str | None:
+    """This machine's public IP, or None if it cannot be determined.
+
+    Only useful on the direct (non-proxy) route, where the key must allow-list
+    exactly this address. On a home connection it changes without warning, and
+    the whole failure is "the portal wants a number you do not have to hand" --
+    so we fetch it and print it rather than telling the user to go find it.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as probe:
+            response = await probe.get("https://api.ipify.org")
+            if response.status_code == 200:
+                return response.text.strip()
+    except httpx.HTTPError:
+        return None
+    return None
+
+
 def _diagnose_403(body: str, *, via_proxy: bool) -> BrawlAPIError:
     """Tell a bad key apart from a wrong IP, since both come back as 403.
 

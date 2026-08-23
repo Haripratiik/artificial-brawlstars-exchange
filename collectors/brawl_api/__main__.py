@@ -83,6 +83,16 @@ async def check(api_key: str, config: ClientConfig) -> int:
     except (KeyNotAuthorizedForIP, InvalidAPIKey) as denied:
         print("FAILED\n")
         print(str(denied))
+        if not config.use_proxy:
+            # On the direct route the fix is "paste this number into the
+            # portal", so hand over the number rather than the instruction.
+            address = await current_public_ip()
+            if address:
+                print(
+                    f"\nThis machine's current public IP is: {address}\n"
+                    "Add exactly that to the key's allowed addresses at "
+                    "https://developer.brawlstars.com/ ."
+                )
         return 3
     except BrawlAPIError as error:
         print(f"FAILED: {error}")

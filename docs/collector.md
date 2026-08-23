@@ -29,7 +29,42 @@ Because Supercell only ever sees the proxy's address, your own IP becomes irrele
 collector runs anywhere — laptop, home server, Raspberry Pi, any free cloud VM — and keeps
 working when your address changes.
 
-This is what makes the project free to run. Use it.
+### Is routing through someone else's proxy safe?
+
+You are handing a third party a credential, so the question deserves a straight answer rather than
+a reassurance.
+
+**What the proxy can see:** your API key, and which player tags you look up. The key travels in an
+`Authorization` header, and the proxy has to read it to forward the request.
+
+**What that key can actually do:** read public Brawl Stars game data. That is the entire scope.
+It cannot touch your Supercell account, cannot write anything, cannot see private data, cannot
+spend anything, and cannot be used to log in. It is also allow-listed to the proxy's own IP, so
+even a leaked key only works from there.
+
+**Worst realistic case:** someone else burns your rate limit. You revoke the key at
+<https://developer.brawlstars.com/>, create another, and carry on. There is no lasting harm
+available.
+
+**Who runs it:** RoyaleAPI, a long-standing and named community operator behind RoyaleAPI.com.
+Not an anonymous endpoint.
+
+Sensible hygiene: create a key **used only for this**, never reuse it elsewhere, and revoke it if
+anything looks odd.
+
+**If you would rather not**, the direct route needs no third party at all:
+
+```bash
+python -m collectors.brawl_api --check
+```
+
+Allow-list your own public IP instead of the proxy's. The cost is that a home IP changes without
+warning, and when it does the collector stops with a 403. That is not silent — `--check` reports
+it, **and prints your current public IP** so fixing it is a copy-paste into the portal rather than
+a hunt. On a typical home connection expect to do that every few weeks.
+
+Both routes are supported and you can switch at any time by adding or dropping `--proxy` and
+editing the key's allow-list to match. Nothing else changes.
 
 ---
 
@@ -147,6 +182,35 @@ static IP.
 
 In rough order of how little effort they take:
 
+### Closing your laptop
+
+Nothing breaks and nothing is lost. The collector's state is a SQLite file plus append-only
+shards, so suspending, killing, or rebooting costs you the *hours* you were asleep and nothing
+else — restart and it resumes from exactly the frontier position it had reached.
+
+What it will not do is start itself. Use the supervisor so you never have to think about it:
+
+```bash
+python tools/run_collector.py -- --proxy --data-dir data/raw
+```
+
+It restarts the collector whenever it exits, backs off if something is genuinely broken instead of
+spinning, and **stops outright** on the two failures a restart cannot fix (missing key, rejected
+key) rather than hammering the API with a bad credential.
+
+Then add a startup entry so it runs whenever the machine is awake:
+
+- **Windows** — Task Scheduler → Create Task → Trigger "At log on" → Action: your `python.exe`,
+  arguments `tools/run_collector.py -- --proxy`, Start in: the repo directory.
+- **macOS** — a `launchd` plist with `RunAtLoad`.
+- **Linux** — the systemd unit below already does it.
+
+**The honest caveat:** coverage gaps from a sleeping laptop are *not* missing-at-random. They
+correlate with your timezone, and therefore with which regions were playing. That biases the crawl
+in a way standardization does not fully remove, because it shifts which *players* you reach rather
+than only which strata. It is a real argument for an always-on host eventually. It is not an
+argument for delaying the start — a gappy corpus that exists beats a perfect one that does not.
+
 ### Option A — A machine you already own
 
 A spare laptop, a home server, a Raspberry Pi, or just leaving your desktop on. Genuinely the
@@ -239,6 +303,72 @@ Back this up somewhere periodically. Free cloud instances do occasionally get re
 corpus is the one thing in this project you cannot regenerate.
 
 ---
+
+## Why collect at all, when stats sites already exist?
+
+A fair challenge, and the answer has two halves.
+
+### There is no public API that serves the statistics
+
+This was checked rather than assumed. [BrawlAPI](https://brawlapi.com/) — the most open source
+available, requiring no key, no token, and imposing no rate limit — serves **only static reference
+data**: the brawler roster, the map catalog, game modes, icons, and raw game config. Its `/v1/maps`
+endpoint returns empty `stats` and `teamStats` arrays. Its own documentation is explicit that it
+does not serve win rates, pick rates, or meta analytics.
+
+The sites that *do* have those numbers — Brawl Time Ninja, Brawlify, BrawlMeta, BrawlVision —
+compute them internally from their own crawls and expose them through their web UIs, not through
+an API. BrawlMeta describes doing exactly what this collector does: storing match history hourly,
+because the official API only returns the last 25 games.
+
+So "just use an existing API" is not an option that exists. The choice is between crawling and
+scraping someone's website, and scraping is worse on every axis: unclear licensing, no
+redistribution rights, blocked by bot protection, and dependent on a page layout that can change
+without notice.
+
+### Even a perfect stats API would not settle contracts
+
+This is the deeper reason, and it is specific to this project rather than a general preference.
+
+A stats site tells you **what is true now**. Historical replay needs **what was knowable then** —
+every observation tagged with when it became available, so an agent standing at time *t* can be
+given exactly the information that existed at *t* and nothing more. Strip that out and the
+no-lookahead guarantee this whole layer is built around becomes unenforceable, and every research
+result becomes unfalsifiable.
+
+Three consequences follow:
+
+- **Provenance.** A settlement must be able to name the bytes it came from. Brawl Time Ninja moved
+  to a private repository, so its methodology is no longer readable — if it silently changed how
+  "adjusted win rate" is computed, every past settlement derived from it would become
+  indefensible, with no way to detect that it had happened.
+- **Population.** Brawl Time Ninja states its data comes from *its visitors*, "usually better than
+  the average". That is a fine population; it is simply not a stated one, and our contracts have to
+  name the population they measure.
+- **Licensing.** A public research artifact cannot be built on data we have no right to
+  redistribute.
+
+### What third-party data is genuinely good for
+
+Not nothing. An occasional **manual** CSV export from Brawl Time Ninja is a legitimate way to
+sanity-check our own aggregates and shape priors, and it is what the roadmap recommends. Manual
+export, never automated ingestion, never redistribution.
+
+And BrawlAPI is worth adopting for what it *does* serve: a free, keyless, authoritative roster of
+all ~107 brawlers and ~1,239 maps. That is exactly the reference data needed to define strata, and
+to run the mechanical-baseline check, which is only meaningful over a corpus covering every
+brawler.
+
+### And the honest caveat
+
+Brawl Time Ninja reports a sample on the order of hundreds of millions of battles. A single
+well-behaved collector accrues perhaps 10^5–10^6 per day. We will not catch up, and should not try.
+
+That is survivable because **the core research does not need to.** The flagship experiment asks
+whether a market aggregates information better than its constituent agents, and answering it
+requires knowing the *true* probability — which a synthetic, calibrated world provides exactly and
+real data never can. Real replay is the external-validity test that comes afterwards, and it needs
+a defensible corpus, not the largest one.
 
 ## Checking on it
 
