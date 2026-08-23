@@ -1,0 +1,107 @@
+{
+  "as_of": "2026-08-03T00:00:00Z",
+  "estimation": [
+    [
+      "method",
+      "moments/beta-binomial"
+    ],
+    [
+      "as_of",
+      "2026-08-03T00:00:00Z"
+    ],
+    [
+      "weight_basis",
+      "slots"
+    ],
+    [
+      "lookback_days",
+      56.0
+    ],
+    [
+      "min_cell_battles",
+      30.0
+    ],
+    [
+      "prior_pooling",
+      5000.0
+    ],
+    [
+      "rows_used",
+      756.0
+    ],
+    [
+      "cells_used",
+      108.0
+    ],
+    [
+      "between_component",
+      0.07491294918514864
+    ]
+  ],
+  "mode_priors": {
+    "brawlBall": 0.5163690925752495,
+    "gemGrab": 0.5244271188450479,
+    "showdown": 0.41519136880340646
+  },
+  "prior_strength": 355.35223369329606,
+  "reference_id": "ref-2026S09-v1",
+  "source_digest": "sha256:b70164fd312c879e20c0b7d10de04952f8a800ae8b829bc36d326290ea66ea06",
+  "stratum_priors": {
+    "brawlBall/BackyardBowl/high": 0.5178024694965472,
+    "brawlBall/BackyardBowl/low": 0.5085248113613838,
+    "brawlBall/BackyardBowl/mid": 0.5114603646700164,
+    "brawlBall/PinholePunt/high": 0.5301381664263919,
+    "brawlBall/PinholePunt/low": 0.5259565437417337,
+    "brawlBall/PinholePunt/mid": 0.5325238597738288,
+    "brawlBall/SneakySneak/high": 0.5106689242290513,
+    "brawlBall/SneakySneak/low": 0.5058818439494408,
+    "brawlBall/SneakySneak/mid": 0.5095208990480435,
+    "gemGrab/DoubleSwoosh/high": 0.5204451482339313,
+    "gemGrab/DoubleSwoosh/low": 0.5106132297293856,
+    "gemGrab/DoubleSwoosh/mid": 0.5168114420085261,
+    "gemGrab/HardRockMine/high": 0.5377397516818291,
+    "gemGrab/HardRockMine/low": 0.5315823776875537,
+    "gemGrab/HardRockMine/mid": 0.5342202987600477,
+    "gemGrab/UndermineGG/high": 0.5298677962817222,
+    "gemGrab/UndermineGG/low": 0.5211566048310946,
+    "gemGrab/UndermineGG/mid": 0.5257571470784009,
+    "showdown/FeastOrFamine/high": 0.4111609405292439,
+    "showdown/FeastOrFamine/low": 0.4018636636355465,
+    "showdown/FeastOrFamine/mid": 0.40692904384052253,
+    "showdown/RockwallBrawl/high": 0.4174649247266976,
+    "showdown/RockwallBrawl/low": 0.41654082266019005,
+    "showdown/RockwallBrawl/mid": 0.420406192898236,
+    "showdown/SkullCreek/high": 0.4282631751998338,
+    "showdown/SkullCreek/low": 0.4200689329770221,
+    "showdown/SkullCreek/mid": 0.4201051893903201
+  },
+  "weights": {
+    "brawlBall/BackyardBowl/high": 0.008253693304278213,
+    "brawlBall/BackyardBowl/low": 0.030392661264851184,
+    "brawlBall/BackyardBowl/mid": 0.05484300388464183,
+    "brawlBall/PinholePunt/high": 0.007823769104313233,
+    "brawlBall/PinholePunt/low": 0.028460130702632355,
+    "brawlBall/PinholePunt/mid": 0.05065869211666582,
+    "brawlBall/SneakySneak/high": 0.008484405102675263,
+    "brawlBall/SneakySneak/low": 0.029929534997958213,
+    "brawlBall/SneakySneak/mid": 0.05267209950858103,
+    "gemGrab/DoubleSwoosh/high": 0.008747467632950867,
+    "gemGrab/DoubleSwoosh/low": 0.03293049104721873,
+    "gemGrab/DoubleSwoosh/mid": 0.05221833792723185,
+    "gemGrab/HardRockMine/high": 0.008743210957703688,
+    "gemGrab/HardRockMine/low": 0.02978906471480134,
+    "gemGrab/HardRockMine/mid": 0.051335503480967125,
+    "gemGrab/UndermineGG/high": 0.00850824248405946,
+    "gemGrab/UndermineGG/low": 0.030710209238290667,
+    "gemGrab/UndermineGG/mid": 0.05480128846721949,
+    "showdown/FeastOrFamine/high": 0.013302110147431366,
+    "showdown/FeastOrFamine/low": 0.0514901626816146,
+    "showdown/FeastOrFamine/mid": 0.08682624280018854,
+    "showdown/RockwallBrawl/high": 0.0005505299986350261,
+    "showdown/RockwallBrawl/low": 0.051112737476364814,
+    "showdown/RockwallBrawl/mid": 0.09116095709356484,
+    "showdown/SkullCreek/high": 0.014999104679306343,
+    "showdown/SkullCreek/low": 0.051080102966136444,
+    "showdown/SkullCreek/mid": 0.09017624621971766
+  }
+}
