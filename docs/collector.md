@@ -321,10 +321,36 @@ compute them internally from their own crawls and expose them through their web 
 an API. BrawlMeta describes doing exactly what this collector does: storing match history hourly,
 because the official API only returns the last 25 games.
 
-So "just use an existing API" is not an option that exists. The choice is between crawling and
-scraping someone's website, and scraping is worse on every axis: unclear licensing, no
-redistribution rights, blocked by bot protection, and dependent on a page layout that can change
-without notice.
+So "just use an existing API" is not an option that exists. The remaining alternative is scraping a
+stats site's web pages.
+
+### On scraping — a fair question, and a more nuanced answer
+
+"It is a public page" is a reasonable starting point, and largely right on the narrow legal
+question: courts have generally held that accessing publicly available data is not unauthorized
+access. Reading public pages for research is normal and lawful in many contexts.
+
+The complications are not really about legality:
+
+- **Public accessibility is not a licence to redistribute.** Whatever we do privately, a public
+  research repository that republishes another site's dataset is a different act, and the one this
+  project actually needs to do.
+- **Brawl Time Ninja returns HTTP 403 to automated fetchers.** That is an explicit signal, and
+  routing around it is a different act from viewing a page in a browser.
+- **They already built the front door.** The dashboard has an *Export CSV* button. Using the export
+  path they provided is unambiguous, requires no evasion, and gets the same numbers.
+- **Layout fragility.** A scraper breaks silently when markup changes, and a settlement metric that
+  silently changes definition is the specific failure this whole layer exists to prevent.
+
+But the decisive objection is technical rather than any of those: **their pages do not carry what
+we need anyway.** A stats site shows current win rates. Replay needs per-observation "knowable at"
+timestamps. You could recover those by snapshotting the site repeatedly and stamping each
+snapshot — but that *is* building a collector, just one with more legal ambiguity and less control
+over the population definition.
+
+The recommendation is therefore not "scraping is wrong", it is: **use the export button for
+bootstrapping and validation, and run the collector for the longitudinal record.** Manual export
+is periodic, low-effort, and gets you exactly the calibration data that is genuinely useful.
 
 ### Even a perfect stats API would not settle contracts
 
@@ -424,6 +450,62 @@ What the numbers should do over time:
 --recrawl-hours FLOAT   minimum age before refetching a player (default 12)
 -v/--verbose            debug logging
 ```
+
+## Storage, and keeping it small
+
+Raw battles are not cheap. Measured on realistic records:
+
+| Rate | Raw JSONL (gzipped) | After a year |
+|---|---|---|
+| 100k battles/day | 0.68 GB/month | 8 GB |
+| 500k battles/day | 3.40 GB/month | **41 GB** |
+| 1M battles/day | 6.80 GB/month | **82 GB** |
+
+That is a real problem on a laptop, and the answer is to roll raw up into the aggregates
+settlement actually reads, then prune:
+
+```bash
+python tools/rollup.py --data-dir data/raw --out data/derived --prune-after-days 7
+```
+
+Measured end to end on 60,000 synthetic battles: a 1.93 MB raw shard becomes a 68 KB aggregate
+file — **28x smaller**, and that is before compressing the CSV.
+
+The reason it collapses so far is that **aggregate size is bounded by brawlers × strata, not by
+battle count**. Ten times the battles produce the same number of rows, just with bigger counts in
+them. So aggregates grow with *time*, not with *volume*: on the order of a few MB per month
+whatever the crawl rate, indefinitely affordable.
+
+Steady state at 500k/day with a 7-day raw buffer is roughly **0.8 GB of raw plus a few MB per
+month of aggregates**, instead of 41 GB a year.
+
+Run the rollup on a schedule (weekly is plenty) alongside the collector.
+
+**Pruning is opt-in and never deletes a shard it did not just roll up successfully.** Raw battles
+are evidence — a settlement months from now may need to name the bytes it came from — so keeping a
+buffer means a normalization bug stays recoverable. Trading that auditability for disk is your
+call, not a default. `--prune-after-days 0` (the default) deletes nothing.
+
+### The mechanical check runs on every rollup
+
+```
+mechanical baseline check:
+  brawlBall        0.5000   vs 0.5000  gap +0.0000   ok
+  gemGrab          0.5000   vs 0.5000  gap +0.0000   ok
+```
+
+Because a battlelog names every participant of a 3v3, the pooled win rate across all brawlers
+*must* be 0.500. A gap means dropped participants, double-counted battles, or — the nasty one — the
+log owner's team perspective inverted, which would corrupt half the corpus while leaving every
+number looking perfectly plausible.
+
+Showdown is excluded from the verdict. The API reports a `rank` for the log owner only, so we can
+score one slot in ten, and that one belongs to a player the crawler chose to visit. Its pooled rate
+reflects crawled-player skill rather than the game's 0.450.
+
+**Practical consequence: write the first contracts on 3v3 modes.** Showdown win rates rest on a
+tenth of the evidence plus a selection effect nobody has modelled. Use rate is fine in both, since
+every occupied slot is observed whether or not its placement is.
 
 ### What it stores
 
