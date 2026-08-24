@@ -429,3 +429,35 @@ METRICS = {
     "adjusted_win_rate_lift": adjusted_win_rate_lift,
     "use_rate": use_rate,
 }
+
+# The range each metric can take. A contract declares its own bounds -- the
+# settlement layer must not import this module -- but declaring them wrongly is
+# easy and consequential, because the bounds determine how much collateral a
+# position needs. Building a MetricRef from this table instead of by hand is the
+# safe path, and settlement will reject any contract whose declared range does
+# not contain what the oracle actually returned.
+#
+# The lift metric is the one people get wrong: it is a *difference* from a
+# baseline, so it spans [-1, 1] where the rates it is built from span [0, 1].
+METRIC_BOUNDS: dict[str, tuple[float, float]] = {
+    "raw_win_rate": (0.0, 1.0),
+    "adjusted_win_rate": (0.0, 1.0),
+    "adjusted_win_rate_lift": (-1.0, 1.0),
+    "use_rate": (0.0, 1.0),
+}
+
+
+def metric_ref(metric: str, subject: str, **filters):
+    """Build a MetricRef with the metric's declared bounds already attached.
+
+    Preferred over constructing one by hand, precisely because the bounds are
+    both easy to get wrong and load-bearing for collateral.
+    """
+    from arena.contracts.underlying import MetricRef
+
+    if metric not in METRIC_BOUNDS:
+        raise KeyError(
+            f"{metric!r} has no declared bounds; add it to METRIC_BOUNDS so that "
+            "contracts written on it can size collateral correctly"
+        )
+    return MetricRef(metric=metric, subject=subject, bounds=METRIC_BOUNDS[metric], **filters)

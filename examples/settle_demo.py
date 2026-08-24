@@ -14,9 +14,10 @@ from pathlib import Path
 
 from arena.contracts.payoff import Binary, Linear
 from arena.contracts.spec import ContractSpec, DataPolicy, ObservationWindow
-from arena.contracts.underlying import Difference, MetricRef, Single
+from arena.contracts.underlying import Difference, Single
 from arena.settlement.engine import settle
 from arena.worlds.brawl.dataset import CanonicalDataset
+from arena.worlds.brawl.metrics import metric_ref
 from arena.worlds.brawl.oracle import BrawlOracle
 from arena.worlds.brawl.reference import load_reference
 
@@ -26,11 +27,15 @@ REPO = Path(__file__).resolve().parents[1]
 REFERENCE_ID = "ref-2026S09-v1"
 POLICY = DataPolicy(min_sample_size=1_000, min_stratum_battles=200, min_strata_coverage=0.80)
 
-SPIKE = Single(MetricRef(metric="adjusted_win_rate", subject="SPIKE"))
-CROW = Single(MetricRef(metric="adjusted_win_rate", subject="CROW"))
+SPIKE = Single(metric_ref("adjusted_win_rate", "SPIKE"))
+CROW = Single(metric_ref("adjusted_win_rate", "CROW"))
 # Performance relative to each stratum's mechanically-pinned baseline. Zero means
 # "exactly average wherever it was played", under any weighting and any rotation.
-LIFT = Single(MetricRef(metric="adjusted_win_rate_lift", subject="SPIKE"))
+#
+# Built through metric_ref rather than by hand because its range is [-1, 1], not
+# the [0, 1] a rate defaults to -- and declaring that wrongly would size a short
+# position's collateral against the wrong worst case.
+LIFT = Single(metric_ref("adjusted_win_rate_lift", "SPIKE"))
 
 
 def spec(contract_id, underlying, payoff, window) -> ContractSpec:

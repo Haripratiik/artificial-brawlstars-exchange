@@ -103,3 +103,8 @@ class RejectReason(Enum):
     LIMIT_ORDER_REQUIRES_PRICE = "limit_order_requires_price"
     FOK_NOT_FILLABLE = "fok_not_fillable"
     NOT_ORDER_OWNER = "not_order_owner"
+    # Raised by the venue, not the engine: the account could not cover the
+    # worst case of the position the order would create. Checked before the
+    # order reaches a book, because an exchange cannot unprint a trade it
+    # should not have allowed.
+    INSUFFICIENT_COLLATERAL = "insufficient_collateral"

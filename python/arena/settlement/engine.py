@@ -25,7 +25,16 @@ from arena.determinism import quantize_to_tick
 from arena.settlement.oracle import MetricResolution, MetricUnavailable, Oracle
 from arena.settlement.result import SettlementResult, SettlementStatus
 
-__all__ = ["settle", "ReferenceMismatch", "ReferenceLookahead"]
+__all__ = [
+    "settle",
+    "ReferenceMismatch",
+    "ReferenceLookahead",
+    "SettlementOutOfBounds",
+]
+
+
+class SettlementOutOfBounds(Exception):
+    """A contract settled outside the interval it declared it could settle in."""
 
 
 class ReferenceMismatch(Exception):
@@ -92,6 +101,21 @@ def settle(spec: ContractSpec, oracle: Oracle) -> SettlementResult:
     values = {resolution.ref: resolution.value for resolution in resolutions}
     level = spec.underlying.evaluate(values)
     settlement_value = quantize_to_tick(spec.payoff.apply(level), spec.tick_size)
+
+    # A settlement outside the contract's declared range means the oracle
+    # returned something the contract never contemplated -- a metric out of its
+    # stated bounds, or bounds declared wrongly. Either way the collateral
+    # posted against this contract was computed from a false premise, so this is
+    # a hard error rather than a void: voiding would hide a solvency problem
+    # behind a normal-looking outcome.
+    low, high = spec.settlement_bounds
+    if not low <= settlement_value <= high:
+        raise SettlementOutOfBounds(
+            f"{spec.contract_id} settled at {settlement_value}, outside its declared "
+            f"range [{low}, {high}]. Either the oracle returned a metric outside its "
+            "stated bounds, or the contract's bounds are wrong -- in both cases the "
+            "collateral held against this contract was computed from a false premise."
+        )
 
     return SettlementResult(
         contract_id=spec.contract_id,

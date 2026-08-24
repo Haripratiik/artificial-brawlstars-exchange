@@ -43,12 +43,22 @@ class MetricRef:
     modes: tuple[str, ...] = (ALL,)
     maps: tuple[str, ...] = (ALL,)
     trophy_buckets: tuple[str, ...] = (ALL,)
+    # The range the metric can take, declared by the contract rather than
+    # inferred. Two jobs: it propagates through the algebra to give an exact
+    # settlement range, which makes collateral computable rather than estimated;
+    # and settlement verifies the resolved value falls inside it, which catches
+    # an oracle returning something the contract never contemplated.
+    #
+    # A rate is the default because every metric in the first world is one.
+    bounds: tuple[float, float] = (0.0, 1.0)
 
     def __post_init__(self) -> None:
         if not self.metric:
             raise ValueError("metric name is required")
         if not self.subject:
             raise ValueError("subject is required")
+        if self.bounds[0] > self.bounds[1]:
+            raise ValueError(f"bounds are inverted: {self.bounds}")
         for field_name in ("modes", "maps", "trophy_buckets"):
             values = getattr(self, field_name)
             if not values:
@@ -83,6 +93,7 @@ class MetricRef:
             "modes": list(self.modes),
             "maps": list(self.maps),
             "trophy_buckets": list(self.trophy_buckets),
+            "bounds": list(self.bounds),
         }
 
 
@@ -98,6 +109,16 @@ class Underlying(ABC):
         """Combine already-resolved metric values into the underlying level."""
 
     @abstractmethod
+    def bounds(self) -> tuple[float, float]:
+        """The range this underlying's level can take.
+
+        Interval arithmetic over the algebra. Exact rather than estimated,
+        which is what lets a position's worst case be computed instead of
+        modelled -- unusual, and a direct consequence of every underlying here
+        being a bounded statistic rather than an unbounded price.
+        """
+
+    @abstractmethod
     def to_dict(self) -> dict[str, Any]:
         """Canonical form, which feeds the contract spec digest."""
 
@@ -111,6 +132,9 @@ class Single(Underlying):
 
     def evaluate(self, values: Mapping[MetricRef, float]) -> float:
         return values[self.ref]
+
+    def bounds(self) -> tuple[float, float]:
+        return self.ref.bounds
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "single", "ref": self.ref.to_dict()}
@@ -132,6 +156,15 @@ class Difference(Underlying):
 
     def evaluate(self, values: Mapping[MetricRef, float]) -> float:
         return self.left.evaluate(values) - self.right.evaluate(values)
+
+    def bounds(self) -> tuple[float, float]:
+        # Subtraction inverts the right interval: the widest the difference can
+        # be is (left's best minus right's worst), and vice versa. Using
+        # (lo - lo, hi - hi) is the classic interval-arithmetic mistake and
+        # would understate a spread's range by half.
+        left_lo, left_hi = self.left.bounds()
+        right_lo, right_hi = self.right.bounds()
+        return (left_lo - right_hi, left_hi - right_lo)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -179,6 +212,19 @@ class Basket(Underlying):
         for _shape, contribution in contributions:
             total += contribution
         return total
+
+    def bounds(self) -> tuple[float, float]:
+        # A negative weight flips its leg's interval, which is how a
+        # long/short index expresses itself. Ignoring the sign would report a
+        # range that excludes values the basket can actually settle at.
+        lower = 0.0
+        upper = 0.0
+        for leg, weight in self.legs:
+            leg_lo, leg_hi = leg.bounds()
+            scaled = (weight * leg_lo, weight * leg_hi)
+            lower += min(scaled)
+            upper += max(scaled)
+        return (lower, upper)
 
     def to_dict(self) -> dict[str, Any]:
         return {

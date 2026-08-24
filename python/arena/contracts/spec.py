@@ -21,11 +21,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from arena.contracts.payoff import Payoff
 from arena.contracts.underlying import MetricRef, Underlying
-from arena.determinism import digest
+from arena.determinism import digest, quantize_to_tick
 
 __all__ = [
     "ObservationWindow",
@@ -162,6 +163,35 @@ class ContractSpec:
     def atoms(self) -> tuple[MetricRef, ...]:
         """Every metric the oracle must resolve to settle this contract."""
         return self.underlying.atoms()
+
+    @property
+    def settlement_bounds(self) -> tuple[Decimal, Decimal]:
+        """The interval this contract can settle in, on the tick grid.
+
+        Every instrument in this market settles inside a known range, because
+        every underlying is a bounded statistic rather than an unbounded price.
+        That makes a position's worst case exact arithmetic instead of a
+        value-at-risk estimate, and therefore makes full collateralisation
+        computable: a short at 5100 on a contract bounded by 10000 can lose at
+        most 4900 per lot, and nothing needs to model volatility to know it.
+        """
+        low, high = self.payoff.bounds(self.underlying.bounds())
+        return (
+            quantize_to_tick(low, self.tick_size),
+            quantize_to_tick(high, self.tick_size),
+        )
+
+    def collateral_for(self, quantity: int, price: Decimal) -> Decimal:
+        """Worst-case loss on ``quantity`` lots opened at ``price``.
+
+        Positive quantity is long, negative is short. This is the amount that
+        must be posted for the position to be fully collateralised in the sense
+        Kalshi uses: the holder can lose it all, and can never owe more.
+        """
+        low, high = self.settlement_bounds
+        if quantity >= 0:
+            return Decimal(quantity) * (price - low)
+        return Decimal(-quantity) * (high - price)
 
     def to_dict(self) -> dict[str, Any]:
         return {

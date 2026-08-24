@@ -28,6 +28,16 @@ class Payoff(ABC):
         """Map an underlying level to a settlement value, before tick rounding."""
 
     @abstractmethod
+    def bounds(self, level_bounds: tuple[float, float]) -> tuple[float, float]:
+        """The range of settlement values, given the underlying's range.
+
+        This is what makes collateral exact. Every instrument here settles
+        inside a known interval, so a position's worst case is arithmetic
+        rather than a value-at-risk estimate -- which is not true of an
+        ordinary future on an unbounded price.
+        """
+
+    @abstractmethod
     def to_dict(self) -> dict[str, Any]:
         """Canonical form, which feeds the contract spec digest."""
 
@@ -46,6 +56,13 @@ class Linear(Payoff):
 
     def apply(self, level: float) -> float:
         return self.scale * level + self.offset
+
+    def bounds(self, level_bounds: tuple[float, float]) -> tuple[float, float]:
+        # A negative scale is a legitimate inverse contract, and it flips the
+        # interval. Assuming the low bound maps to the low settlement would
+        # silently invert the collateral requirement on such a contract.
+        ends = (self.apply(level_bounds[0]), self.apply(level_bounds[1]))
+        return (min(ends), max(ends))
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "linear", "scale": self.scale, "offset": self.offset}
@@ -74,6 +91,17 @@ class Binary(Payoff):
     def apply(self, level: float) -> float:
         holds = _COMPARISONS[self.comparison](level, self.threshold)
         return self.payout if holds else 0.0
+
+    def bounds(self, level_bounds: tuple[float, float]) -> tuple[float, float]:
+        """Always zero to payout, regardless of the underlying's range.
+
+        A binary discards everything about the level except which side of the
+        threshold it fell on, so its settlement range does not depend on how
+        wide the underlying's range is. Even a threshold outside the
+        underlying's range keeps this interval: the contract is then certain to
+        settle at one end, but it is still *defined* over both.
+        """
+        return (min(0.0, self.payout), max(0.0, self.payout))
 
     def to_dict(self) -> dict[str, Any]:
         return {
