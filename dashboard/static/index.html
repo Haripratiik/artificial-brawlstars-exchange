@@ -147,6 +147,11 @@
       <div class="scroll"><table id="orders"></table></div>
     </div>
 
+    <div class="panel" style="margin-bottom:12px">
+      <h2>Messages</h2>
+      <div class="scroll"><table id="log"></table></div>
+    </div>
+
     <div class="panel">
       <h2>Time &amp; sales</h2>
       <div class="scroll"><table class="tape" id="tape"></table></div>
@@ -158,7 +163,7 @@
 
 <script>
 const $ = s => document.querySelector(s);
-let selected = null, socket = null, history = {}, lastMark = {}, symList = [];
+let selected = null, socket = null, history = {}, lastMark = {}, symList = [], lastReject = null;
 
 function fmt(n, d=2){
   const v = Number(n);
@@ -259,6 +264,29 @@ function render(s){
         <td>${o.order_id}</td><td>${o.symbol}</td>
         <td><button data-o="${o.order_id}" class="x">×</button></td>
       </tr>`).join("") : `<tr><td colspan="3" class="dim">none working</td></tr>`);
+
+  // Messages from the venue. Rejections especially: an order that disappears
+  // without a reason is indistinguishable from a broken exchange.
+  const label = {ack:"accepted", fill:"filled", cancel:"cancelled",
+                 reject:"REJECTED", replace:"replaced"};
+  $("#log").innerHTML =
+    `<tr><th>event</th><th>detail</th></tr>` +
+    (s.log.length ? s.log.map(e=>{
+      const detail = e.type==="fill" ? `${e.quantity} @ ${fmt(e.price)}`
+                   : e.type==="reject" ? (e.reason||"").replace(/_/g," ")
+                   : e.type==="ack" ? `${e.quantity} @ ${e.price===null?"mkt":fmt(e.price)}`
+                   : (e.order_id ?? "");
+      return `<tr><td class="${e.type==='reject'?'neg':e.type==='fill'?'pos':'dim'}">${label[e.type]||e.type}</td>
+              <td class="dim">${detail}</td></tr>`;
+    }).join("") : `<tr><td colspan="2" class="dim">nothing yet</td></tr>`);
+
+  // Surface a new rejection immediately -- the panel is for history, the toast
+  // is for the order you just sent.
+  const newest = s.log.find(e => e.type === "reject");
+  if (newest && newest.t !== lastReject){
+    lastReject = newest.t;
+    toast("Order rejected: " + (newest.reason||"").replace(/_/g," "));
+  }
 
   // Tape
   $("#tape").innerHTML =

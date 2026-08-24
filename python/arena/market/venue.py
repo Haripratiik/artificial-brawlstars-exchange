@@ -236,10 +236,24 @@ class Venue:
         symbol = instrument.symbol
         account = self.account(agent_id)
         bounds = instrument.bounds_in_minor
+
         if command.price is not None:
             price = instrument.price_in_minor(command.price)
+            quantity = int(command.quantity)
         else:
-            price = bounds[1] if command.side is Side.BUY else bounds[0]
+            # A market order can only ever trade against resting liquidity, so
+            # its exposure is bounded by the book rather than by the contract's
+            # settlement range. Reserving against the far end of the range --
+            # 10,000 on a win-rate future quoted near 4,700 -- rejects orders
+            # that could never have cost anything like that much, and does it
+            # for a price the order was structurally incapable of paying.
+            quantity, price = self._market_exposure(
+                symbol, instrument, command.side, int(command.quantity)
+            )
+            if quantity == 0:
+                # No liquidity to hit. The order will cancel unfilled and can
+                # create no position, so there is nothing to collateralise.
+                return True
 
         position = account.positions.get(symbol)
         current = position.quantity if position else 0
@@ -248,9 +262,9 @@ class Venue:
         buys = sum(q for side, q, _p in working.values() if side is Side.BUY)
         sells = sum(q for side, q, _p in working.values() if side is Side.SELL)
         if command.side is Side.BUY:
-            buys += int(command.quantity)
+            buys += quantity
         else:
-            sells += int(command.quantity)
+            sells += quantity
 
         # Price each scenario at the worst working price on that side, so a
         # cheap order cannot subsidise an expensive one.
@@ -264,6 +278,31 @@ class Venue:
         )
         released = int(account.collateral.get(symbol, Money(0)))
         return int(account.free_cash) + released >= required
+
+    def _market_exposure(
+        self, symbol: str, instrument: Instrument, side: Side, quantity: int
+    ) -> tuple[int, Money]:
+        """How much a market order could fill, and the worst price it could pay.
+
+        Walks the opposite side of the book. The answer is exact rather than
+        conservative because the engine will walk exactly the same levels in
+        exactly the same order: a market order cannot reach a price nobody is
+        quoting, and cannot fill more than is resting.
+        """
+        book = self._engines[symbol].book.snapshot(levels=1 << 20)
+        levels = book.asks if side is Side.BUY else book.bids
+
+        filled = 0
+        worst: Price | None = None
+        for price, available in levels:
+            filled += min(quantity - filled, int(available))
+            worst = price
+            if filled >= quantity:
+                break
+
+        if filled == 0 or worst is None:
+            return 0, Money(0)
+        return filled, instrument.price_in_minor(worst)
 
     def _track_working(
         self, agent_id: AgentId, symbol: str, events: list[Event]

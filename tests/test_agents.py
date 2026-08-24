@@ -16,6 +16,8 @@ forever. The agent believed it held +7 while the venue held 0.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from arena.agents.fundamental import FundamentalTrader
@@ -189,6 +191,103 @@ def test_market_orders_leave_nothing_working():
 # --------------------------------------------------------------------------
 # The market behaves like a market
 # --------------------------------------------------------------------------
+
+
+def test_a_large_order_moves_the_price():
+    """Size has to have consequences, or the book is decorative.
+
+    A sweep should walk the book, pay progressively worse prices, and leave the
+    mark higher than it found it -- then decay back as the maker refills and the
+    fundamental agents push against it. Temporary impact and permanent impact
+    are different things, and a market that shows neither is not a market.
+    """
+    m = build(seed=7)
+    m.kernel.start()
+    m.kernel.advance(until=seconds(60))
+
+    before = float(m.venue.mark_price(SYMBOL))
+    best_ask = float(
+        m.venue.registry.require(SYMBOL).from_ticks(
+            m.venue.engine(SYMBOL).book.snapshot().best_ask
+        )
+    )
+
+    m.human.enqueue(
+        SymbolCommand(
+            SYMBOL,
+            Submit(HUMAN_ID, Side.BUY, Quantity(5000), None, OrderType.MARKET, TimeInForce.IOC),
+        )
+    )
+    m.kernel.advance(until=seconds(61))
+    impact = float(m.venue.mark_price(SYMBOL))
+
+    position = m.venue.account(HUMAN_ID).positions[SYMBOL]
+    assert position.quantity > 0, "the sweep did not fill at all"
+    # It walked the book, so it paid worse than the touch on average.
+    assert float(position.average_price) > best_ask
+    # And it moved the market it traded through.
+    assert impact > before + 50, f"mark barely moved: {before} -> {impact}"
+
+    # Then the market repairs itself.
+    m.kernel.advance(until=seconds(120))
+    recovered = float(m.venue.mark_price(SYMBOL))
+    assert abs(recovered - before) < abs(impact - before)
+
+
+def test_a_market_order_is_collateralised_against_the_book_not_the_range():
+    """A market order can only trade against resting liquidity.
+
+    Reserving against the far end of the settlement range instead -- 10,000 on a
+    contract quoted near 4,700 -- rejects orders that could never have cost
+    anything like that much, for a price they were structurally incapable of
+    paying. The symptom was a large order silently vanishing.
+    """
+    m = build(seed=7)
+    m.kernel.start()
+    m.kernel.advance(until=seconds(60))
+
+    m.human.enqueue(
+        SymbolCommand(
+            SYMBOL,
+            Submit(HUMAN_ID, Side.BUY, Quantity(5000), None, OrderType.MARKET, TimeInForce.IOC),
+        )
+    )
+    m.kernel.advance(until=seconds(62))
+
+    rejects = [e for e in m.human.log if e["type"] == "reject"]
+    assert not rejects, f"order was rejected: {rejects[-1]['reason']}"
+    assert m.venue.account(HUMAN_ID).positions[SYMBOL].quantity > 0
+
+
+def test_an_order_beyond_all_liquidity_and_capital_is_still_refused():
+    """The check must still bite when it should.
+
+    Bounding a market order by the book must not become a way to take on
+    exposure the account cannot cover: a resting limit order still reserves
+    against its own price.
+    """
+    m = build(seed=7)
+    m.kernel.start()
+    m.kernel.advance(until=seconds(60))
+
+    instrument = m.venue.registry.require(SYMBOL)
+    m.human.enqueue(
+        SymbolCommand(
+            SYMBOL,
+            Submit(
+                HUMAN_ID,
+                Side.BUY,
+                Quantity(500_000),
+                instrument.to_ticks(Decimal("4700")),
+                OrderType.LIMIT,
+                TimeInForce.GTC,
+            ),
+        )
+    )
+    m.kernel.advance(until=seconds(62))
+
+    reasons = [e["reason"] for e in m.human.log if e["type"] == "reject"]
+    assert "insufficient_collateral" in reasons
 
 
 def test_the_market_trades(market):
