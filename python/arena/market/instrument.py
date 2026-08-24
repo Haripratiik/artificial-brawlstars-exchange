@@ -44,6 +44,8 @@ class InstrumentClass:
     EVENT = "event"
     SPREAD = "spread"
     INDEX = "index"
+    CALL = "call"
+    PUT = "put"
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,9 +130,16 @@ class Instrument:
 
     @property
     def instrument_class(self) -> str:
-        from arena.contracts.payoff import Binary
+        from arena.contracts.payoff import Binary, Call, Put
         from arena.contracts.underlying import Basket, Difference
 
+        # The payoff decides first: an option on a spread is an option, not a
+        # spread, because what it pays is shaped by the strike rather than by
+        # the shape of what it is written on.
+        if isinstance(self.spec.payoff, Call):
+            return InstrumentClass.CALL
+        if isinstance(self.spec.payoff, Put):
+            return InstrumentClass.PUT
         if isinstance(self.spec.payoff, Binary):
             return InstrumentClass.EVENT
         if isinstance(self.spec.underlying, Difference):

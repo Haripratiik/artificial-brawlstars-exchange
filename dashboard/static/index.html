@@ -60,6 +60,9 @@
   .row input,.row select{flex:1;min-width:0}
   .pos{color:var(--bid)} .neg{color:var(--ask)}
   .tape td{padding:2px 12px}
+  #terms td{padding:3px 0}
+  #terms td:first-child{width:70px}
+  #terms td:last-child{text-align:left}
   .scroll{max-height:210px;overflow-y:auto}
   .scroll::-webkit-scrollbar{width:8px}
   .scroll::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
@@ -111,9 +114,13 @@
         <div class="mid">mark <b id="mark">—</b> <span class="dim" id="spread"></span></div>
       </div>
     </div>
-    <div class="panel">
+    <div class="panel" style="margin-bottom:12px">
       <h2>Price</h2>
       <canvas id="chart"></canvas>
+    </div>
+    <div class="panel">
+      <h2>Contract terms</h2>
+      <div class="pad" id="terms"></div>
     </div>
   </div>
 
@@ -239,6 +246,32 @@ function render(s){
       <span class="p">${fmt(l[0])}</span><span>${l[1]}</span></div>`;
   $("#bids").innerHTML = book.bids.map(l=>level(l,"b")).join("") || `<div class="lvl dim">no bids</div>`;
   $("#asks").innerHTML = book.asks.map(l=>level(l,"a")).join("") || `<div class="lvl dim">no offers</div>`;
+
+  // Contract terms. What the instrument pays, not just what it costs.
+  const c = book.contract, pay = c.payoff;
+  const describe = {
+    linear: () => `${pay.scale.toLocaleString()} x metric` +
+                  (pay.offset ? ` + ${pay.offset.toLocaleString()}` : ""),
+    binary: () => `pays ${pay.payout} if metric ${pay.comparison} ${pay.threshold}, else 0`,
+    call:   () => `max(${pay.scale.toLocaleString()} x metric &minus; ${pay.strike.toLocaleString()}, 0)`,
+    put:    () => `max(${pay.strike.toLocaleString()} &minus; ${pay.scale.toLocaleString()} x metric, 0)`,
+  }[pay.kind] || (() => pay.kind);
+  const subject = (function walk(u){
+    if (u.kind === "single") return u.ref.subject;
+    if (u.kind === "difference") return walk(u.left) + " &minus; " + walk(u.right);
+    if (u.kind === "basket") return u.legs.map(l => `${l.weight}x${walk(l.leg)}`).join(" + ");
+    return "?";
+  })(c.underlying);
+
+  $("#terms").innerHTML = `
+    <table>
+      <tr><td class="dim">settles</td><td>${describe()}</td></tr>
+      <tr><td class="dim">metric</td><td>adjusted win rate of ${subject}</td></tr>
+      <tr><td class="dim">range</td><td>${fmt(book.bounds[0])} to ${fmt(book.bounds[1])}</td></tr>
+      <tr><td class="dim">tick</td><td>${book.tick}</td></tr>
+      <tr><td class="dim">expiry</td><td>${c.expiry}</td></tr>
+      <tr><td class="dim">spec</td><td class="dim">${c.digest}</td></tr>
+    </table>`;
 
   // Chart history
   const h = history[selected] ||= [];

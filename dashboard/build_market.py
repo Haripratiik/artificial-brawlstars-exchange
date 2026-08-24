@@ -16,12 +16,13 @@ simulator with a browser attached.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 
 from arena.agents.fundamental import FundamentalTrader
 from arena.agents.market_maker import MarketMaker
 from arena.agents.noise import NoiseTrader
-from arena.contracts.payoff import Binary, Linear
+from arena.contracts.payoff import Binary, Call, Linear, Put
 from arena.contracts.spec import ContractSpec, DataPolicy, ObservationWindow
 from arena.contracts.underlying import Basket, Difference, Single
 from arena.exchange.types import AgentId
@@ -79,6 +80,18 @@ def instruments() -> list[Instrument]:
             "SPIKE_CROW",
             _spec("SPIKE_CROW", Difference(_wr("SPIKE"), _wr("CROW")), Linear(10_000.0)),
         ),
+        # Options are payoffs on the same underlying as the future, so they
+        # settle from the same metric at the same instant and need no separate
+        # machinery. Struck either side of where SPIKE actually settles, so one
+        # expires worthless and the other in the money.
+        Instrument(
+            "SPIKE_C4700",
+            _spec("SPIKE_C4700", _wr("SPIKE"), Call(4_700.0, 10_000.0), tick="0.25"),
+        ),
+        Instrument(
+            "SPIKE_P4700",
+            _spec("SPIKE_P4700", _wr("SPIKE"), Put(4_700.0, 10_000.0), tick="0.25"),
+        ),
         Instrument(
             "ASSASSIN_IDX",
             _spec(
@@ -90,16 +103,41 @@ def instruments() -> list[Instrument]:
     ]
 
 
-def true_values(listed: list[Instrument]) -> dict[str, float]:
-    """What each contract will actually settle at, in ticks.
+@lru_cache(maxsize=1)
+def _world():
+    """The dataset and reference snapshot, loaded once.
 
-    Computed by running the real settlement engine against the real dataset --
-    so the fundamental agents are anchored to the same number the contract will
-    pay, not to an invented one. The market's job is to find it.
+    Pure functions of two committed files, so caching changes nothing about
+    what any run produces -- it only stops every market build from re-reading a
+    CSV and re-running settlement, which dominated the test suite.
     """
     dataset = CanonicalDataset.from_csv(REPO / "data" / "fixtures" / "brawl_aggregates.csv")
     reference = load_reference(REPO / "data" / "reference" / f"{REFERENCE_ID}.json")
-    oracle = BrawlOracle(dataset, reference, POLICY)
+    return dataset, reference, BrawlOracle(dataset, reference, POLICY)
+
+
+def true_levels(listed: list[Instrument]) -> dict[str, float]:
+    """The true *metric level* each contract is written on.
+
+    Not the settlement value: agents are given a view on the underlying rate
+    and derive what it implies for each contract themselves, which is both how
+    a fundamental analyst actually works and what makes a single noise
+    parameter meaningful across a future, an option and an event contract
+    alike.
+    """
+    _dataset, _reference, oracle = _world()
+
+    levels: dict[str, float] = {}
+    for instrument in listed:
+        result = settle(instrument.spec, oracle)
+        if result.settled and result.underlying_level is not None:
+            levels[instrument.symbol] = float(result.underlying_level)
+    return levels
+
+
+def true_values(listed: list[Instrument]) -> dict[str, float]:
+    """What each contract will actually settle at, in ticks. For reporting."""
+    _dataset, _reference, oracle = _world()
 
     values: dict[str, float] = {}
     for instrument in listed:
@@ -114,7 +152,7 @@ def true_values(listed: list[Instrument]) -> dict[str, float]:
 def build(seed: int = 7, speed: float = 1.0) -> LiveMarket:
     listed = instruments()
     by_symbol = {i.symbol: i for i in listed}
-    truth = true_values(listed)
+    levels = true_levels(listed)
 
     # Sized for the contracts on offer, not picked round. A 10,000-scale future
     # quoted 30 lots a side ties up ~300k per side per symbol, and full
@@ -163,12 +201,12 @@ def build(seed: int = 7, speed: float = 1.0) -> LiveMarket:
 
     funds = [
         FundamentalTrader(
-            fund_ids[0], VENUE_ID, by_symbol, truth,
+            fund_ids[0], VENUE_ID, by_symbol, levels,
             wake_interval=millis(600), precision=3.0, base_size=20,
             max_position=900,
         ),
         FundamentalTrader(
-            fund_ids[1], VENUE_ID, by_symbol, truth,
+            fund_ids[1], VENUE_ID, by_symbol, levels,
             wake_interval=millis(1_100), precision=0.8, base_size=12,
             max_position=600,
         ),

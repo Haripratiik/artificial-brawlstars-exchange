@@ -20,7 +20,7 @@ from decimal import Decimal as D
 
 import pytest
 
-from arena.contracts.payoff import Binary, Linear
+from arena.contracts.payoff import Binary, Call, Linear, Put
 from arena.contracts.spec import ContractSpec, DataPolicy, ObservationWindow
 from arena.contracts.underlying import Basket, Difference, MetricRef, Single
 from arena.exchange.events import Replace, Submit
@@ -32,7 +32,7 @@ from arena.exchange.types import (
     Side,
     TimeInForce,
 )
-from arena.market.instrument import Instrument
+from arena.market.instrument import Instrument, InstrumentClass
 from arena.market.venue import Venue
 from arena.settlement.result import SettlementResult, SettlementStatus
 
@@ -118,6 +118,18 @@ COMBINATIONS = {
         (D("-10000"), D("10000")),
     ),
     "inverse future": (wr("A"), Linear(-10_000.0), "0.25", (D("-10000"), D("0"))),
+    "call option": (
+        wr("A"),
+        Call(5_000.0, 10_000.0),
+        "0.25",
+        (D("0"), D("5000")),
+    ),
+    "put option": (
+        wr("A"),
+        Put(5_000.0, 10_000.0),
+        "0.25",
+        (D("0"), D("5000")),
+    ),
     "future with offset": (
         wr("A"),
         Linear(10_000.0, offset=5_000.0),
@@ -170,6 +182,79 @@ def test_every_class_trades_marks_and_settles(name):
     assert int(realised[A]) == -int(realised[B])
     assert venue.conservation_check() == 0
     assert all(int(a.posted_collateral) == 0 for a in venue.accounts.values())
+
+
+OPTION_STRIKE = 5_000.0
+OPTION_SCALE = 10_000.0
+
+
+def test_options_are_classified_and_bounded():
+    call = make(wr("A"), Call(OPTION_STRIKE, OPTION_SCALE))
+    put = make(wr("A"), Put(OPTION_STRIKE, OPTION_SCALE))
+
+    assert call.instrument_class == InstrumentClass.CALL
+    assert put.instrument_class == InstrumentClass.PUT
+    # Floored at zero by structure, capped by the best the underlying can do.
+    assert call.settlement_bounds == (D("0"), D("5000"))
+    assert put.settlement_bounds == (D("0"), D("5000"))
+
+
+@pytest.mark.parametrize("level", [0.0, 0.1, 0.3, 0.4669, 0.5, 0.5001, 0.75, 1.0])
+def test_put_call_parity_holds_exactly(level):
+    """``C - P = F - K``, with no discount factor and no approximation.
+
+    Both legs settle from the same metric at the same instant, so parity is an
+    identity here rather than a no-arbitrage relationship that holds to within
+    financing costs. If it ever fails, one of the two payoffs is wrong.
+    """
+    call = Call(OPTION_STRIKE, OPTION_SCALE).apply(level)
+    put = Put(OPTION_STRIKE, OPTION_SCALE).apply(level)
+    future = Linear(OPTION_SCALE).apply(level)
+
+    assert call - put == pytest.approx(future - OPTION_STRIKE)
+
+
+def test_an_option_never_settles_negative():
+    """The whole point of buying one: downside bounded by structure."""
+    for level in (0.0, 0.25, 0.5, 0.75, 1.0):
+        assert Call(OPTION_STRIKE, OPTION_SCALE).apply(level) >= 0
+        assert Put(OPTION_STRIKE, OPTION_SCALE).apply(level) >= 0
+
+
+@pytest.mark.parametrize("payoff_name", ["call", "put"])
+def test_options_trade_and_settle(payoff_name):
+    payoff = (
+        Call(OPTION_STRIKE, OPTION_SCALE)
+        if payoff_name == "call"
+        else Put(OPTION_STRIKE, OPTION_SCALE)
+    )
+    instrument = make(wr("A"), payoff)
+    venue = venue_with(instrument)
+    ticks = instrument.to_ticks(D("400"))  # a plausible premium
+
+    venue.submit(A, SYM, order(A, Side.SELL, ticks, 10))
+    events = venue.submit(B, SYM, order(B, Side.BUY, ticks, 10))
+    assert any(type(e).__name__ == "Traded" for e in events)
+
+    # A long option's worst case is exactly the premium paid -- it expires
+    # worthless, and cannot do worse than that.
+    assert venue.account(B).collateral[SYM] == int(D("400") * 10 * 1_000_000)
+
+    result = SettlementResult(
+        SYM, instrument.spec.spec_digest, SettlementStatus.SETTLED, D("0"), 0.0, ()
+    )
+    venue.settle(SYM, result)
+    assert venue.conservation_check() == 0
+
+
+def test_an_option_on_a_spread_is_an_option():
+    """The payoff decides the class, not the shape of what it is written on."""
+    instrument = make(
+        Difference(wr("A"), wr("B")), Call(0.0, OPTION_SCALE)
+    )
+    assert instrument.instrument_class == InstrumentClass.CALL
+    # A spread ranges over [-1, 1], so a call struck at zero can pay up to 10000.
+    assert instrument.settlement_bounds == (D("0"), D("10000"))
 
 
 def test_negative_prices_trade_correctly():

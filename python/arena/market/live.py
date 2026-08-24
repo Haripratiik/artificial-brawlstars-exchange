@@ -197,7 +197,17 @@ class LiveMarket:
                 "class": instrument.instrument_class,
                 "tick": str(instrument.tick_size),
                 "bounds": [str(b) for b in instrument.settlement_bounds],
-                "trades": self.venue.engine(symbol).tape.__len__(),
+                "trades": len(self.venue.engine(symbol).tape),
+                # What the contract actually is, so a trader can see the terms
+                # rather than only the price. A market where you cannot read the
+                # contract is a casino with extra steps.
+                "contract": {
+                    "id": instrument.spec.contract_id,
+                    "payoff": instrument.spec.payoff.to_dict(),
+                    "underlying": instrument.spec.underlying.to_dict(),
+                    "expiry": instrument.expiry.strftime("%Y-%m-%d"),
+                    "digest": instrument.spec.spec_digest[7:19],
+                },
             }
 
         recent = []

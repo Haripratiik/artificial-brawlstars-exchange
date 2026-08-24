@@ -43,16 +43,20 @@ class FundamentalTrader(TradingAgent):
         agent_id: AgentId,
         venue_id: AgentId,
         instruments: dict[str, Instrument],
-        truth: dict[str, float],
+        truth_level: dict[str, float],
         wake_interval: Duration = millis(1_500),
         precision: float = 1.0,
+        metric_sigma: float = 0.02,
+        draws: int = 128,
         max_position: int = 150,
         base_size: int = 8,
         patience: float = 0.5,
     ) -> None:
         super().__init__(agent_id, venue_id, instruments, wake_interval)
-        self.truth = truth
+        self.truth_level = truth_level
         self.precision = max(0.01, precision)
+        self.metric_sigma = metric_sigma
+        self.draws = max(8, draws)
         self.max_position = max_position
         self.base_size = base_size
         self.patience = patience
@@ -62,25 +66,66 @@ class FundamentalTrader(TradingAgent):
     def _view(self, ctx: SimulationContext, symbol: str) -> tuple[float, float]:
         """This agent's estimate of settlement, and its own uncertainty.
 
-        Drawn once per symbol and then held. An agent that redrew its view every
-        wakeup would behave like a noise trader with extra steps -- its
-        "information" would average out to nothing and it would exert no
-        directional pull on price at all.
+        **The noise is on the metric, not on the settlement value.** A
+        fundamental analyst forms a view on Spike's win rate; what that implies
+        for a future, an option, or an event contract then follows from the
+        contract's own terms. Perturbing the settlement value directly would be
+        modelling an analyst who somehow has an opinion about an option premium
+        without having one about the underlying.
+
+        The difference is not cosmetic. Scaling uncertainty to a *contract's*
+        range gives an option -- whose value is a small fraction of its range --
+        a noise term larger than the entire quantity being estimated, so the
+        agent's view is dominated by noise and the option collapses to its
+        floor. Perturbing the metric instead makes uncertainty propagate through
+        the payoff, which also gives the agent the right sensitivity for free:
+        it reacts to a rate change in proportion to the contract's delta.
+
+        Drawn once per symbol and then held. An agent redrawing its view every
+        wakeup would be a noise trader with extra steps -- its "information"
+        would average to nothing and exert no directional pull on price.
         """
         if symbol not in self._estimate:
             instrument = self.instruments[symbol]
-            low, high = instrument.tick_bounds
-            span = max(1.0, (int(high) - int(low)))
-            # Uncertainty as a fraction of the contract's whole range, so the
-            # same precision means the same thing on a future and on a binary.
-            scale = span * 0.02 / self.precision
-            truth = self.truth.get(symbol)
-            if truth is None:
+            level = self.truth_level.get(symbol)
+            if level is None:
                 self._estimate[symbol] = float("nan")
-                self._noise_scale[symbol] = scale
-            else:
-                self._estimate[symbol] = truth + ctx.rng.gauss(0.0, scale)
-                self._noise_scale[symbol] = scale
+                self._noise_scale[symbol] = 1.0
+                return self._estimate[symbol], self._noise_scale[symbol]
+
+            # Uncertainty in metric units -- percentage points of win rate.
+            # A sharper agent has a tighter posterior about the same quantity.
+            sigma = self.metric_sigma / self.precision
+            payoff = instrument.spec.payoff
+            centre = level + ctx.rng.gauss(0.0, sigma)
+
+            # **E[payoff(level)], not payoff(E[level]).** For a linear future
+            # the two coincide, so the distinction is invisible until an option
+            # appears -- and then it is the whole of the option's time value. A
+            # put struck just above where the metric will land is worth
+            # something precisely because the metric might land lower; a point
+            # estimate says it is worth its intrinsic value and nothing more,
+            # which prices every out-of-the-money option at zero.
+            #
+            # Averaged over draws rather than integrated, because that works
+            # for a kinked payoff, a step payoff and a linear one without any
+            # of them being special-cased -- and because a closed form would
+            # need a volatility model this agent has no business owning.
+            draws = [centre + ctx.rng.gauss(0.0, sigma) for _ in range(self.draws)]
+            values = [payoff.apply(d) for d in draws]
+            value = sum(values) / len(values)
+
+            # Dispersion of the payoff under the agent's own uncertainty. This
+            # is what conviction is measured against, so a contract whose value
+            # is insensitive to the metric produces small trades even when the
+            # price looks far away.
+            variance = sum((v - value) ** 2 for v in values) / len(values)
+            tick = float(instrument.tick_size)
+            self._estimate[symbol] = value / tick
+            # Never zero: a binary far from its threshold has no dispersion at
+            # all, and an agent with zero uncertainty would trade infinitely
+            # hard on any deviation.
+            self._noise_scale[symbol] = max(1.0, (variance**0.5) / tick)
         return self._estimate[symbol], self._noise_scale[symbol]
 
     def act(self, ctx: SimulationContext) -> None:
