@@ -35,6 +35,7 @@ from arena.exchange.types import (
     Price,
     Quantity,
     RejectReason,
+    SelfTradePrevention,
     Side,
     TimeInForce,
 )
@@ -119,7 +120,9 @@ def test_an_order_walks_multiple_levels(engine):
     engine.apply(limit(B, Side.SELL, 101, 5))
     engine.apply(limit(C, Side.SELL, 102, 5))
 
-    events = engine.apply(limit(A, Side.BUY, 102, 12))
+    # A fourth agent, because A already has resting offers here and self-match
+    # prevention would cancel them rather than trade against them.
+    events = engine.apply(limit(AgentId("dave"), Side.BUY, 102, 12))
     prints = trades(events)
 
     assert [(int(t.price), int(t.quantity)) for t in prints] == [(100, 5), (101, 5), (102, 2)]
@@ -460,3 +463,67 @@ def test_sequence_numbers_are_gapless_and_ordered(engine):
     sequences = [int(e.sequence) for e in events]
     assert sequences == sorted(sequences)
     assert sequences == list(range(1, len(sequences) + 1))
+
+
+# --------------------------------------------------------------------------
+# Self-match prevention
+# --------------------------------------------------------------------------
+
+
+def test_an_agent_cannot_trade_with_itself(engine):
+    """Wash trades net to zero, which is exactly why they are dangerous.
+
+    A market maker quoting both sides crosses with itself every time it
+    requotes -- its cancels are still in flight when the new quote arrives. The
+    position nets, the PnL nets, and nothing looks wrong. What it destroys is
+    the tape: before this was fixed, 90% of the live market's volume was one
+    agent trading with itself, so every price, every volume figure and every
+    impact measurement derived from them was fiction.
+    """
+    engine.apply(limit(A, Side.SELL, 100, 10))
+    events = engine.apply(limit(A, Side.BUY, 100, 10))
+
+    assert trades(events) == []
+    assert any(isinstance(e, Cancelled) for e in events)
+
+
+def test_the_stale_quote_goes_and_the_order_trades_with_everyone_else(engine):
+    """Cancel-oldest is right for the case that actually occurs.
+
+    The resting order is a stale quote its owner has already tried to cancel,
+    so removing it and continuing against other participants is what the agent
+    meant to happen.
+    """
+    engine.apply(limit(A, Side.SELL, 100, 10))   # A's stale offer
+    engine.apply(limit(B, Side.SELL, 100, 10))   # B's genuine offer
+
+    events = engine.apply(limit(A, Side.BUY, 100, 15))
+    prints = trades(events)
+
+    assert len(prints) == 1
+    assert int(prints[0].quantity) == 10          # traded with B only
+    assert engine.book.snapshot().best_bid == 100  # A's remainder rests
+
+
+@pytest.mark.parametrize(
+    "policy,expect_resting_bid",
+    [
+        (SelfTradePrevention.CANCEL_OLDEST, 100),
+        (SelfTradePrevention.CANCEL_NEWEST, None),
+        (SelfTradePrevention.CANCEL_BOTH, None),
+    ],
+)
+def test_prevention_policies(policy, expect_resting_bid):
+    engine = MatchingEngine("X", self_trade_prevention=policy)
+    engine.apply(limit(A, Side.SELL, 100, 10))
+    events = engine.apply(limit(A, Side.BUY, 100, 10))
+
+    assert trades(events) == []
+    assert engine.book.snapshot().best_bid == expect_resting_bid
+
+
+def test_prevention_can_be_disabled_for_study(engine):
+    """The raw behaviour stays reachable, so its effect can be measured."""
+    permissive = MatchingEngine("X", self_trade_prevention=SelfTradePrevention.ALLOW)
+    permissive.apply(limit(A, Side.SELL, 100, 10))
+    assert len(trades(permissive.apply(limit(A, Side.BUY, 100, 10)))) == 1

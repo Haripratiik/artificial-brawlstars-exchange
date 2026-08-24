@@ -33,6 +33,7 @@ __all__ = [
     "Side",
     "OrderType",
     "TimeInForce",
+    "SelfTradePrevention",
     "OrderStatus",
     "RejectReason",
 ]
@@ -79,6 +80,34 @@ class TimeInForce(Enum):
     IOC = "ioc"
     # All or nothing, immediately. Fills completely or does not trade at all.
     FOK = "fok"
+
+
+class SelfTradePrevention(Enum):
+    """What to do when an agent's order would match its own resting order.
+
+    Without this, a market maker quoting both sides crosses with itself every
+    time it requotes: its cancels are still in flight while the new quote
+    arrives, so the new bid trades against its own stale offer. The position
+    nets to zero and the PnL nets to zero, which is exactly why it is dangerous
+    -- nothing looks wrong. What it destroys is the tape: volume, prices and
+    every impact measurement derived from them are then largely fictional.
+
+    Real venues offer the same policies under the name self-match prevention.
+
+    CANCEL_OLDEST is the default because it is right for the case that actually
+    occurs here: the resting order is a stale quote the agent has already tried
+    to cancel, so removing it and letting the incoming order continue against
+    everyone else is what the agent intended.
+    """
+
+    # Remove the resting order and carry on matching against other agents.
+    CANCEL_OLDEST = "cancel_oldest"
+    # Cancel the incoming order's remainder and stop.
+    CANCEL_NEWEST = "cancel_newest"
+    # Remove both sides.
+    CANCEL_BOTH = "cancel_both"
+    # Permit the match. Only for tests that need to observe the raw behaviour.
+    ALLOW = "allow"
 
 
 class OrderStatus(Enum):

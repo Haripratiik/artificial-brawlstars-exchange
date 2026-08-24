@@ -26,7 +26,9 @@ worst case of the resulting position is arithmetic, not an estimate.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -116,8 +118,18 @@ class InstrumentRegistry:
 class Venue:
     """Books, accounts, and settlement across many instruments."""
 
-    def __init__(self, name: str = "arena", starting_cash: Decimal | int = 1_000_000):
+    def __init__(
+        self,
+        name: str = "arena",
+        starting_cash: Decimal | int = 1_000_000,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.name = name
+        # Supplies wall-clock or simulated calendar time, so expiries can be
+        # enforced. Left None when a caller wants to trade a contract outside
+        # its window deliberately -- which every unit test does, since a fixture
+        # contract's window is a fixed date in the past or future.
+        self._clock = clock
         self.registry = InstrumentRegistry()
         # Converted once, here. Everything downstream is integer minor units,
         # so the ledger conserves exactly rather than nearly.
@@ -198,6 +210,14 @@ class Venue:
             return [
                 Rejected(SequenceNumber(0), agent_id, RejectReason.UNKNOWN_ORDER)
             ]
+        # A contract's own terms say when it stops trading, and until now
+        # nothing enforced them: the expiry sat on the instrument as
+        # documentation while the book carried on past it. Once the observation
+        # window has closed the outcome is determined, so anyone still trading
+        # is trading against an answer that already exists.
+        if self._clock is not None and self._clock() >= instrument.expiry:
+            self._closed.add(symbol)
+
         if symbol in self._closed and isinstance(command, (Submit, Replace)):
             # Cancels stay legal after the close so an agent can tidy up; new
             # risk cannot be taken once the outcome is determined.

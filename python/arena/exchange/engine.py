@@ -42,6 +42,7 @@ from arena.exchange.types import (
     Price,
     Quantity,
     RejectReason,
+    SelfTradePrevention,
     SequenceNumber,
     Side,
     TimeInForce,
@@ -53,8 +54,13 @@ __all__ = ["MatchingEngine"]
 class MatchingEngine:
     """A single-instrument exchange."""
 
-    def __init__(self, instrument: str = "DEFAULT") -> None:
+    def __init__(
+        self,
+        instrument: str = "DEFAULT",
+        self_trade_prevention: SelfTradePrevention = SelfTradePrevention.CANCEL_OLDEST,
+    ) -> None:
         self.instrument = instrument
+        self.self_trade_prevention = self_trade_prevention
         self.book = OrderBook()
         self._sequence = 0
         self._next_order_id = 0
@@ -182,6 +188,38 @@ class MatchingEngine:
         levels = snapshot.asks if opposite is Side.SELL else snapshot.bids
         return [(p, int(q)) for p, q in levels if side.crosses(p, limit)]
 
+    def _prevent_self_trade(
+        self, incoming: Order, resting: Order, level
+    ) -> list[Event]:
+        """Resolve a would-be wash trade according to the configured policy.
+
+        Removing the resting order also pops it off the level, so the matching
+        loop advances rather than meeting the same order forever -- which would
+        be an infinite loop rather than a wrong price.
+        """
+        events: list[Event] = []
+        policy = self.self_trade_prevention
+
+        if policy in (SelfTradePrevention.CANCEL_OLDEST, SelfTradePrevention.CANCEL_BOTH):
+            remaining = resting.remaining
+            self.book.remove(resting)
+            resting.status = OrderStatus.CANCELLED
+            level.popleft()
+            events.append(
+                Cancelled(self._seq(), resting.agent_id, resting.order_id, remaining)
+            )
+
+        if policy in (SelfTradePrevention.CANCEL_NEWEST, SelfTradePrevention.CANCEL_BOTH):
+            events.append(
+                Cancelled(
+                    self._seq(), incoming.agent_id, incoming.order_id, incoming.remaining
+                )
+            )
+            incoming.remaining = Quantity(0)
+            incoming.status = OrderStatus.CANCELLED
+
+        return events
+
     def _match(self, incoming: Order) -> list[Event]:
         """Walk the opposite side until filled or out of crossable price."""
         events: list[Event] = []
@@ -200,6 +238,16 @@ class MatchingEngine:
                 continue
 
             resting = level.peek()
+
+            if (
+                resting.agent_id == incoming.agent_id
+                and self.self_trade_prevention is not SelfTradePrevention.ALLOW
+            ):
+                events.extend(self._prevent_self_trade(incoming, resting, level))
+                if incoming.status is OrderStatus.CANCELLED:
+                    break
+                continue
+
             traded = Quantity(min(incoming.remaining, resting.remaining))
 
             self.book.consume(resting, traded)

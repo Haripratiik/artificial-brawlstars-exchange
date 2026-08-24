@@ -162,6 +162,13 @@ class ReferenceMatcher:
             if not self._crosses(incoming.side, resting.price, incoming.price):
                 return
 
+            # Self-match prevention, cancel-oldest. Modelled here too so the
+            # policy is differentially tested rather than trusted: a wash trade
+            # nets to zero and so hides in every aggregate except the tape.
+            if resting.agent_id == incoming.agent_id:
+                resting.dead = True
+                continue
+
             traded = min(incoming.remaining, resting.remaining)
             resting.remaining -= traded
             incoming.remaining -= traded
