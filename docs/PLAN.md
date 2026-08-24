@@ -187,7 +187,7 @@ Implemented in detail in [ECONOMY.md](ECONOMY.md), including the open judgment c
 - **Exit:** same contract + same dataset ⇒ byte-identical settlement digest, and a mutated
   reference-weight file changes that digest.
 
-### Phase 2 — Exchange kernel, Python reference
+### Phase 2 — Exchange kernel, Python reference — **DONE**
 Deliberately in Python first.
 - Price-time priority book, limit/market/cancel/replace, partial fills, deterministic sequence
   numbers, trade tape, L2 snapshots.

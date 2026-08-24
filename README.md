@@ -25,9 +25,9 @@ Early. Two of ten phases are complete; the roadmap is in [docs/PLAN.md](docs/PLA
 | Phase | | |
 |---|---|---|
 | 0 | Data collection | **done** — snowball crawler, resumable, running |
-| 1 | Contracts & deterministic settlement | **done** — 100 tests |
-| 2 | Exchange kernel (Python reference) | next |
-| 3 | Minimal artificial market | |
+| 1 | Contracts & deterministic settlement | **done** |
+| 2 | Exchange kernel (Python reference) | **done** — matching engine + event kernel |
+| 3 | Minimal artificial market | next |
 | 4 | C++ kernel, differential-tested | |
 | 5 | Synthetic world, heterogeneous information | |
 | 6 | Information-aggregation experiment | |
@@ -64,6 +64,17 @@ hardcoded constant. Standardization weights, hierarchical priors, and the shrink
 all derived from data knowable at the snapshot date — the last by method of moments on a
 beta-binomial, cross-checked against out-of-sample prediction error. Each snapshot is immutable
 and pinned by contract, while the *series* of snapshots is re-derived as the metagame moves.
+
+**An exchange where information timing is real.** A price-time-priority matching engine on integer
+ticks and lots, deterministic by construction — identical command streams produce identical event
+streams, which is the acceptance test the C++ port will have to pass. It sits behind a
+discrete-event kernel with a per-agent latency matrix, so two subscribers to the same feed
+genuinely see the same print at different times. That gap is not a simulation artifact to smooth
+over; it is what later phases turn into a measurable dollar value.
+
+```
+python examples/market_session.py     # 30s session: maker, noise traders, latency probe
+```
 
 **Lookahead prevention as a structural property.** A contract published after its observation
 window opens is rejected at construction. Reference snapshots must predate the windows they
