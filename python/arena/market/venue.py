@@ -125,6 +125,11 @@ class Venue:
         self._engines: dict[str, MatchingEngine] = {}
         self._accounts: dict[AgentId, Account] = {}
         self._closed: set[str] = set()
+        # Symbols that have settled. Tracked here rather than only on the
+        # accounts, because a symbol nobody held would otherwise settle twice
+        # without complaint -- and a settlement firing more than once is a
+        # plausible bug in any event-driven system.
+        self._settled: set[str] = set()
         # Orders each agent has working, per symbol: order_id -> (side, qty,
         # price in minor units). Collateral is reserved against these, not only
         # against filled positions.
@@ -198,11 +203,21 @@ class Venue:
             # risk cannot be taken once the outcome is determined.
             return [Rejected(SequenceNumber(0), agent_id, RejectReason.ALREADY_TERMINAL)]
 
-        if isinstance(command, Submit) and not self._affordable(
+        # Replace is checked as well as Submit. Guarding only new orders leaves
+        # a hole wide enough to drive through: an agent could work ten lots,
+        # then replace them with five hundred at a worse price and take on
+        # exposure the account was never able to cover. A modification is a
+        # request for risk exactly like an order is.
+        if isinstance(command, (Submit, Replace)) and not self._affordable(
             agent_id, instrument, command
         ):
             return [
-                Rejected(SequenceNumber(0), agent_id, RejectReason.INSUFFICIENT_COLLATERAL)
+                Rejected(
+                    SequenceNumber(0),
+                    agent_id,
+                    RejectReason.INSUFFICIENT_COLLATERAL,
+                    getattr(command, "order_id", None),
+                )
             ]
 
         events = self._engines[symbol].apply(command)
@@ -236,11 +251,27 @@ class Venue:
         symbol = instrument.symbol
         account = self.account(agent_id)
         bounds = instrument.bounds_in_minor
+        working = dict(self._working.get((agent_id, symbol), {}))
 
-        if command.price is not None:
+        if isinstance(command, Replace):
+            existing = working.pop(command.order_id, None)
+            if existing is None:
+                # Nothing of ours to replace. Let the engine reject it for the
+                # right reason rather than pre-empting with a collateral error.
+                return True
+            side = existing[0]
+            quantity = int(command.new_quantity)
+            price = (
+                instrument.price_in_minor(command.new_price)
+                if command.new_price is not None
+                else Money(existing[2])
+            )
+        elif command.price is not None:
+            side = command.side
             price = instrument.price_in_minor(command.price)
             quantity = int(command.quantity)
         else:
+            side = command.side
             # A market order can only ever trade against resting liquidity, so
             # its exposure is bounded by the book rather than by the contract's
             # settlement range. Reserving against the far end of the range --
@@ -248,7 +279,7 @@ class Venue:
             # that could never have cost anything like that much, and does it
             # for a price the order was structurally incapable of paying.
             quantity, price = self._market_exposure(
-                symbol, instrument, command.side, int(command.quantity)
+                symbol, instrument, side, int(command.quantity)
             )
             if quantity == 0:
                 # No liquidity to hit. The order will cancel unfilled and can
@@ -258,10 +289,12 @@ class Venue:
         position = account.positions.get(symbol)
         current = position.quantity if position else 0
 
-        working = self._working.get((agent_id, symbol), {})
-        buys = sum(q for side, q, _p in working.values() if side is Side.BUY)
-        sells = sum(q for side, q, _p in working.values() if side is Side.SELL)
-        if command.side is Side.BUY:
+        # `working` already has the order being replaced removed, so a
+        # modification is measured as the difference it makes rather than as
+        # additional exposure on top of what it supersedes.
+        buys = sum(q for s, q, _p in working.values() if s is Side.BUY)
+        sells = sum(q for s, q, _p in working.values() if s is Side.SELL)
+        if side is Side.BUY:
             buys += quantity
         else:
             sells += quantity
@@ -328,6 +361,16 @@ class Venue:
                         book.pop(event.order_id, None)
                     else:
                         book[event.order_id] = (existing[0], remaining, existing[2])
+            elif isinstance(event, Replaced):
+                # The engine keeps the order id across a replace, whether or
+                # not queue priority survived, so the entry is updated in place.
+                # Leaving the old size and price here would reserve collateral
+                # against an order that no longer exists.
+                book[event.order_id] = (
+                    book.get(event.order_id, (Side.BUY, 0, 0))[0],
+                    int(event.quantity),
+                    int(self.registry.require(symbol).price_in_minor(event.price)),
+                )
             elif isinstance(event, (Cancelled, Rejected)):
                 book.pop(getattr(event, "order_id", None), None)
 
@@ -355,6 +398,10 @@ class Venue:
     def closed_symbols(self) -> tuple[str, ...]:
         return tuple(sorted(self._closed))
 
+    @property
+    def settled_symbols(self) -> tuple[str, ...]:
+        return tuple(sorted(self._settled))
+
     def settle(self, symbol: str, result: SettlementResult) -> dict[AgentId, Decimal]:
         """Apply a settlement to every account holding the symbol.
 
@@ -370,7 +417,18 @@ class Venue:
                 f"listed instrument is {instrument.spec.spec_digest}. The contract that "
                 "settled is not the contract that traded."
             )
+        if symbol in self._settled:
+            raise ValueError(
+                f"{symbol} has already settled. Settling twice would pay every "
+                "position out twice, and an expiry firing more than once is a "
+                "plausible bug rather than an impossible one."
+            )
+        self._settled.add(symbol)
         self._closed.add(symbol)
+        # Nothing can be working on a settled contract. Leaving entries behind
+        # would keep reserving collateral against orders that can never fill.
+        for key in [k for k in self._working if k[1] == symbol]:
+            del self._working[key]
 
         realised: dict[AgentId, Decimal] = {}
         for agent_id in sorted(self._accounts):

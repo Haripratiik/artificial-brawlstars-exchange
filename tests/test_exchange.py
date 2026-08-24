@@ -226,6 +226,48 @@ def test_fok_spanning_several_levels_is_allowed(engine):
     assert sum(int(t.quantity) for t in trades(events)) == 10
 
 
+def test_cancelled_orders_do_not_inflate_reported_depth(engine):
+    """A tombstone mid-queue must not be counted as available liquidity.
+
+    Cancellation tombstones rather than splices, so the level's queue still
+    holds the dead order until something prunes past it. Summing the queue
+    counted it; the level's maintained total does not.
+    """
+    first = acked(engine.apply(limit(A, Side.SELL, 100, 10)))
+    engine.apply(limit(B, Side.SELL, 100, 10))
+    third = acked(engine.apply(limit(C, Side.SELL, 100, 10)))
+
+    # Cancel the middle one by cancelling first then third would prune; cancel
+    # a strictly interior order instead.
+    engine.apply(Cancel(A, first.order_id))       # front: pruned on next touch
+    engine.apply(Cancel(C, third.order_id))       # interior relative to nothing
+
+    assert int(engine.book.depth_at(Side.SELL, Price(100))) == 10
+    assert engine.book.snapshot().asks == ((100, 10),)
+
+
+def test_fill_or_kill_is_not_fooled_by_dead_liquidity(engine):
+    """The consequence of over-reported depth, and why it mattered.
+
+    ``_fillable`` reads the level totals. If a cancelled order still counted,
+    a FOK order would be accepted as satisfiable and then partially fill --
+    exactly what fill-or-kill exists to prevent.
+    """
+    engine.apply(limit(A, Side.SELL, 100, 5))
+    doomed = acked(engine.apply(limit(B, Side.SELL, 100, 20)))
+    engine.apply(Cancel(B, doomed.order_id))
+
+    events = engine.apply(limit(C, Side.BUY, 100, 15, TimeInForce.FOK))
+
+    assert trades(events) == [], "FOK filled against liquidity that was cancelled"
+    assert any(
+        isinstance(e, Rejected) and e.reason is RejectReason.FOK_NOT_FILLABLE
+        for e in events
+    )
+    # And the genuine five lots are untouched.
+    assert int(engine.book.depth_at(Side.SELL, Price(100))) == 5
+
+
 @pytest.mark.parametrize("quantity", [0, -5])
 def test_non_positive_quantity_is_rejected(engine, quantity):
     events = engine.apply(Submit(A, Side.BUY, Quantity(quantity), Price(100)))

@@ -171,11 +171,29 @@ class OrderBook:
         return None if price is None else self._levels[side][price]
 
     def depth_at(self, side: Side, price: Price) -> Quantity:
+        """Live resting quantity at a price.
+
+        Returns the level's maintained total rather than summing the deque, and
+        the distinction is a correctness one rather than a performance one.
+        Cancellation tombstones an order instead of splicing it out, and
+        ``prune`` only clears tombstones from the *front* of the queue -- so a
+        cancelled order sitting mid-queue is invisible to matching but was still
+        being counted by a naive sum.
+
+        That over-reported depth was not merely cosmetic. ``_fillable`` reads it
+        to decide whether a fill-or-kill order can be satisfied, so an inflated
+        figure let a FOK order be accepted and then partially fill, which is
+        precisely what fill-or-kill exists to prevent.
+
+        The total is exact because every path that removes quantity -- a fill via
+        ``consume``, a cancellation via ``remove``, a shrinking replace -- reduces
+        it at the same moment.
+        """
         level = self._levels[side].get(price)
         if level is None:
             return Quantity(0)
         level.prune()
-        return Quantity(sum(order.remaining for order in level.orders))
+        return Quantity(max(0, int(level.total)))
 
     def snapshot(self, levels: int = 5) -> BookSnapshot:
         """Aggregated depth, best first, at most ``levels`` prices per side."""
