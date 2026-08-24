@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arena Markets</title>
+<style>
+  :root{
+    --bg:#0b0e13; --panel:#12161f; --panel-2:#161b26; --line:#232a38;
+    --ink:#e6ebf5; --muted:#8b96ab; --dim:#5d6879;
+    --bid:#2ecc8f; --ask:#ff5c73; --accent:#5aa9ff; --warn:#ffb454;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:13px/1.45 var(--mono);-webkit-font-smoothing:antialiased}
+  header{display:flex;align-items:center;gap:18px;padding:10px 16px;
+         background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{margin:0;font-size:14px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent)}
+  .stat{display:flex;gap:6px;align-items:baseline}
+  .stat b{font-weight:600}
+  .muted{color:var(--muted)}
+  .dim{color:var(--dim)}
+  main{display:grid;grid-template-columns:210px minmax(0,1fr) 320px;gap:12px;padding:12px;
+       align-items:start}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow:hidden}
+  .panel h2{margin:0;padding:8px 12px;font-size:11px;letter-spacing:.12em;
+            text-transform:uppercase;color:var(--muted);
+            background:var(--panel-2);border-bottom:1px solid var(--line)}
+  .pad{padding:10px 12px}
+  table{width:100%;border-collapse:collapse}
+  td,th{padding:3px 12px;text-align:right;font-variant-numeric:tabular-nums}
+  th{color:var(--dim);font-weight:500;font-size:11px}
+  td:first-child,th:first-child{text-align:left}
+  .sym{display:block;width:100%;text-align:left;background:none;border:0;color:var(--ink);
+       padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--line);font:inherit}
+  .sym:hover{background:var(--panel-2)}
+  .sym.on{background:var(--panel-2);box-shadow:inset 3px 0 0 var(--accent)}
+  .sym .k{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+  .sym .m{float:right;color:var(--muted)}
+  .book{display:grid;grid-template-columns:1fr 1fr;gap:0}
+  .book>div{padding:6px 0}
+  .lvl{display:flex;justify-content:space-between;padding:2px 12px;position:relative}
+  .lvl span{position:relative;z-index:1}
+  .lvl .bar{position:absolute;top:1px;bottom:1px;opacity:.14;border-radius:2px}
+  .bids .bar{right:0;background:var(--bid)} .bids .p{color:var(--bid)}
+  .asks .bar{left:0;background:var(--ask)}  .asks .p{color:var(--ask)}
+  .mid{grid-column:1/-1;text-align:center;padding:6px;border-top:1px solid var(--line);
+       border-bottom:1px solid var(--line);background:var(--panel-2);color:var(--muted)}
+  .mid b{color:var(--ink);font-size:15px}
+  input,select,button{font:inherit;background:var(--panel-2);color:var(--ink);
+       border:1px solid var(--line);border-radius:4px;padding:6px 8px}
+  button{cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  .buy{background:rgba(46,204,143,.12);border-color:rgba(46,204,143,.5);color:var(--bid)}
+  .sell{background:rgba(255,92,115,.12);border-color:rgba(255,92,115,.5);color:var(--ask)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+  .row label{color:var(--muted);width:52px;flex:none}
+  .row input,.row select{flex:1;min-width:0}
+  .pos{color:var(--bid)} .neg{color:var(--ask)}
+  .tape td{padding:2px 12px}
+  .scroll{max-height:210px;overflow-y:auto}
+  .scroll::-webkit-scrollbar{width:8px}
+  .scroll::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+  canvas{display:block;width:100%;height:150px}
+  .toast{position:fixed;right:16px;bottom:16px;background:var(--panel-2);
+         border:1px solid var(--line);border-left:3px solid var(--warn);
+         padding:9px 13px;border-radius:5px;opacity:0;transition:opacity .2s;max-width:340px}
+  .toast.show{opacity:1}
+  .note{padding:8px 12px;color:var(--dim);font-size:11px;line-height:1.5;
+        border-top:1px solid var(--line)}
+  @media(max-width:1100px){main{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Arena Markets</h1>
+  <div class="stat"><span class="muted">clock</span><b id="clock">—</b></div>
+  <div class="stat"><span class="muted">events</span><b id="events">—</b></div>
+  <div class="stat"><span class="muted">equity</span><b id="equity">—</b></div>
+  <div class="stat"><span class="muted">P&L</span><b id="pnl">—</b></div>
+  <div class="stat"><span class="muted">free</span><b id="free">—</b></div>
+  <div class="stat"><span class="muted">collateral</span><b id="coll">—</b></div>
+  <div class="stat" style="margin-left:auto">
+    <span class="muted">speed</span>
+    <select id="speed">
+      <option value="0">paused</option>
+      <option value="1" selected>1×</option>
+      <option value="3">3×</option>
+      <option value="10">10×</option>
+    </select>
+  </div>
+  <div class="stat"><span class="dim" id="conn">connecting…</span></div>
+</header>
+
+<main>
+  <div class="panel" id="symbols"><h2>Instruments</h2><div id="symlist"></div>
+    <div class="note">Every contract settles from the same Brawl Stars dataset.
+      Two funds hold noisy views of where each will settle; one is sharper than
+      the other. A colocated market maker quotes both sides.</div>
+  </div>
+
+  <div>
+    <div class="panel" style="margin-bottom:12px">
+      <h2><span id="bookname">—</span> · order book</h2>
+      <div class="book">
+        <div class="bids" id="bids"></div>
+        <div class="asks" id="asks"></div>
+        <div class="mid">mark <b id="mark">—</b> <span class="dim" id="spread"></span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Price</h2>
+      <canvas id="chart"></canvas>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel" style="margin-bottom:12px">
+      <h2>Order entry</h2>
+      <div class="pad">
+        <div class="row"><label>size</label><input id="qty" type="number" value="10" min="1"></div>
+        <div class="row"><label>price</label><input id="px" type="text" placeholder="blank = market"></div>
+        <div class="grid2">
+          <button class="buy"  id="buy">BUY</button>
+          <button class="sell" id="sell">SELL</button>
+        </div>
+        <div class="grid2" style="margin-top:8px">
+          <button id="flat">Flatten all</button>
+          <button id="cancel">Cancel mine</button>
+        </div>
+      </div>
+      <div class="note">Your orders travel through the kernel with a 20&nbsp;ms
+        latency, like every other agent's. No privileged fills, and the same
+        collateral check.</div>
+    </div>
+
+    <div class="panel" style="margin-bottom:12px">
+      <h2>Positions</h2>
+      <div class="scroll"><table id="positions"></table></div>
+    </div>
+
+    <div class="panel" style="margin-bottom:12px">
+      <h2>Working orders</h2>
+      <div class="scroll"><table id="orders"></table></div>
+    </div>
+
+    <div class="panel">
+      <h2>Time &amp; sales</h2>
+      <div class="scroll"><table class="tape" id="tape"></table></div>
+    </div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let selected = null, socket = null, history = {}, lastMark = {}, symList = [];
+
+function fmt(n, d=2){
+  const v = Number(n);
+  if (!isFinite(v)) return "—";
+  return v.toLocaleString(undefined,{minimumFractionDigits:d, maximumFractionDigits:d});
+}
+function toast(msg){
+  const el = $("#toast"); el.textContent = msg; el.classList.add("show");
+  clearTimeout(el._t); el._t = setTimeout(()=>el.classList.remove("show"), 2600);
+}
+
+function connect(){
+  socket = new WebSocket(`ws://${location.host}/ws`);
+  socket.onopen  = () => { $("#conn").textContent = "live"; $("#conn").style.color = "var(--bid)"; };
+  socket.onclose = () => { $("#conn").textContent = "disconnected"; $("#conn").style.color = "var(--ask)";
+                           setTimeout(connect, 1200); };
+  socket.onmessage = e => {
+    const data = JSON.parse(e.data);
+    if (data.ack){ if(!data.ack.ok) toast(data.ack.error || "rejected"); return; }
+    render(data);
+  };
+}
+function send(payload){
+  if (socket && socket.readyState === 1) socket.send(JSON.stringify(payload));
+}
+
+function render(s){
+  $("#clock").textContent  = (s.clock/1e9).toFixed(1)+"s";
+  $("#events").textContent = s.events.toLocaleString();
+  $("#equity").textContent = fmt(s.account.equity);
+  $("#free").textContent   = fmt(s.account.free_cash);
+  $("#coll").textContent   = fmt(s.account.collateral);
+  const pnl = $("#pnl");
+  pnl.textContent = (Number(s.account.pnl)>=0?"+":"") + fmt(s.account.pnl);
+  pnl.className = Number(s.account.pnl) >= 0 ? "pos" : "neg";
+
+  const symbols = Object.keys(s.books);
+  if (!selected || !symbols.includes(selected)) selected = symbols[0];
+
+  // Instrument list. Built once, then updated in place.
+  //
+  // Re-rendering this every frame is the obvious approach and it makes the UI
+  // unusable: at 20 Hz an element is destroyed and recreated between a person
+  // deciding to click and the click landing, so buttons go dead and inputs
+  // lose focus mid-keystroke. Only the numbers change every frame; the
+  // elements themselves persist.
+  if (symList.join("|") !== symbols.join("|")){
+    symList = symbols.slice();
+    $("#symlist").innerHTML = symbols.map(sym =>
+      `<button class="sym" data-s="${sym}">${sym}<span class="m"></span>
+        <span class="k">${s.books[sym].class}</span></button>`).join("");
+  }
+  document.querySelectorAll(".sym").forEach(el => {
+    const sym = el.dataset.s, b = s.books[sym];
+    const prev = lastMark[sym];
+    const dir = prev === undefined ? "" : (Number(b.mark) > prev ? "pos" : Number(b.mark) < prev ? "neg" : "");
+    lastMark[sym] = Number(b.mark);
+    const m = el.querySelector(".m");
+    m.textContent = fmt(b.mark);
+    m.className = "m " + dir;
+    el.classList.toggle("on", sym === selected);
+  });
+
+  // Book
+  const book = s.books[selected];
+  $("#bookname").textContent = selected;
+  $("#mark").textContent = fmt(book.mark);
+  $("#spread").textContent = book.spread ? `· spread ${book.spread}` : "· no two-sided market";
+
+  const maxQ = Math.max(1, ...book.bids.map(l=>l[1]), ...book.asks.map(l=>l[1]));
+  const level = (l, side) => `<div class="lvl">
+      <div class="bar" style="width:${(l[1]/maxQ*100).toFixed(0)}%"></div>
+      <span class="p">${fmt(l[0])}</span><span>${l[1]}</span></div>`;
+  $("#bids").innerHTML = book.bids.map(l=>level(l,"b")).join("") || `<div class="lvl dim">no bids</div>`;
+  $("#asks").innerHTML = book.asks.map(l=>level(l,"a")).join("") || `<div class="lvl dim">no offers</div>`;
+
+  // Chart history
+  const h = history[selected] ||= [];
+  const m = Number(book.mark);
+  if (isFinite(m) && (h.length===0 || h[h.length-1] !== m)) h.push(m);
+  if (h.length > 420) h.shift();
+  drawChart(h);
+
+  // Positions
+  $("#positions").innerHTML =
+    `<tr><th>symbol</th><th>qty</th><th>avg</th><th>unreal</th></tr>` +
+    (s.account.positions.length ? s.account.positions.map(p=>`<tr>
+        <td>${p.symbol}</td>
+        <td class="${p.quantity>0?'pos':p.quantity<0?'neg':''}">${p.quantity>0?'+':''}${p.quantity}</td>
+        <td>${fmt(p.average_price)}</td>
+        <td class="${Number(p.unrealized)>=0?'pos':'neg'}">${fmt(p.unrealized)}</td>
+      </tr>`).join("") : `<tr><td colspan="4" class="dim">flat</td></tr>`);
+
+  // Working orders
+  $("#orders").innerHTML =
+    `<tr><th>id</th><th>symbol</th><th></th></tr>` +
+    (s.orders.length ? s.orders.map(o=>`<tr>
+        <td>${o.order_id}</td><td>${o.symbol}</td>
+        <td><button data-o="${o.order_id}" class="x">×</button></td>
+      </tr>`).join("") : `<tr><td colspan="3" class="dim">none working</td></tr>`);
+
+  // Tape
+  $("#tape").innerHTML =
+    `<tr><th>symbol</th><th>price</th><th>qty</th></tr>` +
+    (s.tape.length ? s.tape.slice(0,40).map(t=>`<tr>
+        <td class="dim">${t.symbol}</td>
+        <td class="${t.side==='buy'?'pos':'neg'}">${fmt(t.price)}</td>
+        <td>${t.quantity}</td></tr>`).join("")
+      : `<tr><td colspan="3" class="dim">no trades yet</td></tr>`);
+}
+
+function drawChart(series){
+  const c = $("#chart"), ctx = c.getContext("2d");
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== w*2){ c.width = w*2; c.height = h*2; ctx.scale(2,2); }
+  ctx.clearRect(0,0,w,h);
+  if (series.length < 2) return;
+
+  const lo = Math.min(...series), hi = Math.max(...series);
+  const pad = (hi-lo)*0.12 || 1;
+  const y = v => h - 12 - ((v-lo+pad)/((hi-lo)+2*pad))*(h-24);
+  const x = i => (i/(series.length-1))*w;
+
+  ctx.strokeStyle = "#232a38"; ctx.lineWidth = 1;
+  for(let g=0; g<=3; g++){ const gy = 12+g*(h-24)/3;
+    ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(w,gy); ctx.stroke(); }
+
+  const grad = ctx.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0,"rgba(90,169,255,.28)"); grad.addColorStop(1,"rgba(90,169,255,0)");
+  ctx.beginPath(); ctx.moveTo(x(0), y(series[0]));
+  series.forEach((v,i)=>ctx.lineTo(x(i), y(v)));
+  ctx.lineTo(w,h); ctx.lineTo(0,h); ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
+
+  ctx.beginPath(); ctx.moveTo(x(0), y(series[0]));
+  series.forEach((v,i)=>ctx.lineTo(x(i), y(v)));
+  ctx.strokeStyle = "#5aa9ff"; ctx.lineWidth = 1.6; ctx.stroke();
+
+  ctx.fillStyle = "#5d6879"; ctx.font = "10px ui-monospace,monospace";
+  ctx.fillText(hi.toFixed(2), 4, 12);
+  ctx.fillText(lo.toFixed(2), 4, h-4);
+}
+
+function order(side){
+  const px = $("#px").value.trim();
+  send({action:"submit", symbol:selected, side, quantity:Number($("#qty").value),
+        price: px === "" ? null : px});
+}
+$("#symlist").addEventListener("click", e => {
+  const el = e.target.closest(".sym"); if (el) selected = el.dataset.s;
+});
+$("#orders").addEventListener("click", e => {
+  const el = e.target.closest(".x");
+  if (el) send({action:"cancel", order_id:Number(el.dataset.o)});
+});
+$("#buy").onclick  = () => order("buy");
+$("#sell").onclick = () => order("sell");
+$("#flat").onclick = () => send({action:"flatten"});
+$("#cancel").onclick = () => send({action:"cancel_all"});
+$("#speed").onchange = e => send({action:"speed", value:Number(e.target.value)});
+addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "b") order("buy");
+  if (e.key === "s") order("sell");
+});
+connect();
+</script>
+</body>
+</html>

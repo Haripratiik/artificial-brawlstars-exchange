@@ -14,19 +14,54 @@ directly rather than assumed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timezone
 from typing import Any
 
 import pytest
 
 from arena.exchange.events import Acknowledged, Filled, Submit
 from arena.exchange.types import AgentId, OrderType, Price, Quantity, Side, TimeInForce
-from arena.sim.exchange_agent import ExchangeAgent
+from arena.contracts.payoff import Linear
+from arena.contracts.spec import ContractSpec, DataPolicy, ObservationWindow
+from arena.contracts.underlying import MetricRef, Single
+from arena.market.instrument import Instrument
+from arena.market.venue import SymbolCommand, Venue
+from arena.market.venue_agent import VenueAgent
 from arena.sim.kernel import Kernel, SimulationContext
 from arena.sim.latency import PairwiseLatency, UniformLatency
 from arena.sim.messages import Feed, PrivateEvent, Subscribe, TopOfBook, TradePrint
 from arena.sim.time import Duration, Timestamp, micros, millis, seconds
 
+UTC = timezone.utc
 EXCHANGE = AgentId("exchange")
+SYM = "TEST_FUT"
+
+
+def make_exchange() -> VenueAgent:
+    """A one-symbol venue, so these tests stay about the kernel.
+
+    The kernel does not care how many instruments a venue lists; these tests
+    are about ordering, latency and delivery, so they use the smallest venue
+    that can accept an order.
+    """
+    from datetime import datetime as _dt, timedelta as _td
+
+    window = ObservationWindow(
+        _dt(2026, 9, 1, tzinfo=UTC), _dt(2026, 9, 30, tzinfo=UTC)
+    )
+    spec = ContractSpec(
+        contract_id=SYM,
+        underlying=Single(MetricRef("adjusted_win_rate", "SPIKE")),
+        payoff=Linear(scale=10_000.0),
+        window=window,
+        policy=DataPolicy(min_sample_size=1),
+        reference_id="ref-1",
+        published_at=window.start - _td(days=1),
+        tick_size="1",
+    )
+    venue = Venue("test", starting_cash=50_000_000)
+    venue.list_instrument(Instrument(SYM, spec))
+    return VenueAgent(EXCHANGE, venue)
 
 
 @dataclass
@@ -126,7 +161,7 @@ def test_simultaneous_events_are_broken_by_insertion_order():
 
 def _run_market(seed: int, latency=None) -> list[dict]:
     kernel = Kernel(seed=seed, latency=latency)
-    exchange = ExchangeAgent(EXCHANGE, "SPIKE_WR_FUT")
+    exchange = make_exchange()
     kernel.add(exchange)
 
     for i, (side, price, qty) in enumerate(
@@ -140,12 +175,12 @@ def _run_market(seed: int, latency=None) -> list[dict]:
     ):
         name = AgentId(f"trader{i}")
         kernel.add(
-            Recorder(name, subscribe_to=(Feed.TRADES,), to_send=[(EXCHANGE, limit(name, side, price, qty))])
+            Recorder(name, subscribe_to=(Feed.TRADES,), to_send=[(EXCHANGE, SymbolCommand(SYM, limit(name, side, price, qty)))])
         )
 
     kernel.run(until=seconds(5))
-    return [e.to_dict() for e in exchange.engine.apply_all([])] or [
-        t.to_dict() for t in exchange.tape
+    return [e.to_dict() for e in []] or [
+        t.to_dict() for t in exchange.venue.engine(SYM).tape
     ]
 
 
@@ -212,19 +247,19 @@ def test_a_slow_agent_sees_the_same_event_later():
         jitter_fraction=0.0,
     )
     kernel = Kernel(seed=1, latency=latency)
-    exchange = ExchangeAgent(EXCHANGE)
+    exchange = make_exchange()
     fast = Recorder(AgentId("fast"), subscribe_to=(Feed.TRADES,))
     slow = Recorder(AgentId("slow"), subscribe_to=(Feed.TRADES,))
     # Both trade only after 500ms, by which time even the slow agent's
     # subscription (itself delayed 100ms) has reached the exchange.
     mover = Recorder(
         AgentId("mover"),
-        to_send=[(EXCHANGE, limit(AgentId("mover"), Side.SELL, 100, 10))],
+        to_send=[(EXCHANGE, SymbolCommand(SYM, limit(AgentId("mover"), Side.SELL, 100, 10)))],
         send_after=millis(500),
     )
     taker = Recorder(
         AgentId("taker"),
-        to_send=[(EXCHANGE, limit(AgentId("taker"), Side.BUY, 100, 10))],
+        to_send=[(EXCHANGE, SymbolCommand(SYM, limit(AgentId("taker"), Side.BUY, 100, 10)))],
         send_after=millis(600),
     )
     kernel.add_all([exchange, fast, slow, mover, taker])
@@ -248,7 +283,7 @@ def test_trade_prints_carry_a_unique_sequence():
     engine's match number is carried through unchanged for exactly this reason.
     """
     kernel = Kernel(seed=3, latency=UniformLatency(base=millis(1), jitter=Duration(0)))
-    exchange = ExchangeAgent(EXCHANGE)
+    exchange = make_exchange()
     watcher = Recorder(AgentId("watcher"), subscribe_to=(Feed.TRADES,))
     maker, taker = AgentId("maker"), AgentId("taker")
 
@@ -258,12 +293,12 @@ def test_trade_prints_carry_a_unique_sequence():
             watcher,
             Recorder(
                 maker,
-                to_send=[(EXCHANGE, limit(maker, Side.SELL, 100, 1)) for _ in range(5)],
+                to_send=[(EXCHANGE, SymbolCommand(SYM, limit(maker, Side.SELL, 100, 1))) for _ in range(5)],
                 send_after=millis(10),
             ),
             Recorder(
                 taker,
-                to_send=[(EXCHANGE, limit(taker, Side.BUY, 100, 1)) for _ in range(5)],
+                to_send=[(EXCHANGE, SymbolCommand(SYM, limit(taker, Side.BUY, 100, 1))) for _ in range(5)],
                 send_after=millis(20),
             ),
         ]
@@ -307,22 +342,22 @@ def test_the_slower_leg_dominates_a_pair():
 
 def test_orders_routed_through_the_kernel_reach_the_book():
     kernel = Kernel(seed=1, latency=UniformLatency(base=millis(1), jitter=Duration(0)))
-    exchange = ExchangeAgent(EXCHANGE)
+    exchange = make_exchange()
     alice = AgentId("alice")
     kernel.add_all(
-        [exchange, Recorder(alice, to_send=[(EXCHANGE, limit(alice, Side.BUY, 100, 10))])]
+        [exchange, Recorder(alice, to_send=[(EXCHANGE, SymbolCommand(SYM, limit(alice, Side.BUY, 100, 10)))])]
     )
     kernel.run(until=seconds(1))
 
-    assert exchange.snapshot().best_bid == 100
+    assert exchange.venue.engine(SYM).book.snapshot().best_bid == 100
 
 
 def test_an_agent_receives_its_own_fills_privately():
     kernel = Kernel(seed=1, latency=UniformLatency(base=millis(1), jitter=Duration(0)))
-    exchange = ExchangeAgent(EXCHANGE)
+    exchange = make_exchange()
     maker, taker = AgentId("maker"), AgentId("taker")
-    m = Recorder(maker, to_send=[(EXCHANGE, limit(maker, Side.SELL, 100, 10))])
-    t = Recorder(taker, to_send=[(EXCHANGE, limit(taker, Side.BUY, 100, 10))])
+    m = Recorder(maker, to_send=[(EXCHANGE, SymbolCommand(SYM, limit(maker, Side.SELL, 100, 10)))])
+    t = Recorder(taker, to_send=[(EXCHANGE, SymbolCommand(SYM, limit(taker, Side.BUY, 100, 10)))])
     kernel.add_all([exchange, m, t])
     kernel.run(until=seconds(1))
 
@@ -342,26 +377,26 @@ def test_an_agent_receives_its_own_fills_privately():
 def test_an_agent_cannot_act_for_another():
     """Trusting the agent_id field would let anyone cancel anyone's orders."""
     kernel = Kernel(seed=1, latency=UniformLatency(base=millis(1), jitter=Duration(0)))
-    exchange = ExchangeAgent(EXCHANGE)
+    exchange = make_exchange()
     alice, mallory = AgentId("alice"), AgentId("mallory")
     # Mallory sends an order claiming to be Alice.
-    bad = Recorder(mallory, to_send=[(EXCHANGE, limit(alice, Side.BUY, 100, 10))])
+    bad = Recorder(mallory, to_send=[(EXCHANGE, SymbolCommand(SYM, limit(alice, Side.BUY, 100, 10)))])
     kernel.add_all([exchange, Recorder(alice), bad])
     kernel.run(until=seconds(1))
 
-    assert exchange.snapshot().best_bid is None
+    assert exchange.venue.engine(SYM).book.snapshot().best_bid is None
 
 
 def test_a_new_subscriber_gets_an_immediate_snapshot():
     """Otherwise a subscriber is blind until something happens to move the book."""
     kernel = Kernel(seed=1, latency=UniformLatency(base=millis(1), jitter=Duration(0)))
-    exchange = ExchangeAgent(EXCHANGE)
+    exchange = make_exchange()
     seeder = AgentId("seeder")
     watcher = Recorder(AgentId("watcher"), subscribe_to=(Feed.TOP_OF_BOOK,))
     kernel.add_all(
         [
             exchange,
-            Recorder(seeder, to_send=[(EXCHANGE, limit(seeder, Side.BUY, 100, 10))]),
+            Recorder(seeder, to_send=[(EXCHANGE, SymbolCommand(SYM, limit(seeder, Side.BUY, 100, 10)))]),
             watcher,
         ]
     )
@@ -373,7 +408,7 @@ def test_a_new_subscriber_gets_an_immediate_snapshot():
 def test_throttled_subscribers_receive_fewer_updates():
     """Models a subscriber that cannot consume every tick."""
     kernel = Kernel(seed=1, latency=UniformLatency(base=micros(10), jitter=Duration(0)))
-    exchange = ExchangeAgent(EXCHANGE)
+    exchange = make_exchange()
 
     @dataclass
     class Churner:
@@ -387,7 +422,7 @@ def test_throttled_subscribers_receive_fewer_updates():
             self.sent += 1
             ctx.send(
                 EXCHANGE,
-                limit(self.agent_id, Side.BUY, 90 + self.sent % 5, 1),
+                SymbolCommand(SYM, limit(self.agent_id, Side.BUY, 90 + self.sent % 5, 1)),
             )
             if self.sent < 40:
                 ctx.request_wakeup(millis(1))

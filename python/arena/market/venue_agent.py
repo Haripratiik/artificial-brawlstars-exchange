@@ -1,0 +1,248 @@
+"""The venue as a participant in the simulation.
+
+Gives a multi-instrument :class:`~arena.market.venue.Venue` a mailbox, so agents
+reach it through the kernel and therefore through latency. Supersedes the
+single-instrument ``ExchangeAgent``: same responsibilities, plus symbol routing
+and the account layer.
+
+The layering is unchanged and deliberate:
+
+    matching        one MatchingEngine per symbol, still a pure function of its
+                    own command stream, so the C++ port's differential test
+                    remains statable per symbol
+    accounting      the Venue -- positions, collateral, settlement
+    timing          the kernel -- latency, ordering, wakeups
+    this module     the mailbox that joins them
+
+Private events go out before public ones, as on a real venue: an agent learns of
+its own fill before the tape learns a trade happened. The reverse would let a
+subscriber react to a print before its counterparty knew it had traded.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from arena.exchange.events import (
+    Acknowledged,
+    Cancel,
+    Cancelled,
+    Event,
+    Filled,
+    Rejected,
+    Replace,
+    Replaced,
+    Submit,
+    Traded,
+)
+from arena.exchange.types import AgentId, Quantity, Side
+from arena.market.venue import SymbolCommand, Venue
+from arena.sim.kernel import SimulationContext
+from arena.sim.messages import (
+    DepthUpdate,
+    Feed,
+    PrivateEvent,
+    Subscribe,
+    TopOfBook,
+    TradePrint,
+    Unsubscribe,
+)
+from arena.sim.time import Timestamp
+
+__all__ = ["VenueAgent"]
+
+
+@dataclass(slots=True)
+class _Subscription:
+    feed: Feed
+    symbol: str | None
+    throttle: int
+    last_sent: int = -1
+
+    def covers(self, symbol: str) -> bool:
+        return self.symbol is None or self.symbol == symbol
+
+
+class VenueAgent:
+    """A multi-instrument venue with a mailbox and market-data feeds."""
+
+    def __init__(
+        self, agent_id: AgentId, venue: Venue, depth_levels: int = 8
+    ) -> None:
+        self.agent_id = agent_id
+        self.venue = venue
+        self.depth_levels = depth_levels
+        self._subscriptions: dict[AgentId, list[_Subscription]] = {}
+        # Every public event in order, for the research harness and the UI.
+        # Agents never read this -- they only see what reaches their mailbox.
+        self.public_log: list[tuple[Timestamp, Any]] = []
+        self.max_log = 5_000
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def on_start(self, ctx: SimulationContext) -> None:
+        pass
+
+    def on_finish(self, ctx: SimulationContext) -> None:
+        pass
+
+    def on_wakeup(self, ctx: SimulationContext) -> None:
+        """The venue does not act on its own schedule."""
+
+    # -- mailbox -----------------------------------------------------------
+
+    def on_message(self, ctx: SimulationContext, sender: AgentId, message: Any) -> None:
+        if isinstance(message, Subscribe):
+            self._subscriptions.setdefault(sender, []).append(
+                _Subscription(message.feed, message.symbol, message.throttle)
+            )
+            # An immediate snapshot, so a new subscriber is not blind until
+            # something happens to move a book.
+            for symbol in self._symbols_for(message.symbol):
+                self._send_snapshot(ctx, sender, message.feed, symbol)
+            return
+
+        if isinstance(message, Unsubscribe):
+            existing = self._subscriptions.get(sender, [])
+            self._subscriptions[sender] = [
+                s
+                for s in existing
+                if not (s.feed is message.feed and s.symbol == message.symbol)
+            ]
+            return
+
+        if isinstance(message, SymbolCommand):
+            self._handle(ctx, sender, message.symbol, message.command)
+            return
+
+    def _symbols_for(self, symbol: str | None) -> tuple[str, ...]:
+        if symbol is None:
+            return self.venue.registry.symbols
+        return (symbol,) if self.venue.registry.get(symbol) else ()
+
+    def _handle(
+        self, ctx: SimulationContext, sender: AgentId, symbol: str, command: Any
+    ) -> None:
+        if not isinstance(command, (Submit, Cancel, Replace)):
+            return
+        if command.agent_id != sender:
+            # An agent may act only for itself. Trusting the field would let one
+            # agent cancel another's orders by writing a different id.
+            from arena.exchange.types import RejectReason, SequenceNumber
+
+            ctx.send(
+                sender,
+                PrivateEvent(
+                    Rejected(
+                        SequenceNumber(0), sender, RejectReason.NOT_ORDER_OWNER, None
+                    )
+                ),
+            )
+            return
+
+        events = self.venue.submit(sender, symbol, command)
+
+        for event in events:
+            owner = _owner(event)
+            if owner is not None:
+                ctx.send(owner, PrivateEvent(event, symbol))
+
+        traded = False
+        for event in events:
+            if isinstance(event, Traded):
+                traded = True
+                print_ = TradePrint(
+                    symbol=symbol,
+                    timestamp=ctx.now,
+                    sequence=event.sequence,
+                    price=event.price,
+                    quantity=event.quantity,
+                    aggressor_side=event.aggressor_side,
+                )
+                self._log(ctx.now, print_)
+                self._broadcast(ctx, Feed.TRADES, symbol, print_)
+
+        if events:
+            self._publish_quotes(ctx, symbol, include_depth=True, traded=traded)
+
+    # -- market data -------------------------------------------------------
+
+    def _publish_quotes(
+        self, ctx: SimulationContext, symbol: str, include_depth: bool, traded: bool
+    ) -> None:
+        top = self.top_of_book(symbol, ctx.now)
+        self._log(ctx.now, top)
+        self._broadcast(ctx, Feed.TOP_OF_BOOK, symbol, top)
+        if include_depth:
+            self._broadcast(
+                ctx,
+                Feed.DEPTH,
+                symbol,
+                DepthUpdate(
+                    symbol,
+                    ctx.now,
+                    self.venue.engine(symbol).book.snapshot(self.depth_levels),
+                ),
+            )
+
+    def top_of_book(self, symbol: str, now: Timestamp) -> TopOfBook:
+        book = self.venue.engine(symbol).book
+        bid = book.best_price(Side.BUY)
+        ask = book.best_price(Side.SELL)
+        return TopOfBook(
+            symbol=symbol,
+            timestamp=now,
+            bid=bid,
+            bid_size=book.depth_at(Side.BUY, bid) if bid is not None else Quantity(0),
+            ask=ask,
+            ask_size=book.depth_at(Side.SELL, ask) if ask is not None else Quantity(0),
+        )
+
+    def _broadcast(
+        self, ctx: SimulationContext, feed: Feed, symbol: str, message: Any
+    ) -> None:
+        """Send to every subscriber, each after their own latency.
+
+        Recipients are iterated in sorted order so the sequence of sends -- and
+        so the kernel sequence numbers that break timestamp ties -- does not
+        depend on the order agents happened to subscribe in.
+        """
+        for recipient in sorted(self._subscriptions):
+            for subscription in self._subscriptions[recipient]:
+                if subscription.feed is not feed or not subscription.covers(symbol):
+                    continue
+                if subscription.throttle > 0:
+                    if int(ctx.now) - subscription.last_sent < subscription.throttle:
+                        continue
+                subscription.last_sent = int(ctx.now)
+                ctx.send(recipient, message)
+                break
+
+    def _send_snapshot(
+        self, ctx: SimulationContext, recipient: AgentId, feed: Feed, symbol: str
+    ) -> None:
+        if feed is Feed.TOP_OF_BOOK:
+            ctx.send(recipient, self.top_of_book(symbol, ctx.now))
+        elif feed is Feed.DEPTH:
+            ctx.send(
+                recipient,
+                DepthUpdate(
+                    symbol,
+                    ctx.now,
+                    self.venue.engine(symbol).book.snapshot(self.depth_levels),
+                ),
+            )
+
+    def _log(self, now: Timestamp, message: Any) -> None:
+        self.public_log.append((now, message))
+        if len(self.public_log) > self.max_log:
+            # Bounded: a live session runs indefinitely, and an unbounded log is
+            # a memory leak with a long fuse.
+            del self.public_log[: len(self.public_log) - self.max_log]
+
+
+def _owner(event: Event) -> AgentId | None:
+    if isinstance(event, (Acknowledged, Rejected, Filled, Cancelled, Replaced)):
+        return event.agent_id
+    return None

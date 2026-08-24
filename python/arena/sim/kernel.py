@@ -141,6 +141,11 @@ class Kernel:
         self._processed = 0
         self._trace: list[ScheduledEvent] = []
         self.record_trace = False
+        self._started = False
+        self._finished = False
+        # Latest delivery time scheduled on each ordered pair, so messages on a
+        # link cannot overtake one another.
+        self._last_delivery: dict[tuple[AgentId, AgentId], int] = {}
 
     # -- registration ------------------------------------------------------
 
@@ -204,13 +209,40 @@ class Kernel:
         )
 
     def send(self, sender: AgentId, recipient: AgentId, message: Any) -> None:
-        """Queue a message for delivery after the pair's latency."""
+        """Queue a message for delivery after the pair's latency.
+
+        **Delivery order is preserved per ordered pair.** Latency is jittered,
+        and without this a message could overtake one sent earlier on the same
+        link -- which is not how an exchange session behaves. Order entry runs
+        over a stream, and a participant that received a fill before the
+        acknowledgement of the order it filled would be seeing something no real
+        venue produces.
+
+        The bug this prevents is not hypothetical or cosmetic: an agent that saw
+        a fill for an order it had not yet been told about would fail to
+        attribute the position, and the late acknowledgement would then leave a
+        phantom order working forever. Its own view of its book would silently
+        diverge from the venue's, which is the kind of error that survives all
+        the way into a PnL figure.
+
+        Modelled as a per-link FIFO: a message cannot be delivered before the
+        one ahead of it on the same link. Jitter still varies the delay, it just
+        cannot reorder.
+        """
         if recipient not in self._agents:
             raise KeyError(f"no such agent {recipient!r}")
         delay = self.latency.delay(sender, recipient)
+        arrival = int(self._now) + max(1, int(delay))
+
+        link = (sender, recipient)
+        previous = self._last_delivery.get(link)
+        if previous is not None and arrival <= previous:
+            arrival = previous + 1
+        self._last_delivery[link] = arrival
+
         self._push(
             ScheduledEvent(
-                timestamp=Timestamp(int(self._now) + max(1, int(delay))),
+                timestamp=Timestamp(arrival),
                 sequence=self._next_sequence(),
                 kind="deliver",
                 recipient=recipient,
@@ -221,6 +253,67 @@ class Kernel:
 
     # -- running -----------------------------------------------------------
 
+    def start(self) -> None:
+        """Deliver ``on_start`` to every agent. Idempotent.
+
+        Split out from :meth:`run` so the kernel can be driven incrementally --
+        a slice of simulated time per slice of wall clock -- which is what a
+        live interface needs. Batch runs and live runs then share one code
+        path, so a market watched in a browser behaves identically to the same
+        seed replayed headless.
+        """
+        if self._started:
+            return
+        self._started = True
+        for agent_id in self.agent_ids:
+            self._agents[agent_id].on_start(SimulationContext(self, agent_id))
+
+    def finish(self) -> None:
+        """Deliver ``on_finish`` to every agent. Idempotent."""
+        if self._finished:
+            return
+        self._finished = True
+        for agent_id in self.agent_ids:
+            self._agents[agent_id].on_finish(SimulationContext(self, agent_id))
+
+    def advance(
+        self, until: Timestamp | None = None, max_events: int | None = None
+    ) -> int:
+        """Process queued events up to ``until``. Returns how many ran.
+
+        Does not call ``on_start`` or ``on_finish`` -- the caller owns the
+        lifecycle, which is what makes stepping possible.
+        """
+        processed = 0
+        while self._queue:
+            if max_events is not None and processed >= max_events:
+                break
+            timestamp, _sequence, event = self._queue[0]
+            if until is not None and timestamp > int(until):
+                break
+            heapq.heappop(self._queue)
+
+            if timestamp < int(self._now):
+                raise RuntimeError(
+                    f"event at {timestamp} scheduled before current time {self._now}"
+                )
+            self._now = Timestamp(timestamp)
+            self._processed += 1
+            processed += 1
+            if self.record_trace:
+                self._trace.append(event)
+
+            agent = self._agents[event.recipient]
+            ctx = SimulationContext(self, event.recipient)
+            if event.kind == "wakeup":
+                agent.on_wakeup(ctx)
+            else:
+                agent.on_message(ctx, event.sender, event.payload)
+
+        if until is not None:
+            self._now = Timestamp(max(int(self._now), int(until)))
+        return processed
+
     def run(self, until: Timestamp | None = None, max_events: int | None = None) -> None:
         """Process the queue until it empties, time runs out, or the cap is hit.
 
@@ -229,9 +322,7 @@ class Kernel:
         unbounded loop inside a test suite is much harder to diagnose than a
         loud stop.
         """
-        for agent_id in self.agent_ids:
-            agent = self._agents[agent_id]
-            agent.on_start(SimulationContext(self, agent_id))
+        self.start()
 
         while self._queue:
             if max_events is not None and self._processed >= max_events:
@@ -263,9 +354,7 @@ class Kernel:
         if until is not None:
             self._now = Timestamp(max(int(self._now), int(until)))
 
-        for agent_id in self.agent_ids:
-            agent = self._agents[agent_id]
-            agent.on_finish(SimulationContext(self, agent_id))
+        self.finish()
 
     def summary(self) -> str:
         return (

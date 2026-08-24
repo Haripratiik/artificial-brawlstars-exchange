@@ -59,22 +59,36 @@ class Subscribe:
     """
 
     feed: Feed
+    symbol: str | None = None
     throttle: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class Unsubscribe:
     feed: Feed
+    symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class PrivateEvent:
-    """An engine event addressed to the agent that caused it."""
+    """An engine event addressed to the agent that caused it.
+
+    Carries the symbol because the matching engine does not: each engine serves
+    one book and so has no need of one. The venue knows which book produced the
+    event, and attaching it here is what lets an agent attribute a fill to an
+    instrument without having to remember what it last sent -- a guess that
+    breaks the moment it has orders working in two symbols at once.
+    """
 
     event: Event
+    symbol: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": "private", "event": self.event.to_dict()}
+        return {
+            "type": "private",
+            "symbol": self.symbol,
+            "event": self.event.to_dict(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +103,7 @@ class TradePrint:
     quietly match the wrong one.
     """
 
+    symbol: str
     timestamp: Timestamp
     sequence: SequenceNumber
     price: Price
@@ -98,6 +113,7 @@ class TradePrint:
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": "trade_print",
+            "symbol": self.symbol,
             "timestamp": int(self.timestamp),
             "sequence": int(self.sequence),
             "price": int(self.price),
@@ -110,6 +126,7 @@ class TradePrint:
 class TopOfBook:
     """Best bid and ask with their sizes. The cheapest useful quote feed."""
 
+    symbol: str
     timestamp: Timestamp
     bid: Price | None
     bid_size: Quantity
@@ -131,6 +148,7 @@ class TopOfBook:
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": "top_of_book",
+            "symbol": self.symbol,
             "timestamp": int(self.timestamp),
             "bid": None if self.bid is None else int(self.bid),
             "bid_size": int(self.bid_size),
@@ -143,12 +161,14 @@ class TopOfBook:
 class DepthUpdate:
     """Aggregated L2 depth, best first."""
 
+    symbol: str
     timestamp: Timestamp
     snapshot: BookSnapshot
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "type": "depth",
+            "symbol": self.symbol,
             "timestamp": int(self.timestamp),
             "bids": [[int(p), int(q)] for p, q in self.snapshot.bids],
             "asks": [[int(p), int(q)] for p, q in self.snapshot.asks],

@@ -27,7 +27,8 @@ Early. Two of ten phases are complete; the roadmap is in [docs/PLAN.md](docs/PLA
 | 0 | Data collection | **done** — snowball crawler, resumable, running |
 | 1 | Contracts & deterministic settlement | **done** |
 | 2 | Exchange kernel (Python reference) | **done** — matching engine + event kernel |
-| 3 | Minimal artificial market | next |
+| 3 | Instruments, positions, collateral, settlement | **done** |
+| 3b | Trading agents + live market UI | **done** |
 | 4 | C++ kernel, differential-tested | |
 | 5 | Synthetic world, heterogeneous information | |
 | 6 | Information-aggregation experiment | |
@@ -72,8 +73,18 @@ discrete-event kernel with a per-agent latency matrix, so two subscribers to the
 genuinely see the same print at different times. That gap is not a simulation artifact to smooth
 over; it is what later phases turn into a measurable dollar value.
 
+```bash
+python examples/full_market.py        # contracts -> trades -> settlement -> PnL
 ```
-python examples/market_session.py     # 30s session: maker, noise traders, latency probe
+
+**A market you can trade.** A browser terminal over the live simulation: order
+book, price chart, blotter, time and sales, and order entry. Your orders travel
+through the same kernel with a latency, hit the same collateral check, and get
+no privileged fills — you are an agent, not an observer.
+
+```bash
+pip install -e ".[dashboard]"
+python -m dashboard.server           # then open http://127.0.0.1:8000
 ```
 
 **Lookahead prevention as a structural property.** A contract published after its observation

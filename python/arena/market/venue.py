@@ -125,6 +125,10 @@ class Venue:
         self._engines: dict[str, MatchingEngine] = {}
         self._accounts: dict[AgentId, Account] = {}
         self._closed: set[str] = set()
+        # Orders each agent has working, per symbol: order_id -> (side, qty,
+        # price in minor units). Collateral is reserved against these, not only
+        # against filled positions.
+        self._working: dict[tuple[AgentId, str], dict[OrderId, tuple[Side, int, int]]] = {}
         # Last traded price per symbol, in ticks. The mark of last resort when
         # a book has no two-sided quote.
         self._last: dict[str, Price] = {}
@@ -203,27 +207,90 @@ class Venue:
 
         events = self._engines[symbol].apply(command)
         self._book_fills(symbol, instrument, events)
+        self._track_working(agent_id, symbol, events)
         return events
 
     def _affordable(
         self, agent_id: AgentId, instrument: Instrument, command: Submit
     ) -> bool:
-        """Would the worst case of the resulting position still be covered?
+        """Could the account survive every one of its working orders filling?
 
-        Priced at the order's own limit, or at the far end of the settlement
-        range for a market order -- because a market order can fill anywhere, so
-        the only honest assumption is the worst price it could get.
+        Checking only the position an order would create is not enough, and the
+        gap is not academic: a market maker works a bid and an ask at once, each
+        individually affordable, and ends up over-committed when both fill. The
+        symptom is an account with negative free cash, which is a venue that
+        allowed a trade it could not collateralise.
+
+        So the test is over *scenarios*, not over one order. Collateral is
+        reserved against the worse of the two directional extremes:
+
+            every working buy fills   ->  position + total working buy quantity
+            every working sell fills  ->  position - total working sell quantity
+
+        Only one of those can be the adverse one, so the maximum of the two is
+        both sufficient and not over-conservative. Working orders are priced at
+        their own limits; a market order is priced at the far end of the
+        settlement range, because it can fill anywhere and the only honest
+        assumption is the worst price it could get.
         """
+        symbol = instrument.symbol
         account = self.account(agent_id)
-        signed = int(command.quantity) * (1 if command.side is Side.BUY else -1)
         bounds = instrument.bounds_in_minor
         if command.price is not None:
             price = instrument.price_in_minor(command.price)
         else:
-            # A market order can fill anywhere, so the only honest assumption is
-            # the worst price it could get: the far end of the settlement range.
             price = bounds[1] if command.side is Side.BUY else bounds[0]
-        return account.can_afford(instrument.symbol, signed, price, bounds)
+
+        position = account.positions.get(symbol)
+        current = position.quantity if position else 0
+
+        working = self._working.get((agent_id, symbol), {})
+        buys = sum(q for side, q, _p in working.values() if side is Side.BUY)
+        sells = sum(q for side, q, _p in working.values() if side is Side.SELL)
+        if command.side is Side.BUY:
+            buys += int(command.quantity)
+        else:
+            sells += int(command.quantity)
+
+        # Price each scenario at the worst working price on that side, so a
+        # cheap order cannot subsidise an expensive one.
+        prices = [p for _s, _q, p in working.values()] + [int(price)]
+        worst_buy = Money(max(prices))
+        worst_sell = Money(min(prices))
+
+        required = max(
+            int(account.collateral_required(current + buys, worst_buy, bounds)),
+            int(account.collateral_required(current - sells, worst_sell, bounds)),
+        )
+        released = int(account.collateral.get(symbol, Money(0)))
+        return int(account.free_cash) + released >= required
+
+    def _track_working(
+        self, agent_id: AgentId, symbol: str, events: list[Event]
+    ) -> None:
+        """Maintain the book of orders this agent has working.
+
+        Reserving against working orders is the whole point of the affordability
+        scenario above, so this has to stay in step with the engine's view.
+        """
+        book = self._working.setdefault((agent_id, symbol), {})
+        for event in events:
+            if isinstance(event, Acknowledged) and event.price is not None:
+                book[event.order_id] = (
+                    event.side,
+                    int(event.quantity),
+                    int(self.registry.require(symbol).price_in_minor(event.price)),
+                )
+            elif isinstance(event, Filled):
+                existing = book.get(event.order_id)
+                if existing is not None:
+                    remaining = int(event.remaining)
+                    if remaining <= 0:
+                        book.pop(event.order_id, None)
+                    else:
+                        book[event.order_id] = (existing[0], remaining, existing[2])
+            elif isinstance(event, (Cancelled, Rejected)):
+                book.pop(getattr(event, "order_id", None), None)
 
     def _book_fills(
         self, symbol: str, instrument: Instrument, events: list[Event]
