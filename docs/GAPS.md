@@ -96,9 +96,7 @@ In the order that buys the most realism per unit of work:
 2. **Realistic order flow.** Power-law order sizes, clustered arrivals, and a
    cancel rate above 90% -- real books are mostly cancellations, and queue
    dynamics depend on it.
-3. **An arbitrageur.** Put-call parity does not hold in the live market and
-   nothing enforces cross-instrument consistency. This is the cheapest agent to
-   write and the one whose absence is most visible.
+3. ~~**An arbitrageur.**~~ **Written, and it half-works.** See below.
 4. **Fees.** Maker/taker economics change market-maker behaviour qualitatively,
    and the hooks already exist.
 5. **Auctions and halts.** Needed before any claim about opening dynamics or
@@ -107,3 +105,80 @@ In the order that buys the most realism per unit of work:
 Sophisticated market makers and buy-side firms come after all of these, because
 until the market reproduces known statistical regularities there is no way to
 tell a good market maker from a badly calibrated one.
+
+## The arbitrageur, and what measuring it actually showed
+
+`arena/agents/arbitrageur.py` derives its pricing identities from the listed
+contracts rather than from a hand-written table -- list a new spread and it
+becomes arbitrageable with no code change; list an index whose component has no
+future and no relation is formed, because a relation traded against a proxy is
+a bet rather than an arbitrage.
+
+Three predictions were made before it was measured. **Two were wrong.**
+
+**It is off by default, on the evidence.** `build()` takes `arbitrageur=True`
+to switch it on.
+
+**The spread gap: bought with liquidity, and not worth the price.** Paired
+seeds, 600 simulated seconds, mean `|SPIKE_CROW - (SPIKE_WR_FUT - CROW_WR_FUT)|`
+over the second half of each session, against visible ask depth in the top ten
+levels of `SPIKE_WR_FUT`:
+
+| version | mean gap (ticks) | ask depth | attempts |
+|---|---|---|---|
+| no arbitrageur | 307.7 | 785 | -- |
+| aggressive (fires on every wakeup) | 180.7 | ~130 | 337 |
+| restrained (scale-in rule) | 282.9 | 625 | 78 |
+
+The aggressive version really does enforce the relation better -- 41% tighter --
+and it does so by **stripping the book**, taking depth down by 83%. It fired on
+93% of its wakeups, roughly 1,400 times a session, because the gap never closed
+and nothing stopped it re-entering the same trade. A market that thin cannot
+absorb anyone else's order, and it broke a previously-verified property: a
+5,000-lot sweep that used to walk the book filled 26 lots at the touch.
+
+Restraining it (do not add to a package unless the dislocation has widened
+1.5x, and never take more than 25% of visible depth) restores the book and
+loses most of the consistency gain. Per seed, the gap ratio with the restrained
+version is 0.65, 1.29, 0.61, 0.90 -- it makes one of four seeds **worse**, and
+four seeds cannot distinguish a mean of 0.86 from 1.0.
+
+So the honest verdict is that this design does not reliably do its job. The
+resolution is not tuning: a taker enforces relations by consuming liquidity, and
+the agent that enforces them while *adding* liquidity is one that **posts** at
+relation-implied prices and hedges on fill. That is the deferred market-maker
+work, not an arbitrageur.
+
+What it does do reliably, and what the tests assert: derive the correct
+identities from the listed contracts with nothing hand-configured, respect its
+position limits on every leg, size to the depth it can actually see, and
+conserve value exactly.
+
+**Put-call parity: unenforceable, for a reason worth recording.** The call book
+is two-sided in **2% of samples**. The arbitrageur cannot check the relation
+98% of the time -- not because it declines, but because there is no price. Its
+own inventory in the option never exceeds 72 of a 300 limit; it is starved, not
+constrained.
+
+No arbitrageur fixes this. Parity needs a market maker that quotes the option
+off the *replicating portfolio* -- underlying plus put -- rather than off the
+option's own last trade, which is exactly how real option market makers work,
+and is the deferred "sophisticated market maker" work. Recorded here rather than
+patched, because tightening the arbitrageur's band would produce a smaller
+number without producing a two-sided option book.
+
+**The spread's mean reversion was diagnosed wrongly.** The plan called
+VR(32) = 0.25 on the spread a pathology caused by the spread being untethered
+from its legs. It is not. Measured per instrument:
+
+| symbol | VR(32) without arb | with arb |
+|---|---|---|
+| SPIKE_CROW (spread) | 0.27 | 0.25 |
+| SPIKE_WR_FUT (leg) | 1.73 | 1.26 |
+| CROW_WR_FUT (leg) | 1.47 | 1.09 |
+
+Both legs trend; their difference mean-reverts. That is the signature of
+**cointegration**, not of a broken market -- it is the reason pairs trading
+exists. Tying the spread to its legs did not move its variance ratio and should
+not have. The prediction that it would go to 1 was wrong on the theory, and the
+market was right.

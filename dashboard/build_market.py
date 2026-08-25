@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 
+from arena.agents.arbitrageur import Arbitrageur
 from arena.agents.fundamental import FundamentalTrader
 from arena.agents.market_maker import MarketMaker
 from arena.agents.noise import NoiseTrader
@@ -149,7 +150,12 @@ def true_values(listed: list[Instrument]) -> dict[str, float]:
     return values
 
 
-def build(seed: int = 7, speed: float = 1.0) -> LiveMarket:
+def build(
+    seed: int = 7,
+    speed: float = 1.0,
+    arbitrageur: bool = False,
+    recycle_capital: bool = True,
+) -> LiveMarket:
     listed = instruments()
     by_symbol = {i.symbol: i for i in listed}
     levels = true_levels(listed)
@@ -164,6 +170,7 @@ def build(seed: int = 7, speed: float = 1.0) -> LiveMarket:
         venue.list_instrument(instrument)
 
     maker_id = AgentId("mm-1")
+    arb_id = AgentId("arb-1")
     fund_ids = [AgentId("fund-sharp"), AgentId("fund-vague")]
     noise_ids = [AgentId(f"noise-{i:02d}") for i in range(14)]
 
@@ -171,6 +178,7 @@ def build(seed: int = 7, speed: float = 1.0) -> LiveMarket:
         default=millis(4),
         per_agent={
             maker_id: micros(150),                       # colocated
+            arb_id: millis(2),
             fund_ids[0]: millis(3),
             fund_ids[1]: millis(9),
             HUMAN_ID: millis(20),                        # a person on a browser
@@ -217,6 +225,23 @@ def build(seed: int = 7, speed: float = 1.0) -> LiveMarket:
     ]
 
     agents = [maker, *funds, *noise]
+    if arbitrageur:
+        # Off by default, on the evidence. It derives the right identities and
+        # trades them, but measured across four paired seeds it improved spread
+        # consistency on three and made it worse on the fourth, and on one seed
+        # it took visible ask depth from 877 lots to 69. Enforcing a relation by
+        # repeatedly lifting the book buys consistency with liquidity, and a
+        # market that cannot absorb an order is broken more fundamentally than
+        # one carrying a stale spread. See docs/GAPS.md for the numbers.
+        agents.append(
+            Arbitrageur(
+                arb_id,
+                VENUE_ID,
+                by_symbol,
+                wake_interval=millis(400),
+                recycle_capital=recycle_capital,
+            )
+        )
     kernel.add(venue_agent)
     kernel.add(human)
     kernel.add_all(agents)

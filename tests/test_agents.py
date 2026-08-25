@@ -16,11 +16,14 @@ forever. The agent believed it held +7 while the venue held 0.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
 from arena.agents.fundamental import FundamentalTrader
+from arena.determinism import canonical_json
+from arena.market.instrument import Instrument
 from arena.agents.market_maker import MarketMaker
 from arena.agents.noise import NoiseTrader
 from arena.exchange.events import Submit
@@ -29,9 +32,9 @@ from arena.market.live import HUMAN_ID
 from arena.market.venue import SymbolCommand
 from arena.sim.kernel import Kernel
 from arena.sim.latency import PairwiseLatency
-from arena.sim.time import Duration, micros, millis, seconds
+from arena.sim.time import Duration, Timestamp, micros, millis, seconds
 
-from dashboard.build_market import build
+from dashboard.build_market import build, instruments as build_instruments
 
 SYMBOL = "SPIKE_WR_FUT"
 
@@ -383,3 +386,125 @@ def test_agent_populations_are_present(market):
     assert kinds.count("MarketMaker") == 1
     assert kinds.count("FundamentalTrader") == 2
     assert kinds.count("NoiseTrader") >= 10
+
+
+# --------------------------------------------------------------------------
+# The arbitrageur: consistency *between* books
+# --------------------------------------------------------------------------
+
+
+def test_relations_are_read_out_of_the_listed_contracts():
+    """Nothing is configured by hand -- the algebra comes from the contracts.
+
+    This is what makes the agent connective tissue rather than a strategy: list
+    a new spread and it becomes arbitrageable with no code change. If these
+    relations were a hand-written table, the test would be checking that I can
+    copy a list, which is not a property of the market.
+    """
+    from arena.agents.arbitrageur import derive_relations
+
+    listed = {i.symbol: i for i in build_instruments()}
+    relations = {r.name: r for r in derive_relations(listed)}
+
+    spread = relations["spread:SPIKE_CROW"]
+    assert spread.target == "SPIKE_CROW"
+    assert dict(spread.legs) == {"SPIKE_WR_FUT": 1.0, "CROW_WR_FUT": -1.0}
+    assert spread.constant == 0.0
+
+    # Put-call parity, C = P + F - K, with the strike as the constant.
+    parity = relations["parity:SPIKE_C4700"]
+    assert parity.target == "SPIKE_C4700"
+    assert dict(parity.legs) == {"SPIKE_P4700": 1.0, "SPIKE_WR_FUT": 1.0}
+    assert parity.constant == -4_700.0
+
+
+def test_a_relation_missing_a_leg_is_not_formed():
+    """The index has no relation, because PIPER has no listed future.
+
+    A relation traded against a proxy is a bet, not an arbitrage. The agent has
+    to decline it -- and then form it the moment the leg is listed, with no
+    code change, or the derivation is not really reading the contracts.
+    """
+    from arena.agents.arbitrageur import derive_relations
+
+    listed = {i.symbol: i for i in build_instruments()}
+    assert "ASSASSIN_IDX" in listed
+    assert not any(r.target == "ASSASSIN_IDX" for r in derive_relations(listed))
+
+    # A PIPER future is the SPIKE future with a different underlying -- built by
+    # replacement rather than by hand, so the test cannot drift from the real
+    # listing conventions.
+    template = listed["SPIKE_WR_FUT"].spec
+    component = next(
+        leg for leg, _ in listed["ASSASSIN_IDX"].spec.underlying.legs
+        if "PIPER" in canonical_json(leg.to_dict())
+    )
+    piper = Instrument(
+        "PIPER_WR_FUT",
+        replace(template, contract_id="PIPER_WR_FUT", underlying=component),
+    )
+    listed[piper.symbol] = piper
+    index = next(r for r in derive_relations(listed) if r.target == "ASSASSIN_IDX")
+    assert dict(index.legs) == {
+        "SPIKE_WR_FUT": 0.5,
+        "CROW_WR_FUT": 0.3,
+        "PIPER_WR_FUT": 0.2,
+    }
+
+
+@pytest.fixture(scope="module")
+def arb_market():
+    """A market with the arbitrageur switched on.
+
+    It is off by default. Across four paired seeds it improved spread
+    consistency on three and worsened it on the fourth, and on one seed it took
+    visible ask depth from 877 lots to 69 -- consistency bought with liquidity.
+    So the tests below assert what it reliably *does* (derives the right
+    identities, trades them, conserves value, respects its limits) and not the
+    price convergence it does not reliably deliver. docs/GAPS.md carries the
+    numbers.
+    """
+    m = build(seed=41, arbitrageur=True)
+    m.kernel.start()
+    m.kernel.advance(until=seconds(300))
+    return m
+
+
+def test_the_arbitrageur_actually_traded(arb_market):
+    """Otherwise every assertion below is about an idle agent."""
+    from arena.agents.arbitrageur import Arbitrageur
+
+    arb = next(a for a in arb_market.agents if isinstance(a, Arbitrageur))
+    assert arb.attempts > 0
+
+
+def test_the_arbitrageur_leaves_conservation_exact(arb_market):
+    """It adds volume, so it is the obvious place for the invariant to break."""
+    assert arb_market.venue.conservation_check() == 0
+
+
+def test_the_arbitrageur_never_legs_past_its_position_limit(arb_market):
+    """A half-entered relation is a directional bet, so the limit is per leg."""
+    from arena.agents.arbitrageur import Arbitrageur
+
+    arb = next(a for a in arb_market.agents if isinstance(a, Arbitrageur))
+    for symbol, quantity in arb.position.items():
+        assert abs(quantity) <= arb.position_limit + arb.base_size * 2, symbol
+
+
+def test_the_arbitrageur_sizes_to_the_liquidity_it_can_see(arb_market):
+    """The participation cap is what stops it stripping the book bare.
+
+    Without it this agent fired IOC orders on three legs every 400ms and took
+    ask depth from 207 resting lots to 26 -- and a book that thin cannot absorb
+    anyone else's order, so the damage was not confined to its own P&L.
+    """
+    from arena.agents.arbitrageur import Arbitrageur
+
+    arb = next(a for a in arb_market.agents if isinstance(a, Arbitrageur))
+    assert 0.0 < arb.max_participation <= 1.0
+    for symbol in arb.instruments:
+        for side in (Side.BUY, Side.SELL):
+            book = arb.books[symbol]
+            resting = book.ask_size if side is Side.BUY else book.bid_size
+            assert arb._takeable(symbol, side) <= max(0, resting)
