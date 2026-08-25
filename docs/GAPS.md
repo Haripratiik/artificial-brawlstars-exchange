@@ -82,6 +82,35 @@ Not everything thin is wrong, and these have been checked rather than assumed:
   designed for, with put-call parity exact at settlement.
 - **Lookahead prevented structurally** on five channels.
 
+## Two venues now, and the comparison between them
+
+`arena/market/lmsr_venue.py` runs Hanson's logarithmic scoring rule beside the
+order book. It subclasses `Venue` rather than reimplementing it, so accounts,
+collateral, expiry, settlement and the conservation check are literally the same
+code on both -- if they were separate implementations, a difference between the
+two experiments could be an accounting difference.
+
+The cost curve is rendered as an L2 book (level `T` holds the shares that move
+the marginal price from tick `T` to `T+1`), so `VenueAgent`, the market-data
+feeds and every agent work against it unchanged. Two honest departures from a
+book, both documented in the module: nothing rests, so every order is
+effectively immediate-or-cancel; and raw LMSR has **no bid-ask spread at all**
+because it is path independent -- the spread here comes from quantising prices to
+the tick grid, always in the maker's favour, which is also what keeps the ledger
+exact and the bounded-loss guarantee intact.
+
+Liquidity is parameterised by **subsidy**, not by `b`: the subsidy is what the
+venue will lose making the market, which is the quantity anyone actually
+decides, and `b` is its consequence. `subsidy_for_depth` inverts it again so the
+two venues can be calibrated to the same depth at the touch -- without that, a
+comparison of mechanisms would really be a comparison of depths.
+
+**Result: the mechanism does not matter.** 200 paired trials, order book 0.03108
+against scoring rule 0.03115, difference +0.00007 with a 95% interval of
+[-0.0035, +0.0031]. A tight null, not an underpowered one. Sweeping depth across
+a 70x range does not rescue it either -- error is U-shaped with its minimum at
+the depth-matched point and never approaches the precision-weighted baseline.
+
 ## What would make it a market rather than a mechanism
 
 In the order that buys the most realism per unit of work:
@@ -160,12 +189,22 @@ is two-sided in **2% of samples**. The arbitrageur cannot check the relation
 own inventory in the option never exceeds 72 of a 300 limit; it is starved, not
 constrained.
 
-No arbitrageur fixes this. Parity needs a market maker that quotes the option
-off the *replicating portfolio* -- underlying plus put -- rather than off the
-option's own last trade, which is exactly how real option market makers work,
-and is the deferred "sophisticated market maker" work. Recorded here rather than
-patched, because tightening the arbitrageur's band would produce a smaller
-number without producing a two-sided option book.
+The cause turned out not to be a missing market maker. Both options are struck
+at 4700 while SPIKE settles at 4669, so the call is worth **exactly zero** and
+the put 123 ticks of an 18,800-tick range. Both sit pinned on the price floor,
+and a book at zero cannot carry a bid below it -- measured across a session, the
+options show a bid 14-16% of the time and an ask 100% of the time, which is what
+a worthless option is *supposed* to look like. The binary on the same underlying
+is also worth zero but stays two-sided, because its range is 100 ticks rather
+than 18,800, so "near zero" still leaves room to quote.
+
+So the asset class works; the demo contracts are badly struck. The fix is a
+**strike ladder** spanning the plausible range, as a real exchange lists,
+rather than a single pair placed either side of the settlement value. Some
+strikes are then near the money and liquid, and parity becomes testable on
+those. Choosing strikes near where the underlying already trades is standard
+listing practice; choosing them near where it *settles* would be leaking the
+answer, and is not what this means.
 
 **The spread's mean reversion was diagnosed wrongly.** The plan called
 VR(32) = 0.25 on the spread a pathology caused by the spread being untethered

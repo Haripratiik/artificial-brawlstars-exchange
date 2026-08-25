@@ -209,6 +209,60 @@ def test_a_different_seed_gives_a_different_result():
     assert first.to_dict() != second.to_dict()
 
 
+# --------------------------------------------------------------------------
+# Both mechanisms
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def lmsr_trial():
+    return run_trial(_config(venue_kind="lmsr"))
+
+
+def test_the_scoring_rule_venue_produces_a_forecast(lmsr_trial):
+    assert math.isfinite(lmsr_trial.market_forecast)
+    assert 0.0 <= lmsr_trial.market_forecast <= 1.0
+    assert lmsr_trial.trades > 0
+
+
+def test_the_scoring_rule_venue_is_always_quoted(lmsr_trial):
+    """Its defining advantage over a book: there is never nothing to trade against.
+
+    An order book can empty out; a cost function cannot. If this ever dropped
+    below one, the comparison in Experiment 2 would partly be measuring
+    downtime rather than aggregation.
+    """
+    assert lmsr_trial.quoted_fraction == 1.0
+
+
+def test_the_scoring_rule_venue_conserves_value(lmsr_trial):
+    assert lmsr_trial.conservation == 0
+
+
+def test_both_mechanisms_are_deterministic():
+    for kind in ("clob", "lmsr"):
+        config = _config(seed=404, venue_kind=kind)
+        assert run_trial(config).to_dict() == run_trial(config).to_dict()
+
+
+def test_the_two_mechanisms_see_identical_agents():
+    """The control that makes Experiment 2 a comparison rather than two runs.
+
+    Agents draw their evidence from their own seeded streams, so swapping the
+    venue must not change what any of them believes -- only what the price does
+    with those beliefs.
+    """
+    clob = run_trial(_config(seed=88, venue_kind="clob"))
+    lmsr = run_trial(_config(seed=88, venue_kind="lmsr"))
+    assert clob.agent_forecasts == lmsr.agent_forecasts
+    assert clob.truth_probability == lmsr.truth_probability
+
+
+def test_an_unknown_venue_is_refused():
+    with pytest.raises(ValueError, match="unknown venue kind"):
+        run_trial(_config(venue_kind="dark-pool"))
+
+
 def test_the_outcome_draw_does_not_disturb_the_simulation():
     """The sampled outcome comes from its own stream.
 

@@ -1,13 +1,25 @@
-# Experiment 1 — Does the market aggregate better than the agents inside it?
+# Does a market aggregate information better than the agents inside it?
 
-**Answer: no. It reproduces the simple average of their beliefs, and loses
-decisively to weighting those same beliefs by how much evidence each rests on.**
+**Experiment 1: no.** It reproduces the simple average of their beliefs, and
+loses decisively to weighting those same beliefs by how much evidence each
+rests on.
+
+**Experiment 2: and the mechanism is not why.** A logarithmic scoring rule —
+which has none of an order book's structural limitations, always quotes, and
+needs no counterparty — lands in exactly the same place (p = 0.97).
+
+What is left, measured rather than assumed: agents stop trading once the price
+is inside their own uncertainty band, using under half their capacity. Nothing
+in either venue makes a well-informed agent bet bigger than a poorly informed
+one.
+
+---
+
+# Experiment 1 — The market against its own agents
 
 ```bash
 python experiments/information_aggregation/run.py --full --workers 8
 ```
-
----
 
 ## What was measured
 
@@ -67,14 +79,21 @@ Plus a convergence check: market error by session length was 0.0144 (60s),
 market has converged; it is not short of time.
 
 So it is not noise traders, not position limits, and not insufficient time.
-What remains is the mechanism itself: **a limit order book aggregates by
-capital, not by evidence.** Every agent here carries the same base size, the
-same position limit and the same cash, so the 50-battle agent pushes the price
-about as hard as the 5,000-battle agent. The price settles where buying and
-selling pressure balance — an unweighted consensus — which is precisely what the
-result says it is. The precision-weighted baseline knows each agent's battle
-count exactly and uses it; the market has no channel through which that
-information could reach the price.
+
+The conclusion drawn here was that what remained was the mechanism — that a
+limit order book aggregates by capital rather than by evidence, because it needs
+a counterparty for every trade and its market maker anchors price to its own
+reference. **Experiment 2 tested that and refuted it.** The paragraph is left
+standing rather than quietly rewritten, because it was the obvious inference
+from these ablations and it was wrong; what replaced it is in Experiment 2's
+final section.
+
+What survives from this experiment is the finding itself: every agent here
+carries the same base size, the same position limit and the same cash, so the
+50-battle agent pushes the price about as hard as the 5,000-battle agent, and
+the price settles at an unweighted consensus. The precision-weighted baseline
+knows each agent's battle count exactly and uses it; the market has no channel
+through which that information reaches the price.
 
 The concentration ablation is the same point from the other side. Holding total
 information fixed and moving it all into one trader makes the market **2.7×
@@ -116,14 +135,104 @@ specifies, a boundary value would have been reported as an interior optimum.
   reason: 2,360 trades per trial, two-sided 99.9% of the time, conservation
   exact in every trial, reliability 0.0098 (well calibrated).
 
+---
+
+# Experiment 2 — Is it the mechanism?
+
+**Answer: no. Swapping the limit order book for a logarithmic scoring rule
+changes nothing at all.**
+
+```bash
+python experiments/information_aggregation/run.py --compare-venues --full --workers 8
+```
+
+Experiment 1 left one obvious suspect. A book needs a counterparty for every
+trade, so an informed agent can only move price as fast as someone takes the
+other side; and its market maker quotes around its own reference, which acts as
+an anchor. A scoring rule has neither problem — it always quotes, at any size,
+and its price is a function of cumulative net flow with nothing to revert to.
+
+The same 200 trials, the same agents, the same seeds, the same information. The
+only thing that varies is where liquidity comes from.
+
+| mechanism | error to truth | trades/trial |
+|---|---|---|
+| limit order book | 0.03108 | 2,360 |
+| logarithmic scoring rule | 0.03115 | 1,780 |
+
+Paired difference **+0.00007**, 95% CI **[−0.0035, +0.0031]**, p = 0.97.
+
+This is a tight null, not an underpowered one: the interval excludes any effect
+larger than ±0.0035, against a 0.0167 gap to precision-weighting. The mechanism
+accounts for **none** of it. The scoring rule lands on the simple mean too.
+
+## Depth doesn't rescue it either
+
+Depth is the scoring rule's one real parameter, set here by the subsidy the
+venue is willing to lose. Both venues were calibrated to the same depth at the
+touch (40 lots a tick) so the comparison above isolates mechanism. Varying it,
+at full 200-trial power:
+
+| shares/tick | subsidy | error to truth |
+|---|---|---|
+| 5 | 87 | 0.03270 |
+| 12 | 208 | 0.03149 |
+| **40** | **693** | **0.03118** |
+| 115 | 1,993 | 0.03542 |
+| 346 | 5,997 | 0.04641 |
+
+A shallow U with its minimum at the depth-matched point, degrading in both
+directions — too deep and informed trading cannot move price, too thin and noise
+traders push it around. Nothing anywhere near precision-weighting's 0.01436.
+
+> An 8-trial pilot of this sweep showed a clean monotonic improvement toward
+> shallow markets (0.0184 at 12 shares/tick) and would have supported a tidy
+> story about depth being the binding constraint. At 200 trials that number is
+> 0.0315. The pilot was noise. It is recorded here because it is exactly the
+> result that would have been reported if the sweep had stopped where it looked
+> most interesting.
+
+## What is actually binding — measured, not inferred
+
+If agents were constrained, they would end sessions pinned at their limits. They
+do not:
+
+| venue | mean \|position\|/limit | at limit | \|price − own estimate\| | own uncertainty |
+|---|---|---|---|---|
+| order book | 0.47 | 38% | 19.1 ticks | 40.8 ticks |
+| scoring rule | 0.44 | 38% | 18.9 ticks | 40.8 ticks |
+
+Agents use under half their capacity, and the price ends up **well inside** each
+one's uncertainty band. They stop because they are satisfied, not because they
+have run out of room — which is exactly what their rule says to do: stop once
+the price is within `patience × uncertainty` of your estimate.
+
+The two venues produce these numbers to two decimal places of each other. That
+is the whole of Experiment 2 in one table: the binding constraint lives in how
+an agent converts belief into pressure, and both mechanisms are downstream of it.
+
+So the price rests where pressure balances. A sharp agent has a narrow band and
+keeps pushing until price is close to its view; a vague agent has a wide band
+and gives up early. That *is* a form of information weighting — it is simply far
+too weak to beat weighting by evidence directly, because a vague agent's early
+position moves price just as far as a sharp one's.
+
 ## What this sets up next
 
-The result names its own follow-up. If the gap between the market and
-precision-weighting is that wealth does not track skill, then let it: run
-repeated trials with the same agents, carry P&L across them, and see whether the
-market migrates from the simple mean toward the precision-weighted aggregate as
-better-informed agents accumulate capital. That is a sharper question than this
-one, and this experiment is what makes it askable.
+Three things are now ruled out: the mechanism, liquidity depth, and trading
+capacity. What remains is the hypothesis Experiment 1 named and this one
+sharpens — **nothing makes a well-informed agent bet bigger than a poorly
+informed one.** Two ways to test it, and they are complementary:
+
+1. **Kelly-proportional sizing.** Let an agent's stake scale with its edge over
+   its uncertainty without the conviction cap. If the market then approaches
+   precision-weighting, the gap was a sizing rule all along.
+2. **Wealth that tracks skill.** Carry P&L across repeated trials with the same
+   agents and let capital accumulate. If the market migrates from the simple
+   mean toward precision-weighting over time, markets aggregate by evidence only
+   once they have had time to reallocate capital toward the people who were
+   right — which would be a far more interesting claim than either experiment
+   here has established.
 
 ## Reproducing
 

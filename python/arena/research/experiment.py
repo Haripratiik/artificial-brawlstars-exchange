@@ -55,6 +55,7 @@ from arena.contracts.underlying import Single
 from arena.determinism import canonical_json
 from arena.exchange.types import AgentId, Side
 from arena.market.instrument import Instrument
+from arena.market.lmsr_venue import LmsrVenue
 from arena.market.venue import Venue
 from arena.market.venue_agent import VenueAgent
 from arena.sim.kernel import Kernel, SimulationContext
@@ -95,6 +96,18 @@ class TrialConfig:
     # through which a view reaches the price, so it is a first-class knob
     # rather than a constant buried in the builder.
     position_limit: int = 800
+    # Which market mechanism runs the trial. "clob" is a limit order book with a
+    # quoting market maker; "lmsr" is a logarithmic scoring rule, where the
+    # maker is a cost function rather than a participant. Experiment 2 varies
+    # only this.
+    venue_kind: str = "clob"
+    # What the scoring-rule venue is willing to lose making the market.
+    # Calibrated so a fresh scoring-rule book shows the same depth at the touch
+    # as the order-book maker quotes -- 40 lots a tick. Depth decides how far a
+    # given amount of informed trading moves the price, so two venues quoting
+    # different depth are not being compared on mechanism at all. Derived by
+    # subsidy_for_depth(40, 0.01, 1.0) rather than chosen.
+    subsidy: float = 693.1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -113,6 +126,8 @@ class TrialConfig:
             "starting_cash": self.starting_cash,
             "heterogeneous_latency": self.heterogeneous_latency,
             "position_limit": self.position_limit,
+            "venue_kind": self.venue_kind,
+            "subsidy": self.subsidy,
         }
 
     @property
@@ -202,7 +217,16 @@ def run_trial(config: TrialConfig) -> TrialResult:
     by_symbol = {SYMBOL: instrument}
     levels = {SYMBOL: config.truth}
 
-    venue = Venue("arena", starting_cash=config.starting_cash)
+    if config.venue_kind == "lmsr":
+        venue = LmsrVenue(
+            "arena-lmsr",
+            starting_cash=config.starting_cash,
+            subsidy=config.subsidy,
+        )
+    elif config.venue_kind == "clob":
+        venue = Venue("arena", starting_cash=config.starting_cash)
+    else:
+        raise ValueError(f"unknown venue kind {config.venue_kind!r}")
     venue.list_instrument(instrument)
 
     maker_id = AgentId("mm-1")
@@ -213,18 +237,26 @@ def run_trial(config: TrialConfig) -> TrialResult:
     venue_agent = VenueAgent(VENUE_ID, venue)
 
     low, high = instrument.tick_bounds
-    maker = MarketMaker(
-        maker_id,
-        VENUE_ID,
-        by_symbol,
-        wake_interval=millis(250),
-        half_spread=config.maker_half_spread,
-        quote_size=config.maker_quote_size,
-        max_skew_fraction=0.15,
-        position_limit=2_000,
-        # Opens at the middle of the range, not at the answer: the maker must
-        # not be the thing that already knows.
-        reference={SYMBOL: float((int(low) + int(high)) / 2)},
+    # The scoring rule *is* the market maker, so adding a quoting agent beside
+    # it would be running two makers and calling it one mechanism.
+    makers = (
+        []
+        if config.venue_kind == "lmsr"
+        else [
+            MarketMaker(
+                maker_id,
+                VENUE_ID,
+                by_symbol,
+                wake_interval=millis(250),
+                half_spread=config.maker_half_spread,
+                quote_size=config.maker_quote_size,
+                max_skew_fraction=0.15,
+                position_limit=2_000,
+                # Opens at the middle of the range, not at the answer: the maker
+                # must not be the thing that already knows.
+                reference={SYMBOL: float((int(low) + int(high)) / 2)},
+            )
+        ]
     )
 
     funds = [
@@ -249,7 +281,7 @@ def run_trial(config: TrialConfig) -> TrialResult:
     ]
 
     kernel.add(venue_agent)
-    kernel.add_all([maker, *funds, *noise])
+    kernel.add_all([*makers, *funds, *noise])
     kernel.start()
 
     # Sample the mid on a fixed grid so the "time-weighted" average really is

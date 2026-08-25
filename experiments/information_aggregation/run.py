@@ -353,6 +353,59 @@ def write_outputs(
     return manifest_path, digest
 
 
+def compare_venues(configs: list[TrialConfig], args: argparse.Namespace) -> int:
+    """Experiment 2: the same trials through both mechanisms.
+
+    Identical seeds, truths, thresholds, agents and information -- the only thing
+    that varies is where the liquidity comes from. That makes the difference
+    between the two a property of the mechanism, and lets it be tested as a
+    paired difference rather than as two separate averages that happen to
+    differ.
+    """
+    print(f"running {len(configs)} trials on both mechanisms "
+          f"({args.workers} worker(s))...")
+
+    outcomes: dict[str, list[TrialResult]] = {}
+    for kind in ("clob", "lmsr"):
+        variant = [replace(c, venue_kind=kind) for c in configs]
+        outcomes[kind] = run_all(variant, args.workers)
+        report = analyse(outcomes[kind], bootstrap=args.bootstrap, seed=args.seed)
+        print(render(report, outcomes[kind]).replace(
+            "Experiment 1: information aggregation", f"{kind.upper():<5} against the ladder"
+        ))
+        write_outputs(f"venue_{kind}", variant, outcomes[kind], report, args)
+
+    truth = np.array([r.truth_probability for r in outcomes["clob"]])
+    clob = (np.array([r.market_forecast for r in outcomes["clob"]]) - truth) ** 2
+    lmsr = (np.array([r.market_forecast for r in outcomes["lmsr"]]) - truth) ** 2
+    head_to_head = paired_comparison(
+        "order book", lmsr, clob, bootstrap=args.bootstrap, seed=args.seed
+    )
+
+    print("=" * 78)
+    print("  Experiment 2: scoring rule against order book, paired by trial")
+    print("=" * 78)
+    print()
+    print(f"  order book     {clob.mean():.5f}")
+    print(f"  scoring rule   {lmsr.mean():.5f}")
+    print()
+    print(f"  difference {head_to_head.mean_difference:+.5f} "
+          f"[{head_to_head.ci_low:+.5f}, {head_to_head.ci_high:+.5f}]  "
+          f"p={head_to_head.p_value:.5f}")
+    verdict = (
+        "the scoring rule aggregates better"
+        if head_to_head.mean_difference < 0
+        else "the order book aggregates better"
+    )
+    print(f"  {verdict if head_to_head.p_value < 0.05 else 'no detectable difference'}")
+    print()
+    for kind in ("clob", "lmsr"):
+        trades = np.mean([r.trades for r in outcomes[kind]])
+        print(f"  {kind:<6} mean trades per trial {trades:8.0f}")
+    print()
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--quick", action="store_true", help="30 trials, for CI")
@@ -387,6 +440,25 @@ def main() -> int:
         help="ablation: cap on each informed agent's position, the thing that "
         "decides how much of its view reaches the price",
     )
+    parser.add_argument(
+        "--venue",
+        choices=("clob", "lmsr"),
+        default="clob",
+        help="market mechanism: a limit order book, or a logarithmic scoring rule",
+    )
+    parser.add_argument(
+        "--subsidy",
+        type=float,
+        default=None,
+        help="what the scoring-rule venue will lose making the market; "
+        "defaults to the depth-matched value",
+    )
+    parser.add_argument(
+        "--compare-venues",
+        action="store_true",
+        help="Experiment 2: run both mechanisms on the same trials and report "
+        "the paired difference between them",
+    )
     parser.add_argument("--tag", default=None)
     args = parser.parse_args()
 
@@ -397,9 +469,12 @@ def main() -> int:
         "duration": int(sim_seconds(args.duration)),
         "heterogeneous_latency": not args.homogeneous_latency,
         "noise_traders": args.noise_traders,
+        "venue_kind": args.venue,
     }
     if args.position_limit is not None:
         overrides["position_limit"] = args.position_limit
+    if args.subsidy is not None:
+        overrides["subsidy"] = args.subsidy
     configs = draw_trials(
         count,
         seed=args.seed,
@@ -429,6 +504,9 @@ def main() -> int:
         tag += f"_noise{args.noise_traders}"
     if args.position_limit is not None:
         tag += f"_limit{args.position_limit}"
+
+    if args.compare_venues:
+        return compare_venues(configs, args)
 
     print(f"running {count} trials (seed {args.seed}, {args.workers} worker(s))...")
     results = run_all(configs, args.workers)
