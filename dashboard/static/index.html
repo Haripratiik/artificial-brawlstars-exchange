@@ -41,6 +41,17 @@
 
       <div class="spacer"></div>
 
+      <!-- Who you are trading as. Every browser used to share one account, so
+           two tabs were one trader: the same balance, the same blotter, and
+           either able to cancel the other's orders. The name is what other
+           traders see beside a fill of yours. -->
+      <div class="whoami">
+        <button type="button" id="whoami" class="ghost"
+                title="Change the name other traders see">
+          <span aria-hidden="true">&#9679;</span> <b id="whoami-name">&mdash;</b>
+        </button>
+      </div>
+
       <div class="speed">
         <label for="speed">Speed</label>
         <input id="speed" type="range" min="0" max="20" step="0.5" value="1"

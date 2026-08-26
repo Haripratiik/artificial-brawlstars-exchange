@@ -32,15 +32,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import secrets
 import mimetypes
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from arena.exchange.types import AgentId
+from dashboard.identity import COOKIE, display_name, sign, verify
 from dashboard.state import FEE_SCHEDULES, MarketConfig, MarketRunner
 
 # Starlette serves static files with whatever `mimetypes` reports, and on
@@ -64,6 +67,11 @@ STATIC = HERE / "static"
 # How often the kernel is advanced and a snapshot goes out. 20 Hz is past what
 # an eye resolves and cheap enough that the simulation never waits on a socket.
 TICK_SECONDS = 0.05
+
+# Sessions this process has seated, by cookie session id. Not a database: the
+# accounts they name live in the running market, so both go away together.
+_SEATS: dict[str, AgentId] = {}
+
 
 app = FastAPI(title="Arena Markets")
 runner = MarketRunner()
@@ -101,8 +109,83 @@ async def _shutdown() -> None:
 
 
 @app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(STATIC / "index.html")
+async def index(request: Request) -> FileResponse:
+    """The page, and a session cookie for whoever asked for it.
+
+    Issued on the first visit rather than behind a sign-in form, so someone who
+    opens the exchange can trade immediately with their own account and rename
+    themselves afterwards if they want to. The alternative -- a wall between a
+    visitor and the market -- is the wrong default for a place whose capital is
+    imaginary.
+    """
+    response = FileResponse(STATIC / "index.html")
+    _ensure_session(request, response)
+    return response
+
+
+def _seat_for(request_or_socket: Any) -> AgentId | None:
+    """The account this connection is signed in as, if any.
+
+    Returns ``None`` for a connection with no valid cookie, and the caller
+    falls back to the shared account -- which is what every test and every
+    direct API user gets, unchanged.
+    """
+    payload = verify(request_or_socket.cookies.get(COOKIE))
+    if payload is None:
+        return None
+    seat = _SEATS.get(str(payload.get("sid", "")))
+    return seat
+
+
+def _ensure_session(request: Request, response: Response) -> AgentId:
+    """Resolve the cookie to an account, seating a new one if needed.
+
+    The cookie carries a session id and a name; the *account* is looked up from
+    the session id in this process. So a cookie from a previous run names a
+    session this market has never heard of, and the visitor is seated afresh --
+    which is right, because the accounts that cookie referred to went away with
+    the market that held them.
+    """
+    payload = verify(request.cookies.get(COOKIE)) or {}
+    sid = str(payload.get("sid", ""))
+    name = display_name(payload.get("name"))
+
+    seat = _SEATS.get(sid)
+    if seat is None:
+        sid = secrets.token_urlsafe(12)
+        seat = runner.market.seat(name)
+        _SEATS[sid] = seat
+        response.set_cookie(
+            COOKIE,
+            sign({"sid": sid, "name": name}),
+            max_age=7 * 24 * 3600,
+            httponly=False,
+            samesite="lax",
+        )
+    return seat
+
+
+@app.post("/api/me")
+async def api_rename(request: Request, response: Response) -> dict[str, Any]:
+    """Change the name other traders see. There is nothing else to change."""
+    body = await request.json()
+    seat = _ensure_session(request, response)
+    name = display_name(str(body.get("name", "")))
+    agent = runner.market.traders.get(seat)
+    if agent is not None:
+        agent.display_name = name
+    payload = verify(request.cookies.get(COOKIE)) or {}
+    sid = str(payload.get("sid", "")) or next(
+        (k for k, v in _SEATS.items() if v == seat), ""
+    )
+    response.set_cookie(
+        COOKIE,
+        sign({"sid": sid, "name": name}),
+        max_age=7 * 24 * 3600,
+        httponly=False,
+        samesite="lax",
+    )
+    return {"ok": True, "id": str(seat), "name": name}
 
 
 # --------------------------------------------------------------------------
@@ -197,10 +280,14 @@ async def api_uncross(symbol: str) -> dict[str, Any]:
 @app.websocket("/ws")
 async def stream(socket: WebSocket) -> None:
     await socket.accept()
-    receiver = asyncio.create_task(_receive(socket))
+    # Read before accepting would be tidier, but the cookie is set by the page
+    # load that preceded this, so by here it is there or the visitor never
+    # loaded the page.
+    seat = _seat_for(socket)
+    receiver = asyncio.create_task(_receive(socket, seat))
     try:
         while True:
-            payload = runner.market.snapshot()
+            payload = runner.market.snapshot(seat)
             payload["generation"] = runner.generation
             payload["sessions"] = {
                 symbol: runner.market.venue.session(symbol).value
@@ -217,7 +304,7 @@ async def stream(socket: WebSocket) -> None:
             await receiver
 
 
-async def _receive(socket: WebSocket) -> None:
+async def _receive(socket: WebSocket, seat: AgentId | None = None) -> None:
     """Handle actions from the browser.
 
     Orders are queued onto the human agent rather than applied directly, so a
@@ -240,13 +327,14 @@ async def _receive(socket: WebSocket) -> None:
                     quantity=int(message["quantity"]),
                     price=None if price in (None, "", "market") else Decimal(str(price)),
                     tif=str(message.get("tif", "")),
+                    trader=seat,
                 )
             elif action == "cancel":
-                result = runner.market.cancel(int(message["order_id"]))
+                result = runner.market.cancel(int(message["order_id"]), trader=seat)
             elif action == "flatten":
-                result = runner.market.flatten()
+                result = runner.market.flatten(trader=seat)
             elif action == "cancel_all":
-                result = runner.market.cancel_all()
+                result = runner.market.cancel_all(trader=seat)
             elif action == "speed":
                 result = runner.set_speed(float(message["value"]))
             else:

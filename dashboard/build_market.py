@@ -582,4 +582,9 @@ def build(
         human=human,
         agents=agents,
         speed=speed,
+        # So a person who signs in gets an account they can read a profit
+        # against, at the same distance from the exchange as anyone else at a
+        # browser -- rather than the bots' balance sheet and the default wire.
+        latency=latency,
+        seat_cash=human_cash,
     )

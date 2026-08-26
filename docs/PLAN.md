@@ -245,9 +245,21 @@ Deliberately not built: a perpetual. Every contract here settles inside a known 
 which is what makes collateral arithmetic rather than a value-at-risk estimate, and a
 claim that never settles has none. `docs/GAPS.md` carries the reasoning.
 
-Still open in this phase: the option surface is internally inconsistent because the maker
-prices every book independently, and the arbitrageur knows no relation between a share and
-the future on the same underlying.
+Both of the things left open here are now closed. The option surface was internally
+inconsistent for two reasons, and the larger one was not the market maker: every agent
+held a separate view of the same Brawler for every contract written on it, so its own
+option ladder was neither monotone nor convex and it traded on the difference. The maker
+now quotes each chain off one distribution, the agents hold one view per underlying, and
+the arbitrageur enforces vertical and butterfly bounds as well as identities. A share is
+related to the four weekly futures it pays, exactly, because the legs are listed.
+
+The exchange also runs its own machinery now -- maker-taker fees, an opening call auction,
+a limit-state circuit breaker, three market makers, and the scoring-rule venue reachable
+from the Lab. Turning it on found four bugs in tested code and cost 4.00 percentage points
+of pricing error on six paired seeds. Both are recorded in `docs/GAPS.md`.
+
+Still open in this phase: nothing requotes faster than 300ms, so the cancel-to-trade ratio
+reaches about 60% against the >90% of real books.
 
 ### Phase 8 — Real historical replay
 Only now, once Track A has accrued enough. Same harness, `BrawlReplayWorld`, one real patch as

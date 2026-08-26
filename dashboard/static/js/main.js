@@ -186,6 +186,7 @@ function render({ force = false } = {}) {
 function paint(now) {
   frame = null;
   renderHeader();
+  renderIdentity();
   const interval = VIEW_INTERVAL_MS[store.view] ?? HEAVY_INTERVAL_MS;
   if (now - lastHeavy < interval) return;            // the next message re-arms
   lastHeavy = now;
@@ -220,6 +221,14 @@ function captureFocus() {
  * and swaps only those that differ. In a quiet market that is nothing at all;
  * when one trade prints, it is one panel.
  */
+function renderIdentity() {
+  const label = document.getElementById('whoami-name');
+  if (!label) return;
+  const name = store.snapshot?.you?.name;
+  const shown = name ?? '\u2014';
+  if (label.textContent !== shown) label.textContent = shown;
+}
+
 function renderMain() {
   const view = VIEWS[store.view] ?? markets;
   const signature = `${store.view}:${store.symbol}`;
@@ -436,6 +445,12 @@ function bind() {
     node.open = store.reveal;
   });
 
+  const whoami = document.getElementById('whoami');
+  if (whoami && !whoami.dataset.wired) {
+    whoami.dataset.wired = '1';
+    whoami.addEventListener('click', rename);
+  }
+
   const apply = document.getElementById('c-apply');
   if (apply) apply.addEventListener('click', rebuild);
 }
@@ -551,6 +566,32 @@ async function act(action, data) {
     } catch (failure) {
       toast(String(failure), true);
     }
+  }
+}
+
+/**
+ * Change the name other traders see.
+ *
+ * A prompt rather than a modal, deliberately: there is exactly one field, no
+ * validation the server does not already do, and a dialog for it would be more
+ * chrome than the decision deserves. There is no password here and the page
+ * does not pretend there is -- the account lives in a signed cookie, and losing
+ * the cookie loses the account. That is the honest shape for an exchange whose
+ * capital is imaginary.
+ */
+async function rename() {
+  const current = store.snapshot?.you?.name ?? '';
+  const chosen = window.prompt('Name other traders will see', current);
+  if (chosen === null) return;
+  try {
+    const result = await json('/api/me', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: chosen }),
+    });
+    toast(`Trading as ${result.name}`);
+  } catch (failure) {
+    toast(String(failure), true);
   }
 }
 

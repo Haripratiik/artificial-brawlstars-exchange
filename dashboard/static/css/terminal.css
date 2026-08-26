@@ -1034,3 +1034,46 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .spoiler > summary:hover { color: var(--amber); }
 .spoiler p { font-size: 12px; line-height: 1.5; margin-top: 8px; }
 .spoiler .note { border: none; padding-left: 0; }
+
+
+/* ── who you are ────────────────────────────────────────────────────── */
+
+.whoami { display: flex; align-items: center; }
+.whoami .ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 5px 10px;
+  min-height: 26px;
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  transition-property: color, border-color, background-color;
+  transition-duration: 130ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+.whoami .ghost span { color: var(--up); font-size: 8px; }
+.whoami .ghost b { color: var(--ink); font-weight: 500; }
+.whoami .ghost:hover { color: var(--ink); border-color: var(--ink-faint); }
+.whoami .ghost:active { scale: 0.96; }
+
+
+/* ── a market that is not trading says so ───────────────────────────── */
+
+.halted {
+  display: inline-block;
+  margin: 6px 0 0;
+  padding: 3px 9px;
+  border: 1px solid var(--amber);
+  border-radius: 3px;
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}

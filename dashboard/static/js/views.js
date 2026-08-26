@@ -162,6 +162,21 @@ export function matches(symbol, book, query) {
 }
 
 /** The contract as a question, which is how a person holds it in their head. */
+/**
+ * What to show where a spread would go, when there is no spread.
+ *
+ * A book in a call phase is crossed on purpose, so it has no spread and does
+ * have an indicative price -- the number the auction would clear at right now,
+ * which is what a real venue publishes during one.
+ */
+export function marketState(book) {
+  if (!book?.session || book.session === 'continuous') return null;
+  const words = { pre_open: 'Opening auction', auction: 'Halted — auction',
+                  closed: 'Closed' };
+  const label = words[book.session] ?? book.session;
+  return book.indicative ? `${label}, indicative ${price(book.indicative)}` : label;
+}
+
 export function question(contract) {
   const p = contract?.payoff;
   if (!p) return '';
@@ -321,6 +336,7 @@ function contractHead(symbol, book, meta, session) {
       <span class="kind">${esc(book.class ?? '')}</span>
     </div>
     <h1 class="question">${question(book.contract)}</h1>
+    ${marketState(book) ? `<p class="halted">${esc(marketState(book))}</p>` : ''}
     <div class="contract-figures">
       ${odds != null
         ? `<div class="stat big"><b class="mono amber">${percent(odds)}</b>

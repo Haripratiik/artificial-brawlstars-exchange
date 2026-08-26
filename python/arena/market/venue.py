@@ -272,6 +272,22 @@ class Venue:
             self._accounts[agent_id] = account
         return account
 
+    def open_account(self, agent_id: AgentId, balance: Decimal | int) -> Account:
+        """Create an account with its own opening balance.
+
+        Refused once the account exists. An account's ``starting_cash`` is what
+        every profit-and-loss figure and the conservation check are measured
+        against, so changing it after the fact would rewrite history rather
+        than add capital.
+        """
+        if agent_id in self._accounts:
+            raise ValueError(
+                f"{agent_id} already has an account; its opening balance is what "
+                "its whole PnL is measured against and cannot be restated"
+            )
+        self._balances[agent_id] = to_money(balance)
+        return self.account(agent_id)
+
     @property
     def accounts(self) -> dict[AgentId, Account]:
         return dict(sorted(self._accounts.items()))

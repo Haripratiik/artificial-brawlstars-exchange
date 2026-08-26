@@ -158,6 +158,29 @@ class Kernel:
         for agent in agents:
             self.add(agent)
 
+    def join(self, agent: Agent) -> None:
+        """Add an agent to a simulation that is already running.
+
+        ``add`` refuses to start anything, because in a batch run every
+        participant is known before the clock moves and an agent that appeared
+        later would make the run unreproducible. This is the exception, and it
+        exists for exactly one reason: a person arriving at the exchange.
+
+        That does not weaken replay in the way it looks like it should. A
+        market with a human in it was never byte-reproducible -- the human acts
+        at wall-clock moments the seed knows nothing about -- so a second human
+        arriving is the same kind of event as the first one placing an order.
+        Every experiment harness builds its population up front and never calls
+        this; the live exchange calls it and is honest about not being a
+        replayable artifact.
+
+        The agent's per-agent random stream is seeded from its id, so joining
+        one cannot shift any other agent's draws.
+        """
+        self.add(agent)
+        if self._started:
+            agent.on_start(SimulationContext(self, agent.agent_id))
+
     @property
     def agent_ids(self) -> tuple[AgentId, ...]:
         """Registered agents in sorted order.

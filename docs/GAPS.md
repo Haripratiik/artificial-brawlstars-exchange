@@ -214,7 +214,10 @@ each item. Struck items link to what actually happened.
 2. ~~Fees, auctions, halts and the scoring-rule venue are built and never
    run.~~ **All running now**, and switching them on found four bugs in tested
    code and cost the market half its accuracy. See below.
-3. **No auth.** Every browser shares one account, so two tabs are one trader.
+3. ~~No auth.~~ **Every browser is its own trader now** -- its own account,
+   balance, blotter and working orders, and it cannot cancel anyone else's.
+   There are still no passwords, and that is stated rather than implied; see
+   below.
 4. ~~Liquidity does not replenish, and one maker is the whole other side.~~
    **Fixed by having three of them**, differing in spread, quote size and
    inventory limit -- identical makers would be one maker with three times the
@@ -338,6 +341,40 @@ Single-mechanism ablations do not isolate a cause, which is worth stating
 rather than hiding: removing the breaker, the auction or two of the three
 makers each moved the error by less than the run-to-run spread, and removing
 the auction made it *worse*. The cost is of the combination.
+
+## Who is at the browser
+
+Every connection used to trade one account. Two tabs shared a balance and a
+blotter and either could cancel the other's working orders, which on a venue
+whose premise is people trading against each other is the premise not holding.
+
+A signed session cookie now carries an account id and a display name,
+authenticated by an HMAC over both. The browser can read what it is and cannot
+write itself a different account. The account is a real participant: its own
+`HumanAgent`, its own opening capital -- the amount a person can read a profit
+against, not the bots' forty million -- and the same latency to the exchange as
+anyone else at a browser.
+
+Joining happens on arrival rather than from a pool of seats. A pool would have
+been simpler and would have made "the exchange is full" something that could
+happen to a visitor, which is a property of a workaround rather than of an
+exchange. `Kernel.join` is the one way an agent may enter a running simulation,
+and it is documented as such: a market with a human in it was never
+byte-reproducible, since the human acts at wall-clock moments the seed knows
+nothing about, so a second human arriving is the same kind of event as the
+first one placing an order. Every experiment harness builds its population up
+front and never calls it. A test pins the rest -- seating someone mid-session
+leaves the tape of everyone else's trading identical, because each agent's
+random stream is seeded from its own id.
+
+**There are no passwords, and the page does not pretend there are.** Signing in
+means choosing a name, a name is not an identity -- two people called Ada get
+two accounts -- and losing the cookie loses the account. That is the right
+shape for an exchange whose capital is imaginary, and saying so is the point:
+the distance between "signed in" and "authenticated" is exactly the sort of
+thing that is comfortable to leave vague. A real one needs credentials to
+store, which means password hashes, a reset path, and a way to be wrong about
+all of it. None of that is built.
 
 ## The option surface, and the bug underneath it
 
