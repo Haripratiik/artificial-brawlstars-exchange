@@ -400,3 +400,78 @@ def test_an_account_that_never_traded_is_unaffected_by_settlement():
     )
     venue.settle(SYM, result)
     assert int(venue.account(B).cash) == int(venue.account(B).starting_cash)
+
+
+# --------------------------------------------------------------------------
+# Commodities: an amount delivered, not a proportion
+# --------------------------------------------------------------------------
+
+
+def test_a_quantity_metric_makes_a_commodity_not_a_future():
+    """The class comes from what the contract measures, not from its name.
+
+    A linear claim is a future when it is written on a rate and a commodity
+    when it is written on an amount delivered. The metric declares which, so
+    the layer doing the classifying never has to know what a Brawler is.
+    """
+    from dashboard.build_market import instruments
+
+    listed = {i.symbol: i for i in instruments()}
+    assert listed["SPIKE_VOL_W1"].instrument_class == "commodity"
+    assert listed["SPIKE_WR_FUT"].instrument_class == "future"
+
+
+def test_a_commodity_has_a_term_structure():
+    """Consecutive delivery weeks, differing in nothing else.
+
+    That is what separates a commodity from a future on the same subject: the
+    amount delivered in one week is a different thing from the amount delivered
+    in the next, so the four of them form a curve rather than four copies.
+    """
+    from dashboard.build_market import instruments
+
+    rungs = [i for i in instruments() if i.symbol.startswith("SPIKE_VOL_")]
+    assert len(rungs) >= 3
+
+    windows = [(i.spec.window.start, i.spec.window.end) for i in rungs]
+    assert len(set(windows)) == len(windows), "two rungs measure the same week"
+    # Consecutive and non-overlapping: each week begins where the last ended.
+    for (_, end), (start, _) in zip(sorted(windows), sorted(windows)[1:]):
+        assert end == start, "the delivery weeks leave a gap or overlap"
+
+    # Everything except the window is identical, or they are not one curve.
+    payoffs = {i.spec.payoff.to_dict()["kind"] for i in rungs}
+    subjects = {i.spec.underlying.ref.subject for i in rungs}
+    assert payoffs == {"linear"} and len(subjects) == 1
+
+
+def test_the_delivery_weeks_settle_at_different_amounts():
+    """A curve that is flat by construction would prove nothing."""
+    from dashboard.build_market import instruments, true_values
+
+    values = true_values(instruments())
+    curve = [values[f"SPIKE_VOL_W{n}"] for n in (1, 2, 3, 4)]
+    assert len(set(curve)) > 1, f"the term structure is flat: {curve}"
+
+
+def test_a_metric_must_declare_whether_it_is_a_rate_or_a_quantity():
+    """The distinction decides the asset class, so a typo must not pass."""
+    from arena.contracts.underlying import MetricRef
+
+    with pytest.raises(ValueError, match="must be 'rate' or 'quantity'"):
+        MetricRef(metric="battle_volume", subject="SPIKE", kind="amount")
+
+
+def test_volume_is_not_standardized_and_says_so():
+    """Reweighting a count onto reference proportions counts nothing.
+
+    Standardization exists to remove the crawler's composition from a *rate*.
+    Applied to an amount it produces a number nobody could deliver, so the
+    metric declines to do it -- and records that it declined, because the
+    consequence is that this measures the corpus rather than the game.
+    """
+    from arena.worlds.brawl.metrics import METRIC_KINDS, METRICS
+
+    assert METRIC_KINDS["battle_volume"] == "quantity"
+    assert "battle_volume" in METRICS
+    assert METRICS["battle_volume"].__doc__ is not None

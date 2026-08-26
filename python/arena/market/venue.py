@@ -224,10 +224,22 @@ class Venue:
         """The price open positions are valued at, in minor units.
 
         Mid when the book is two-sided, otherwise the last trade, otherwise the
-        midpoint of the contract's settlement bounds. The final fallback matters
-        more than it looks: a contract that has never traded still has to be
-        marked, and marking it at zero would report every short as instantly
-        profitable.
+        midpoint of the contract's settlement bounds -- and in every case held
+        inside whatever side of the touch is standing.
+
+        The final fallback matters more than it looks: a contract that has never
+        traded still has to be marked, and marking it at zero would report every
+        short as instantly profitable.
+
+        The clamp matters for a subtler reason. A last trade is a fact about the
+        past and a resting order is an offer about the present, so when they
+        disagree the resting order wins: if someone is bidding 4682 right now,
+        the position is worth at least 4682 whatever the tape says, because that
+        is a price you can hit. Without it a one-lot print can drag the mark
+        away from a touch that a thousand lots are standing at -- which is
+        exactly what a stale or unrepresentative print is, and why real venues
+        bound settlement prices by the book rather than taking the last price
+        as given.
         """
         instrument = self.registry.require(symbol)
         tick = instrument.tick_in_minor
@@ -236,11 +248,18 @@ class Venue:
             # Averaged in minor units rather than in ticks, so a one-tick spread
             # marks at the true midpoint instead of being floored to the bid.
             return Money((int(book.best_bid) * tick + int(book.best_ask) * tick) // 2)
+
         last = self._last.get(symbol)
         if last is not None:
-            return Money(int(last) * tick)
-        low, high = instrument.bounds_in_minor
-        return Money((int(low) + int(high)) // 2)
+            reference = int(last) * tick
+        else:
+            low, high = instrument.bounds_in_minor
+            reference = (int(low) + int(high)) // 2
+        if book.best_bid is not None:
+            reference = max(reference, int(book.best_bid) * tick)
+        if book.best_ask is not None:
+            reference = min(reference, int(book.best_ask) * tick)
+        return Money(reference)
 
     def marks(self) -> dict[str, Money]:
         return {symbol: self.mark(symbol) for symbol in self.registry.symbols}

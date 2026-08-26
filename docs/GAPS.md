@@ -41,6 +41,15 @@ matcher, and real volume turns out to be about a tenth of what was reported.
 documented as "trading stops when the observation window closes". Nothing called
 it. Contracts traded indefinitely past the date their outcome was determined.
 
+**The mark ignored the book when the book was one-sided, now fixed.** `mark`
+returned the last trade whenever either side of the touch was missing, so a
+sweep that cleared every offer left the mark to be set by whatever printed
+next -- a single lot on the bid was enough to value every open position below a
+touch that hundreds of lots were standing at. A print is a fact about the past
+and a resting order is an offer about the present, so the mark is now held
+inside whichever side of the touch is standing. It was found by a test that had
+been passing for the wrong reason.
+
 ## What is genuinely absent
 
 Checked for, and not present:
@@ -174,7 +183,75 @@ Hawkes process parameterised by branching ratio, the constructor refuses any
 value at or above one, and a test checks the realised rate against the
 theoretical `mu / (1 - n)`.
 
-## What would make it a market rather than a mechanism
+## Where this stands now
+
+Most of the list below has been done since it was written; it is kept because
+the reasoning still holds and because the measured outcomes are recorded under
+each item. Struck items link to what actually happened.
+
+1. ~~Validate against stylized facts~~ — done, and three of four predictions
+   were wrong.
+2. ~~Realistic order flow~~ — done. Power-law sizes, Hawkes arrivals. The cancel
+   rate reaches ~60%, not the >90% of real books; see below.
+3. ~~An arbitrageur~~ — written, measured, and **off by default**; see below.
+4. ~~Fees~~ — maker-taker, off by default.
+5. ~~Auctions and halts~~ — done, off by default.
+
+### Still open, in the order that buys the most per unit of work
+
+1. **The option surface is internally inconsistent.** Measured over ten minutes
+   of a live market: `SPIKE_C4700` marks at 72.7 while `SPIKE_C4600` marks at
+   59.1. A call at a higher strike cannot be worth more than one at a lower
+   strike, so that is a riskless arbitrage sitting in the book, and put-call
+   parity is out by 35 ticks at the same strike. The cause is one thing: the
+   market maker prices every book independently, anchoring each at the middle of
+   its own range. Nothing relates one strike to the next. The fix is a maker
+   that quotes options off the underlying and the replicating portfolio, plus
+   vertical-spread relations in the arbitrageur — and it closes all three.
+2. **Fees, auctions, halts and the scoring-rule venue are built and never run.**
+   All tested, all defaulted off, so the live exchange exercises none of them.
+3. **No auth.** Every browser shares one account, so two tabs are one trader.
+4. **Liquidity does not replenish, and one maker is the whole other side.**
+   Measured by sweeping 60% of the standing offers on `SPIKE_WR_FUT`: the
+   maker absorbs **98%** of the order, ends short 2,181 lots, and is then past
+   the point where its collateral lets it quote at all. The offer it was run
+   over at never returns -- the spread goes from 2.75 to 24.50 and is still
+   24.50 three minutes later, and the maker has worked none of the position
+   off. A real book repairs in milliseconds because the maker that got run over
+   is one of several; here it is the only one. `test_a_large_order_moves_the_price`
+   asserts this as it is, so the assertion fails on the day replenishment works.
+5. **Cancel rate is ~60%, not >90%.** Nothing requotes faster than 300ms.
+6. **Stocks.** Commodities exist now; a stock needs a dividend stream, and a
+   perpetual one would break the bounded-settlement invariant that makes
+   collateral arithmetic here rather than an estimate. See below.
+
+## Asset classes
+
+Six classes, derived from the contract rather than declared: `future`, `event`,
+`call`, `put`, `spread`, `index`, and now `commodity`.
+
+**Commodities** are a claim on an *amount delivered* rather than on a
+proportion, which is what makes the delivery window part of the contract and
+gives four consecutive weeks a term structure instead of four copies of the same
+thing. `battle_volume` is deliberately neither shrunk nor standardized:
+reweighting a count onto reference proportions produces a number that is the
+count of nothing. The consequence, stated in the metric and worth repeating, is
+that it measures volume **in the canonical corpus, not in the game** — a wider
+crawl sees more battles. Sample-based volume indices trade on that footing in
+the real world; the honest move is to say so rather than imply a census.
+
+**A stock is not built, and the reason is structural.** What distinguishes a
+stock from a future is a dividend stream and no expiry. The stream is easy — a
+periodic distribution that pays holders and charges shorts, conserving exactly.
+The perpetual part is not: every instrument here settles inside a known
+interval, which is precisely what makes collateral arithmetic rather than a
+value-at-risk estimate, and a contract that never settles has no such interval.
+Real perpetuals solve this with funding rates and margin calls, which is a
+different risk model from the one this venue is built on. The honest version is
+a finite-lived claim that *also* pays a distribution each week — an equity strip
+rather than a share — and that would fit without weakening anything.
+
+## Superseded reasoning, kept for the record
 
 In the order that buys the most realism per unit of work:
 

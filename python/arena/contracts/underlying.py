@@ -51,6 +51,17 @@ class MetricRef:
     #
     # A rate is the default because every metric in the first world is one.
     bounds: tuple[float, float] = (0.0, 1.0)
+    # Whether this measures a proportion or an amount delivered.
+    #
+    # It is not decoration: it is the difference between a contract on how often
+    # something happens and a contract on how much of it there was, and those
+    # are different asset classes with different economics. A rate has no term
+    # structure worth speaking of; a quantity does, because the amount delivered
+    # in March is a different thing from the amount delivered in April.
+    #
+    # Declared here rather than inferred from the metric name, so the layer that
+    # classifies instruments never has to know what a Brawler is.
+    kind: str = "rate"
 
     def __post_init__(self) -> None:
         if not self.metric:
@@ -59,6 +70,11 @@ class MetricRef:
             raise ValueError("subject is required")
         if self.bounds[0] > self.bounds[1]:
             raise ValueError(f"bounds are inverted: {self.bounds}")
+        if self.kind not in ("rate", "quantity"):
+            raise ValueError(
+                f"metric kind {self.kind!r} must be 'rate' or 'quantity'; the "
+                "distinction decides how the instrument is classified"
+            )
         for field_name in ("modes", "maps", "trophy_buckets"):
             values = getattr(self, field_name)
             if not values:
@@ -94,6 +110,7 @@ class MetricRef:
             "maps": list(self.maps),
             "trophy_buckets": list(self.trophy_buckets),
             "bounds": list(self.bounds),
+            "kind": self.kind,
         }
 
 

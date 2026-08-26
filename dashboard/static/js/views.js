@@ -43,11 +43,13 @@ const CLASS_GROUPS = [
   ['future', 'Futures', 'Settles at the measured rate itself.'],
   ['call', 'Options', 'The right to what lies past a strike.'],
   ['put', 'Options', 'The right to what lies past a strike.'],
+  ['commodity', 'Commodities', 'An amount delivered in one week, not a rate. Each week trades separately.'],
   ['spread', 'Spreads', 'One Brawler priced against another.'],
   ['index', 'Indices', 'A weighted basket of several Brawlers.'],
 ];
 
-const GROUP_ORDER = ['Prediction Markets', 'Futures', 'Options', 'Spreads', 'Indices', 'Other'];
+const GROUP_ORDER = ['Prediction Markets', 'Futures', 'Commodities', 'Options',
+                     'Spreads', 'Indices', 'Other'];
 
 export function groupOf(assetClass) {
   return CLASS_GROUPS.find(([key]) => key === assetClass)?.[1] ?? 'Other';
@@ -175,6 +177,13 @@ function question(contract) {
     const direction = String(p.comparison).includes('>') ? 'above' : 'below';
     return `Will ${what} finish ${direction} ${p.threshold}?`;
   }
+  // For a delivery contract the week *is* the contract: the same deliverable in
+  // a different week is a different instrument, which is what gives a commodity
+  // its term structure. Saying "where it settles" would hide the only thing
+  // distinguishing one rung from the next.
+  if (contract?.underlying?.ref?.kind === 'quantity') {
+    return `How many thousand battles ${subject} plays, delivered ${esc(week(contract))}`;
+  }
   if (p.kind === 'call') return `${what} above ${p.strike} at settlement`;
   if (p.kind === 'put') return `${what} below ${p.strike} at settlement`;
   return `Where ${what} settles`;
@@ -188,6 +197,15 @@ function question(contract) {
  * 0.48?", which is a contract nobody could identify. It failed silently
  * because the fallback was a plausible English phrase rather than an error.
  */
+/** "week to 7 Sep", from a contract's expiry. */
+function week(contract) {
+  const raw = contract?.expiry;
+  if (!raw) return 'that week';
+  const when = new Date(raw);
+  if (Number.isNaN(when.getTime())) return 'that week';
+  return `week to ${when.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}`;
+}
+
 function subjectName(underlying) {
   if (!underlying) return 'the metric';
   if (underlying.kind === 'single') return underlying.ref?.subject ?? 'the metric';

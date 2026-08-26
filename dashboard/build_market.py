@@ -63,17 +63,60 @@ def _wr(subject: str):
     return Single(metric_ref("adjusted_win_rate", subject))
 
 
-def _spec(contract_id: str, underlying, payoff, tick: str = "0.25") -> ContractSpec:
+def _spec(
+    contract_id: str,
+    underlying,
+    payoff,
+    tick: str = "0.25",
+    window: ObservationWindow | None = None,
+) -> ContractSpec:
+    """A contract on the default window unless one is given.
+
+    The window is a parameter because a commodity needs it to be. Every rate
+    contract here measures the same four weeks, so the window was a constant --
+    but the whole point of a delivery month is that the amount delivered in one
+    is a different thing from the amount delivered in the next, and a term
+    structure is a set of contracts that differ in nothing else.
+    """
+    measured = window or WINDOW
     return ContractSpec(
         contract_id=contract_id,
         underlying=underlying,
         payoff=payoff,
-        window=WINDOW,
-        policy=POLICY,
+        window=measured,
+        policy=policy_for(measured),
         reference_id=REFERENCE_ID,
-        published_at=WINDOW.start - timedelta(days=1),
+        published_at=measured.start - timedelta(days=1),
         tick_size=tick,
     )
+
+
+def policy_for(window: ObservationWindow) -> DataPolicy:
+    """Scale the evidence bar to the length of the window.
+
+    A one-week delivery window contains roughly a quarter of the battles a
+    four-week observation window does, so holding both to the same minimum
+    sample size would void every weekly contract for thin data that is not
+    actually thin -- it is one week's worth.
+    """
+    weeks = max(1, round((window.end - window.start).days / 7))
+    return DataPolicy(
+        min_sample_size=250 * weeks,
+        min_stratum_battles=POLICY.min_stratum_battles,
+        min_strata_coverage=POLICY.min_strata_coverage,
+    )
+
+
+# Weekly delivery, the way a commodity is listed: the same deliverable across
+# consecutive windows, so the curve across them is a forward curve rather than
+# a set of unrelated contracts.
+DELIVERY_WEEKS = [
+    ObservationWindow(
+        datetime(2026, 8, 31, tzinfo=UTC) + timedelta(weeks=n),
+        datetime(2026, 9, 7, tzinfo=UTC) + timedelta(weeks=n),
+    )
+    for n in range(4)
+]
 
 
 def instruments() -> list[Instrument]:
@@ -143,6 +186,38 @@ def instruments() -> list[Instrument]:
             )
             for strike in (4_700, 4_750)
         ],
+        # ── commodities ────────────────────────────────────────────────
+        #
+        # A claim on an amount delivered, not on a proportion. Battles played,
+        # in thousands, over one delivery week -- which makes the window part of
+        # the contract rather than a detail, and gives the four of them a term
+        # structure with its own shape.
+        #
+        # Volume is measured in the canonical corpus rather than in the game,
+        # and the metric says so at length. A wider crawl sees more battles.
+        *[
+            Instrument(
+                f"SPIKE_VOL_W{n + 1}",
+                _spec(
+                    f"SPIKE_VOL_W{n + 1}",
+                    Single(metric_ref("battle_volume", "SPIKE")),
+                    Linear(1.0),
+                    tick="0.05",
+                    window=week,
+                ),
+            )
+            for n, week in enumerate(DELIVERY_WEEKS)
+        ],
+        Instrument(
+            "CROW_VOL_W1",
+            _spec(
+                "CROW_VOL_W1",
+                Single(metric_ref("battle_volume", "CROW")),
+                Linear(1.0),
+                tick="0.05",
+                window=DELIVERY_WEEKS[0],
+            ),
+        ),
         Instrument(
             "ASSASSIN_IDX",
             _spec(

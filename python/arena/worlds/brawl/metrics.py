@@ -62,6 +62,7 @@ __all__ = [
     "InsufficientEvidence",
     "raw_win_rate",
     "adjusted_win_rate",
+    "battle_volume",
     "use_rate",
     "METRICS",
 ]
@@ -421,6 +422,70 @@ def adjusted_win_rate_lift(
     )
 
 
+def battle_volume(
+    rows: Sequence[AggregateRow],
+    reference: ReferenceSnapshot,
+    *,
+    min_stratum_battles: int = 0,
+    min_coverage: float = 0.0,
+    missing_strata: str = MissingStrata.IMPUTE_FROM_PRIOR,
+) -> MetricOutcome:
+    """Battles this brawler appeared in during the window, in thousands.
+
+    A **quantity**, not a rate, and that difference drives every choice here.
+
+    **No shrinkage.** Shrinking pulls a noisy estimate toward a prior. There is
+    nothing to estimate: the corpus either contains a battle or it does not, and
+    a count is not a sample of itself.
+
+    **No standardization.** This is the one that looks like an omission and is
+    not. Reweighting a *rate* onto the snapshot's proportions removes the
+    crawler's changing reach from the number, which is what makes a rate
+    trustworthy from a non-representative sample. Reweighting a *count* produces
+    a number that is the count of nothing -- battles are not divisible across
+    strata by fiat, and a "standardized number of battles" would not be a
+    quantity anyone could deliver.
+
+    **What this therefore measures, stated plainly.** Volume in the canonical
+    corpus, not volume in the game. A wider crawl sees more battles, so this
+    number moves with our reach as well as with how much the brawler was played.
+    That is a real limitation and it is the reason the contract names the corpus
+    in its own terms: settlement is pinned to a reference snapshot and a source
+    digest, so every participant is measuring the same defined thing even though
+    that thing is a sample. Sample-based volume indices are traded in the real
+    world on exactly this footing; the honest move is to say so rather than to
+    imply a census.
+
+    Denominated in thousands because a contract quoted in the tens is one whose
+    collateral a person can hold, and because commodities are quoted per unit of
+    delivery rather than per item.
+    """
+    if not rows:
+        raise InsufficientEvidence("no rows in window")
+
+    battles = sum(row.brawler_battles for row in rows)
+    if battles <= 0:
+        raise InsufficientEvidence(
+            "no battles observed in window",
+            "a delivery contract on zero volume has nothing to settle against",
+        )
+
+    observed = _collapse(rows)
+    return MetricOutcome(
+        value=battles / 1_000.0,
+        sample_size=battles,
+        diagnostics=(
+            ("metric", "battle_volume"),
+            ("reference_id", reference.reference_id),
+            ("battles", battles),
+            ("strata_observed", len(observed)),
+            ("standardized", False),
+            ("shrunk", False),
+            ("basis", "canonical corpus, not a census of the game"),
+        ),
+    )
+
+
 # The registry the oracle dispatches on. A contract naming a metric outside this
 # mapping fails at resolution rather than silently measuring something adjacent.
 METRICS = {
@@ -428,6 +493,7 @@ METRICS = {
     "adjusted_win_rate": adjusted_win_rate,
     "adjusted_win_rate_lift": adjusted_win_rate_lift,
     "use_rate": use_rate,
+    "battle_volume": battle_volume,
 }
 
 # The range each metric can take. A contract declares its own bounds -- the
@@ -444,6 +510,22 @@ METRIC_BOUNDS: dict[str, tuple[float, float]] = {
     "adjusted_win_rate": (0.0, 1.0),
     "adjusted_win_rate_lift": (-1.0, 1.0),
     "use_rate": (0.0, 1.0),
+    # Thousands of battles. The fixture runs 42-71 per brawler-window, so 500
+    # is a ceiling no realistic window approaches -- and settlement rejects a
+    # contract whose declared range does not contain what the oracle returned,
+    # so an underestimate fails loudly rather than mispricing collateral.
+    "battle_volume": (0.0, 500.0),
+}
+
+# Whether each metric measures a proportion or an amount delivered. A contract
+# on an amount is a commodity: it has a delivery window that means something on
+# its own, and therefore a term structure, which a rate does not.
+METRIC_KINDS: dict[str, str] = {
+    "raw_win_rate": "rate",
+    "adjusted_win_rate": "rate",
+    "adjusted_win_rate_lift": "rate",
+    "use_rate": "rate",
+    "battle_volume": "quantity",
 }
 
 
@@ -460,4 +542,10 @@ def metric_ref(metric: str, subject: str, **filters):
             f"{metric!r} has no declared bounds; add it to METRIC_BOUNDS so that "
             "contracts written on it can size collateral correctly"
         )
-    return MetricRef(metric=metric, subject=subject, bounds=METRIC_BOUNDS[metric], **filters)
+    return MetricRef(
+        metric=metric,
+        subject=subject,
+        bounds=METRIC_BOUNDS[metric],
+        kind=METRIC_KINDS.get(metric, "rate"),
+        **filters,
+    )

@@ -46,6 +46,11 @@ class InstrumentClass:
     INDEX = "index"
     CALL = "call"
     PUT = "put"
+    # A linear claim on an amount delivered over a window, rather than on a
+    # proportion. Different economics: a delivery window is a real part of
+    # the contract, so these come in term structures and their prices carry
+    # information about carry rather than only about the level.
+    COMMODITY = "commodity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +151,12 @@ class Instrument:
             return InstrumentClass.SPREAD
         if isinstance(self.spec.underlying, Basket):
             return InstrumentClass.INDEX
+        # A linear claim on a quantity is a commodity; on a rate, a future. The
+        # metric declares which it is, so this layer never has to know what the
+        # subject means.
+        reference = getattr(self.spec.underlying, "ref", None)
+        if reference is not None and getattr(reference, "kind", "rate") == "quantity":
+            return InstrumentClass.COMMODITY
         return InstrumentClass.FUTURE
 
     def to_dict(self) -> dict[str, Any]:
