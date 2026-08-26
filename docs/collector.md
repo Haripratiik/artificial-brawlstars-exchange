@@ -533,3 +533,59 @@ fast we can ask. 404s are never retried — a deleted tag will not come back, an
 budget the rest of the crawl needs.
 
 The proxy is a free community service. Staying well under the limit is the rent.
+
+## Could we skip the crawl and take the numbers from someone else?
+
+Asked properly, and answered: **no.** Surveyed August 2026, probing endpoints rather
+than reading marketing copy.
+
+The requirement is specific, and most sources fail it on the first clause: win rates by
+**brawler x mode x map x trophy bucket**, with **sample sizes** so precision is knowable,
+as a **historical series** so a contract can settle on a measured window rather than on
+whatever the number happens to be today.
+
+| Source | Has win rates? | Historical? | Sample sizes? | Reachable? |
+|---|---|---|---|---|
+| Official Supercell API | no — per-player only | n/a | n/a | yes, via the proxy |
+| Brawlify / BrawlAPI | **no, static metadata only** | n/a | n/a | yes, free, no key |
+| Brawl Time Ninja | yes | probably | probably | **no — authenticated** |
+| BrawlStats, BrawlVision, Brawl Planet, Brawl Data | yes, on screen | no | no | **no — 403 / 429 / reset** |
+| Kaggle battle-log dumps | computable from raw | **frozen 2021 / 2023** | yes | account needed |
+
+What the probes actually returned:
+
+* `api.brawlify.com` and `brawlapi.com` are **static metadata** — brawlers, 1,239 maps,
+  68 game modes, icons. Free, no key, no rate limit, CORS open. The documentation says
+  plainly that it carries no competitive statistics. Genuinely useful, but for the
+  *universe definition* rather than the metric: it is the authoritative list of what
+  strata exist, which the reference snapshot needs anyway.
+* `cube.brawltime.ninja/cubejs-api/v1/meta` returns `{"error":"Authorization header
+  isn't set"}`. So Brawl Time Ninja computes exactly these aggregates behind a **Cube.js**
+  backend — and it is closed. Its own site API answers in **tRPC** envelopes, undocumented,
+  and its source repository has gone private. The data exists and is not on offer.
+* The other meta sites answered 403, 429, or a reset connection to anything that was not
+  a browser. They are consumer websites, not data providers, and scraping them would be
+  taking a service rather than using one.
+* The official API's per-player battlelog returns roughly the **last 25 battles**. Third
+  parties confirm it from the other side: the ones publishing hourly meta stats say they
+  poll continuously *because* of that ceiling. Everyone computing these numbers is
+  running the crawl we are describing.
+
+### The one genuinely useful finding
+
+The Kaggle dumps are **raw battle logs**, which is the right shape — the aggregation is
+ours to do either way. They are stale (2021 and 2023), so they cannot settle a 2026
+contract. But everything in this repository currently runs on `fixture-synthetic-v1`,
+and a real hundred-thousand-battle log would put the **normalizer, the mode mechanics,
+the shrinkage and the standardization** in front of real data for the first time — no
+API key, no crawl, no waiting.
+
+That is worth doing before the collector ever runs, because it separates two failures
+that would otherwise arrive together: "the metric layer is wrong" and "the crawl is
+wrong". Validating against a stale corpus answers the first one on its own.
+
+### What this does not change
+
+The crawl is still the only path to what the contracts actually settle on, and it is
+still the only part of this project with a real clock on it. A battlelog holds about
+25 battles; a window not collected in August 2026 cannot be collected in October.
