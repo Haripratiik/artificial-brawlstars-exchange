@@ -263,11 +263,24 @@ if STATIC.is_dir():
 
 
 def main() -> None:
+    """Serve the terminal.
+
+    The port comes from ``PORT`` when it is set, because supervisors -- the
+    editor's preview runner among them -- assign one and expect the process to
+    take it. Hard-coding 8000 meant a second instance simply refused to start
+    against whatever was already holding that port, with no way to redirect it
+    short of editing the file.
+
+    An explicit ``--port`` still wins over the environment, since someone who
+    typed a port meant it.
+    """
+    import os
+
     import uvicorn
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
     args = parser.parse_args()
 
     print(f"Arena Markets -> http://{args.host}:{args.port}")

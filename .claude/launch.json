@@ -5,7 +5,8 @@
       "name": "arena",
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "dashboard.server"],
-      "port": 8000
+      "port": 8000,
+      "autoPort": true
     }
   ]
 }
