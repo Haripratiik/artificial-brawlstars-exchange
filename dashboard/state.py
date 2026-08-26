@@ -43,7 +43,10 @@ FEE_SCHEDULES: dict[str, FeeSchedule] = {
 # gives 5Hz, so this buffer covers six minutes of wall clock rather than ninety
 # seconds -- long enough for a chart to show a session rather than a moment.
 HISTORY = 1_800
-SAMPLE_EVERY = 4
+# Every second tick rather than every fourth. A step costs 0.12ms against a
+# 50ms budget, so the old rate was leaving a chart to fill slowly for no
+# reason anyone could point at.
+SAMPLE_EVERY = 2
 
 
 @dataclass(frozen=True, slots=True)

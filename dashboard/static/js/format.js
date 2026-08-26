@@ -101,7 +101,8 @@ export function describe(contract) {
   const subject = subjectOf(u);
   switch (p.kind) {
     case 'binary':
-      return `Pays ${p.payout} if ${subject} ${esc(p.comparison)} ${p.threshold}, else 0.`;
+      return `Pays ${p.payout} for every contract if ${subject}'s measured rate `
+        + `finishes ${esc(p.comparison)} ${p.threshold}. Otherwise it pays nothing.`;
     case 'call':
       return `Call on ${subject}, strike ${p.strike}, scaled ${p.scale}.`;
     case 'put':

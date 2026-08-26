@@ -175,6 +175,26 @@ check('a missing payoff has no probability', fmt.impliedProbability(1, null) ===
 check('percent formats', fmt.percent(0.425) === '42.5%', fmt.percent(0.425));
 check('percent of nothing is a dash', fmt.percent(null) === '—');
 
+/* ── a market must not print its own answer ───────────────────────────────
+ *
+ * The trade page stated "will actually settle at 0.00" beside the price, and
+ * drew it on the chart as a target line. That is not a prediction market; it is
+ * a countdown. Nothing was left to discover and nothing to disagree about, so
+ * the price sat pinned for whole sessions.
+ */
+const revealed = { ...store, reveal: false };
+const quiet = views.trade(revealed);
+check('the settlement value is not on the page', !quiet.includes('Will actually settle at'));
+check('there is a way to reveal it', quiet.includes('Reveal what this will settle at'));
+check('the reveal starts closed', !/<details class="spoiler"[^>]*open/.test(quiet));
+// The target line is the only thing that draws a dashed stroke, so that is
+// what to look for -- the word "settles" also appears in the resolution copy
+// and in the question itself, which made a looser check match the wrong text.
+check('the chart draws no target line by default',
+      !/stroke-dasharray/.test(quiet), 'the answer is still drawn on the chart');
+check('revealing puts it back',
+      /stroke-dasharray/.test(views.trade({ ...store, reveal: true })));
+
 /* ── the contract has to name itself ──────────────────────────────────────
  *
  * The metric reference arrives under `ref`. Reading the wrong key made every

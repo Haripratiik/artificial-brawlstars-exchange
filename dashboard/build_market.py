@@ -80,9 +80,32 @@ def instruments() -> list[Instrument]:
     return [
         Instrument("SPIKE_WR_FUT", _spec("SPIKE_WR_FUT", _wr("SPIKE"), Linear(10_000.0))),
         Instrument("CROW_WR_FUT", _spec("CROW_WR_FUT", _wr("CROW"), Linear(10_000.0))),
+        # A ladder, not a single threshold.
+        #
+        # One binary struck at 0.48 was a foregone conclusion: the rate settles
+        # near 0.467, so the answer was known and the price sat pinned at three
+        # cents for the whole session. A prediction market with no uncertainty
+        # in it is a countdown, not a market.
+        #
+        # These thresholds are chosen from the plausible band a win rate lives
+        # in, the way an exchange lists strikes -- not from the settlement value,
+        # which would be listing the answer. Some rungs will be near-certain and
+        # some genuinely open; which is which is exactly what the market is for.
+        *[
+            Instrument(
+                f"SPIKE_GT{int(threshold * 100)}",
+                _spec(
+                    f"SPIKE_GT{int(threshold * 100)}",
+                    _wr("SPIKE"),
+                    Binary(">", threshold, payout=1.0),
+                    tick="0.01",
+                ),
+            )
+            for threshold in (0.44, 0.46, 0.47, 0.48)
+        ],
         Instrument(
-            "SPIKE_GT48",
-            _spec("SPIKE_GT48", _wr("SPIKE"), Binary(">", 0.48, payout=1.0), tick="0.01"),
+            "CROW_GT47",
+            _spec("CROW_GT47", _wr("CROW"), Binary(">", 0.47, payout=1.0), tick="0.01"),
         ),
         Instrument(
             "SPIKE_CROW",
@@ -92,14 +115,34 @@ def instruments() -> list[Instrument]:
         # settle from the same metric at the same instant and need no separate
         # machinery. Struck either side of where SPIKE actually settles, so one
         # expires worthless and the other in the money.
-        Instrument(
-            "SPIKE_C4700",
-            _spec("SPIKE_C4700", _wr("SPIKE"), Call(4_700.0, 10_000.0), tick="0.25"),
-        ),
-        Instrument(
-            "SPIKE_P4700",
-            _spec("SPIKE_P4700", _wr("SPIKE"), Put(4_700.0, 10_000.0), tick="0.25"),
-        ),
+        # Struck as a ladder for the same reason. Both options used to sit at
+        # 4,700 against a rate settling near 4,669, so both were worth almost
+        # nothing and their books were two-sided about two percent of the time.
+        # An option nobody can quote is not an asset class, it is a row.
+        *[
+            Instrument(
+                f"SPIKE_C{strike}",
+                _spec(
+                    f"SPIKE_C{strike}",
+                    _wr("SPIKE"),
+                    Call(float(strike), 10_000.0),
+                    tick="0.25",
+                ),
+            )
+            for strike in (4_600, 4_650, 4_700)
+        ],
+        *[
+            Instrument(
+                f"SPIKE_P{strike}",
+                _spec(
+                    f"SPIKE_P{strike}",
+                    _wr("SPIKE"),
+                    Put(float(strike), 10_000.0),
+                    tick="0.25",
+                ),
+            )
+            for strike in (4_700, 4_750)
+        ],
         Instrument(
             "ASSASSIN_IDX",
             _spec(

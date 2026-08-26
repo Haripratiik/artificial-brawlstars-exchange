@@ -30,6 +30,9 @@ const store = {
   side: 'buy',
   generation: 0,
   query: '',
+  // Whether to show what a contract will settle at. Off: a market that
+  // prints its own answer has nothing left to discover.
+  reveal: false,
   // Last mark seen per symbol, so a change can be shown as a change.
   marks: {},
 };
@@ -423,6 +426,14 @@ function bind() {
       event.stopPropagation();
       act(button.dataset.act, button.dataset);
     });
+  });
+
+  main.querySelectorAll('.spoiler').forEach((node) => {
+    node.addEventListener('toggle', () => {
+      store.reveal = node.open;
+      render({ force: true });
+    });
+    node.open = store.reveal;
   });
 
   const apply = document.getElementById('c-apply');

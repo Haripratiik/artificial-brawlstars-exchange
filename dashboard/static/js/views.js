@@ -238,7 +238,10 @@ export function trade(store) {
       <div class="panel" data-region="chart">
         <h2>Price <em>${series.length} points</em></h2>
         <div class="panel-body chart-body">
-          ${priceChart(series, { settlesAt: meta.settles_at ?? null, label: symbol })}
+          ${priceChart(series, {
+            settlesAt: store.reveal ? (meta.settles_at ?? null) : null,
+            label: symbol,
+          })}
         </div>
       </div>
 
@@ -327,11 +330,18 @@ function resolution(book, meta) {
       ${p.kind === 'binary'
         ? `<li><span>Pays</span><b class="mono">${price(p.payout)} if it happens, ${price(0)} if not</b></li>`
         : ''}
-      ${settles != null
-        ? `<li><span>Will actually settle at</span><b class="mono up">${price(settles)}</b>
-             <em>visible only because this is a simulation &mdash; a real venue could not tell you</em></li>`
-        : ''}
     </ul>
+    ${settles != null
+      ? `<details class="spoiler">
+           <summary>Reveal what this will settle at</summary>
+           <p>This contract settles at <b class="mono up">${price(settles)}</b>.</p>
+           <p class="note">Only a simulation can tell you this, and printing it on
+             the page turns a prediction market into a countdown: there is nothing
+             left to discover and nothing to disagree about. Kept behind a click so
+             the market can do its job, and available because being able to check
+             the price against the truth is the whole point of building one.</p>
+         </details>`
+      : ''}
   </section>`;
 }
 
@@ -481,14 +491,32 @@ function counterparties(snapshot, symbol) {
     return `<div class="empty">Once you trade, the participants who took the
       other side appear here by name.</div>`;
   }
+
+  // Aggregated per counterparty and side. One order that swept a book produced
+  // twenty near-identical rows -- "buy 30 at 0.06 from mm-1" over and over --
+  // which is a log, not an answer. What a person wants to know is who they are
+  // trading against and at what average, and that is four numbers.
+  const totals = new Map();
+  for (const fill of rows) {
+    const key = `${fill.counterparty}|${fill.side}`;
+    const acc = totals.get(key) ?? { ...fill, quantity: 0, notional: 0, fills: 0 };
+    acc.quantity += fill.quantity;
+    acc.notional += fill.quantity * Number(fill.price);
+    acc.fills += 1;
+    totals.set(key, acc);
+  }
+
+  const summary = [...totals.values()].sort((a, b) => b.quantity - a.quantity);
   return `<table>
-    <thead><tr><th>Side</th><th>Qty</th><th>Price</th><th>Counterparty</th></tr></thead>
-    <tbody>${rows
+    <thead><tr><th>Counterparty</th><th>Side</th><th>Contracts</th>
+               <th>Avg price</th><th>Fills</th></tr></thead>
+    <tbody>${summary
       .map((c) => `<tr>
+        <td class="mono" style="text-align:left">${esc(c.counterparty)}</td>
         <td class="${c.side === 'buy' ? 'up' : 'down'}" style="text-align:left">${esc(c.side)}</td>
         <td>${count(c.quantity)}</td>
-        <td>${price(c.price)}</td>
-        <td class="mono">${esc(c.counterparty)}</td>
+        <td>${price(c.notional / c.quantity)}</td>
+        <td class="faint">${count(c.fills)}</td>
       </tr>`)
       .join('')}</tbody></table>`;
 }
