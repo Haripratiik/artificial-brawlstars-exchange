@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import mimetypes
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,21 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from dashboard.state import FEE_SCHEDULES, MarketConfig, MarketRunner
+
+# Starlette serves static files with whatever `mimetypes` reports, and on
+# Windows `mimetypes` reads the registry -- where `.js` is very often mapped to
+# `text/plain`. Browsers enforce the MIME type of `<script type="module">`
+# strictly and refuse a module served as anything but JavaScript, so the entire
+# front end silently did not run: the page rendered its static HTML, no handler
+# was bound, and nothing in the server logs said why, because every request had
+# answered 200.
+#
+# Registered here rather than relied upon, so the answer does not depend on the
+# machine the server happens to start on.
+mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("application/json", ".json")
+mimetypes.add_type("image/svg+xml", ".svg")
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"

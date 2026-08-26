@@ -286,6 +286,34 @@ def test_the_server_starts_the_way_it_is_documented():
     assert "Arena Markets" in result.stdout
 
 
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/static/js/main.js", "javascript"),
+        ("/static/js/views.js", "javascript"),
+        ("/static/js/format.js", "javascript"),
+        ("/static/css/terminal.css", "text/css"),
+    ],
+)
+def test_assets_are_served_with_a_usable_content_type(client, path, expected):
+    """A 200 is not enough: the browser checks the type before it runs anything.
+
+    Starlette serves static files with whatever `mimetypes` reports, and on
+    Windows that reads the registry, where `.js` is commonly mapped to
+    `text/plain`. Browsers enforce the MIME type of `<script type="module">`
+    strictly and refuse a module served as anything else -- so the entire front
+    end silently did not run. The page painted its static HTML, no handler was
+    bound, no button worked, and the server logged nothing, because every
+    request had answered 200.
+
+    Checking status alone is exactly how that survived a green test suite.
+    """
+    response = client.get(path)
+    assert response.status_code == 200
+    content_type = response.headers["content-type"]
+    assert expected in content_type, f"{path} served as {content_type}"
+
+
 def test_every_static_asset_the_page_asks_for_exists():
     """A 404 on a module leaves a blank screen and one line in the console."""
     html = (REPO / "dashboard" / "static" / "index.html").read_text(encoding="utf-8")
