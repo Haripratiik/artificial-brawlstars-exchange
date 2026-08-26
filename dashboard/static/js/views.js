@@ -10,7 +10,8 @@
  * left alone afterwards.
  */
 
-import { clock, cls, count, describe, esc, money, price, priceChart, signed, sparkline } from './format.js';
+import { clock, cls, count, describe, esc, impliedProbability, money, percent,
+         price, priceChart, signed, sparkline, walkBook } from './format.js';
 
 /* ── markets ─────────────────────────────────────────────────────────── */
 
@@ -41,7 +42,10 @@ export function markets(store) {
           <span class="sym">${esc(symbol)}</span>
           <span class="kind">${esc(book.class ?? '')}</span>
         </span>
-        <span class="price mono ${cls(change)}">${price(book.mark)}</span>
+        <span class="price mono ${cls(change)}">${
+          impliedProbability(book.mark, book.contract?.payoff) != null
+            ? percent(impliedProbability(book.mark, book.contract?.payoff), 0)
+            : price(book.mark)}</span>
         <span class="sub">
           <span class="${cls(change)}">${signed(change)} (${signed(pct)}%)</span>
           <span class="faint">${count(book.trades)} trades</span>
@@ -105,6 +109,9 @@ function instrumentBar(symbol, book, meta, session) {
     </div>
     <span class="badge ${esc(session)}">${esc(session.replace('_', ' '))}</span>
     <div class="stat"><b>${price(book.mark)}</b><span>mark</span></div>
+    ${impliedProbability(book.mark, book.contract?.payoff) != null
+      ? `<div class="stat"><b class="amber">${percent(impliedProbability(book.mark, book.contract?.payoff))}</b>
+           <span>implied odds</span></div>` : ''}
     <div class="stat"><b>${spread}</b><span>spread</span></div>
     <div class="stat"><b>${count(book.trades)}</b><span>trades</span></div>
     ${meta.settles_at != null
@@ -135,7 +142,17 @@ function ladder(book, depth) {
   bids.forEach(([p, q]) => byPrice.set(p, { ...(byPrice.get(p) || {}), bid: q }));
   asks.forEach(([p, q]) => byPrice.set(p, { ...(byPrice.get(p) || {}), ask: q }));
 
-  const peak = Math.max(1, ...bids.map(([, q]) => q), ...asks.map(([, q]) => q));
+  // Cumulative size outward from the touch. Per-level size tells you what is
+  // at a price; the running total tells you what it costs to get through it,
+  // which is the question anyone sizing an order is actually asking.
+  const cumulativeBid = new Map();
+  let runningBid = 0;
+  for (const [p, q] of bids) { runningBid += q; cumulativeBid.set(p, runningBid); }
+  const cumulativeAsk = new Map();
+  let runningAsk = 0;
+  for (const [p, q] of asks) { runningAsk += q; cumulativeAsk.set(p, runningAsk); }
+
+  const peak = Math.max(1, runningBid, runningAsk);
   const mark = Number(book.mark);
   const rows = [...byPrice.entries()].sort((a, b) => b[0] - a[0]);
   // The row nearest the mark, so the eye lands on the middle of the book.
@@ -146,8 +163,10 @@ function ladder(book, depth) {
 
   return `<div class="ladder">${rows
     .map(([p, side], i) => {
-      const bidW = ((side.bid || 0) / peak) * 46;
-      const askW = ((side.ask || 0) / peak) * 46;
+      // Bars show the cumulative book, so their shape is the liquidity profile
+      // rather than a row-by-row sawtooth.
+      const bidW = ((cumulativeBid.get(p) || 0) / peak) * 46;
+      const askW = ((cumulativeAsk.get(p) || 0) / peak) * 46;
       return `<button type="button" class="lad-row ${i === nearest ? 'at-mark' : ''}"
                    data-price="${p}"
                    aria-label="Price ${price(p)}, ${side.bid || 0} bid, ${side.ask || 0} offered">
@@ -163,9 +182,15 @@ function ladder(book, depth) {
 
 function ticket(symbol, book, session) {
   const halted = session !== 'continuous';
+  const binary = book.contract?.payoff?.kind === 'binary';
+  // On a binary, buying is a bet the event happens and selling is a bet it does
+  // not. Prediction markets label the buttons that way rather than making the
+  // reader translate, and the translation is where people make mistakes.
+  const buyLabel = binary ? 'Buy Yes' : 'Buy';
+  const sellLabel = binary ? 'Buy No' : 'Sell';
   return `<div class="sides">
-      <button data-side="buy" aria-pressed="true">Buy</button>
-      <button data-side="sell" aria-pressed="false">Sell</button>
+      <button type="button" data-side="buy" aria-pressed="true">${buyLabel}</button>
+      <button type="button" data-side="sell" aria-pressed="false">${sellLabel}</button>
     </div>
     <div class="row2">
       <div class="field">
@@ -188,6 +213,11 @@ function ticket(symbol, book, session) {
       <input id="t-px" type="text" inputmode="decimal" placeholder="4660.25&hellip;"
              autocomplete="off" spellcheck="false">
     </div>
+    <div class="quick" role="group" aria-label="Quick size">
+      ${[5, 25, 100, 250].map((n) => `<button type="button" data-qty="${n}">${n}</button>`).join('')}
+    </div>
+    <!-- What it costs, before you commit to it. -->
+    <div class="preview" id="t-preview" aria-live="polite"></div>
     <button type="button" class="send" id="t-send" ${halted ? 'disabled' : ''}>
       ${halted ? `${esc(session.replace('_', ' '))} &mdash; orders rest` : 'Send order'}
     </button>

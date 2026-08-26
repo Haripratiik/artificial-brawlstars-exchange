@@ -12,7 +12,8 @@
  * it is the fastest way to make a trading screen unusable.
  */
 
-import { clock, count, money, price, signed, cls } from './format.js';
+import { clock, count, impliedProbability, money, percent, price, signed, cls,
+         walkBook } from './format.js';
 import { lab, markets, portfolio, research, trade } from './views.js';
 
 const store = {
@@ -27,6 +28,8 @@ const store = {
   history: {},          // symbol -> array of mids, built client-side from ticks
   side: 'buy',
   generation: 0,
+  // Last mark seen per symbol, so a change can be shown as a change.
+  marks: {},
 };
 
 const VIEWS = { markets, trade, portfolio, research, lab };
@@ -258,7 +261,15 @@ function renderWatchlist() {
       const change = first != null && last != null ? last - first : 0;
       const pct = first ? (change / first) * 100 : 0;
       const current = symbol === store.symbol;
-      return `<button type="button" class="watch" data-symbol="${symbol}"
+      // Motion that carries information rather than decorating: a price that
+      // just moved flashes in the direction it moved. This is the one
+      // animation on a trading screen that earns its place, because it says
+      // something the static number cannot -- that this is new.
+      const now = Number(book.mark);
+      const was = store.marks[symbol];
+      const tick = !Number.isFinite(was) || now === was ? '' : now > was ? 'tick-up' : 'tick-down';
+      store.marks[symbol] = now;
+      return `<button type="button" class="watch ${tick}" data-symbol="${symbol}"
                    ${current ? 'aria-current="true"' : ''}
                    aria-label="${symbol}, ${price(book.mark)}, ${signed(pct)} percent">
         <span class="sym">${symbol}</span>
@@ -313,11 +324,31 @@ function bind() {
       store.side = button.dataset.side;
       main.querySelectorAll('.sides button').forEach((b) =>
         b.setAttribute('aria-pressed', String(b.dataset.side === store.side)));
+      updatePreview();
     });
   });
 
   const sendButton = document.getElementById('t-send');
   if (sendButton) sendButton.addEventListener('click', submitOrder);
+
+  // The preview has to follow keystrokes, not renders: the ticket is
+  // deliberately not re-rendered while someone is typing into it.
+  ['t-qty', 't-px', 't-tif'].forEach((id) => {
+    const field = document.getElementById(id);
+    if (field && !field.dataset.wired) {
+      field.dataset.wired = '1';
+      field.addEventListener('input', updatePreview);
+      field.addEventListener('change', updatePreview);
+    }
+  });
+  main.querySelectorAll('.quick button').forEach((button) => {
+    button.addEventListener('click', () => {
+      const field = document.getElementById('t-qty');
+      if (field) field.value = button.dataset.qty;
+      updatePreview();
+    });
+  });
+  updatePreview();
 
   main.querySelectorAll('[data-act]').forEach((button) => {
     button.addEventListener('click', (event) => {
@@ -328,6 +359,83 @@ function bind() {
 
   const apply = document.getElementById('c-apply');
   if (apply) apply.addEventListener('click', rebuild);
+}
+
+/**
+ * What the order would cost, and what it could lose.
+ *
+ * Every exchange shows this before you commit, and this one could not: you
+ * typed a size into a box and pressed send with no idea what you were about to
+ * pay. It is all computable from the depth already on screen.
+ *
+ * The worst case is exact rather than estimated, because every contract here
+ * settles inside a known interval — a long position cannot lose more than the
+ * distance from its price down to the floor, and a short cannot lose more than
+ * the distance up to the ceiling. That is the same arithmetic the venue uses to
+ * hold collateral, so the number on the ticket is the number being reserved.
+ */
+function updatePreview() {
+  const panel = document.getElementById('t-preview');
+  if (!panel) return;
+
+  const book = store.snapshot?.books?.[store.symbol];
+  const quantity = Number(document.getElementById('t-qty')?.value);
+  if (!book || !Number.isFinite(quantity) || quantity <= 0) {
+    panel.innerHTML = '';
+    return;
+  }
+
+  const buying = store.side === 'buy';
+  const raw = document.getElementById('t-px')?.value.trim() ?? '';
+  const limit = raw === '' ? null : Number(raw);
+
+  // Marketable orders walk the opposite side; a resting limit fills at its own
+  // price or better, so its own price is the honest estimate.
+  const ladder = buying
+    ? (store.depth?.asks ?? book.asks ?? [])
+    : (store.depth?.bids ?? book.bids ?? []);
+  const marketable =
+    limit === null ||
+    (ladder.length && (buying ? limit >= Number(ladder[0][0]) : limit <= Number(ladder[0][0])));
+
+  const walk = marketable ? walkBook(ladder, quantity) : null;
+  const average = walk ? walk.average : limit;
+  if (!Number.isFinite(average)) {
+    panel.innerHTML = '';
+    return;
+  }
+
+  const [low, high] = (book.bounds ?? []).map(Number);
+  const risk = Number.isFinite(low) && Number.isFinite(high)
+    ? quantity * (buying ? average - low : high - average)
+    : null;
+
+  const payoff = book.contract?.payoff;
+  const odds = impliedProbability(average, payoff);
+
+  const rows = [
+    ['Avg price', price(average)],
+    [buying ? 'Cost' : 'Proceeds', money(average * quantity)],
+  ];
+  if (risk != null) rows.push(['Max loss', money(risk)]);
+
+  // A binary pays a fixed amount, so the useful framing is what you win and
+  // what you staked — not a notional.
+  if (payoff?.kind === 'binary') {
+    const payout = Number(payoff.payout) * quantity;
+    const stake = buying ? average * quantity : (Number(payoff.payout) - average) * quantity;
+    rows.push([buying ? 'Pays if yes' : 'Pays if no', money(buying ? payout : payout)]);
+    rows.push(['Profit if right', money(payout - stake)]);
+    if (odds != null) rows.push(['Implied odds', percent(buying ? odds : 1 - odds)]);
+  }
+
+  const warning = walk && !walk.complete
+    ? `<div class="warn">Book holds only ${count(walk.filled)} — ${count(walk.shortfall)} would not fill.</div>`
+    : '';
+
+  panel.innerHTML =
+    rows.map(([label, value]) =>
+      `<div><span>${label}</span><b class="mono">${value}</b></div>`).join('') + warning;
 }
 
 function submitOrder() {

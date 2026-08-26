@@ -137,6 +137,44 @@ check('esc neutralises markup',
 check('sparkline of one point is empty', fmt.sparkline([1]) === '');
 check('chart of one point degrades', fmt.priceChart([1]).includes('Waiting'));
 
+/* ── the ticket's arithmetic ──────────────────────────────────────────────
+ *
+ * These two decide what a person is *told* an order will cost before they
+ * commit to it, so being subtly wrong here is worse than showing nothing.
+ */
+
+const twoLevels = [[100, 5], [101, 10]];
+
+const partial = fmt.walkBook(twoLevels, 8);
+check('walk fills across levels', partial.filled === 8, `${partial?.filled}`);
+check('walk costs 5x100 + 3x101', partial.cost === 803, `${partial?.cost}`);
+check('walk averages correctly', Math.abs(partial.average - 100.375) < 1e-9,
+      `${partial?.average}`);
+check('walk knows it completed', partial.complete === true);
+
+const beyond = fmt.walkBook(twoLevels, 20);
+check('walk reports a shortfall', beyond.complete === false && beyond.shortfall === 5,
+      `filled ${beyond?.filled}, short ${beyond?.shortfall}`);
+check('walk never invents depth', beyond.filled === 15, `${beyond?.filled}`);
+
+check('walk of nothing is null', fmt.walkBook(twoLevels, 0) === null);
+check('walk of an empty book is null', fmt.walkBook([], 10) === null);
+check('walk of a bad size is null', fmt.walkBook(twoLevels, NaN) === null);
+
+const binary = { kind: 'binary', payout: 1.0, threshold: 0.48, comparison: '>' };
+check('a binary price is its probability',
+      fmt.impliedProbability(0.42, binary) === 0.42,
+      `${fmt.impliedProbability(0.42, binary)}`);
+check('probability scales with the payout',
+      fmt.impliedProbability(50, { kind: 'binary', payout: 200 }) === 0.25);
+check('probability clamps above one',
+      fmt.impliedProbability(1.4, binary) === 1);
+check('a future has no implied probability',
+      fmt.impliedProbability(4660, { kind: 'linear', scale: 10000 }) === null);
+check('a missing payoff has no probability', fmt.impliedProbability(1, null) === null);
+check('percent formats', fmt.percent(0.425) === '42.5%', fmt.percent(0.425));
+check('percent of nothing is a dash', fmt.percent(null) === '—');
+
 /* ── accessibility, as assertions ─────────────────────────────────────────
  *
  * These encode findings from an audit against the Web Interface Guidelines.

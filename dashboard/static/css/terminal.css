@@ -613,3 +613,68 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 
 .stats { display: flex; gap: 22px; }
 .health { margin: 0; }
+
+
+/* ── ticket preview and quick sizes ─────────────────────────────────── */
+
+.quick { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+.quick button {
+  padding: 5px 0;
+  min-height: 24px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  border: 1px solid var(--control-edge);
+  color: var(--ink-dim);
+  transition: border-color var(--tick), color var(--tick);
+}
+.quick button:hover { border-color: var(--amber); color: var(--amber); }
+
+/* What the order costs, stated before it is sent. Bordered on the amber side
+ * so it reads as part of the commitment rather than as more chrome. */
+.preview {
+  border-left: 2px solid var(--amber);
+  background: var(--sunk);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.preview:empty { display: none; }
+.preview > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.preview span {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.preview b { font-size: 12px; font-weight: 500; }
+.preview .warn {
+  display: block;
+  color: var(--halt);
+  font-size: 10px;
+  line-height: 1.4;
+  border-top: 1px solid var(--rule);
+  padding-top: 6px;
+  margin-top: 2px;
+}
+
+.amber { color: var(--amber); }
+
+
+/* ── tick flash ─────────────────────────────────────────────────────── */
+
+/* The one animation on a trading screen that carries information: a price
+ * that just moved is tinted in the direction it moved, and fades. Direction
+ * colours are used here because this *is* direction -- the same meaning they
+ * carry everywhere else. Reduced motion collapses the duration, so the tint
+ * simply does not appear rather than appearing and sticking. */
+.tick-up { animation: tick-up 0.55s ease-out; }
+.tick-down { animation: tick-down 0.55s ease-out; }
+@keyframes tick-up { from { background: var(--up-sunk); } }
+@keyframes tick-down { from { background: var(--down-sunk); } }

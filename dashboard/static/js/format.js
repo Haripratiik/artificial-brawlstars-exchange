@@ -123,6 +123,62 @@ function subjectOf(u) {
   return 'the metric';
 }
 
+/**
+ * A binary contract's price *is* its implied probability, and prediction
+ * markets say so on the screen rather than making you divide.
+ *
+ * On a contract paying 1.00, a price of 0.42 means the market puts the odds at
+ * 42%. Showing the raw tick price and leaving the reader to work that out is
+ * the difference between a number and an answer.
+ */
+export function impliedProbability(mark, payoff) {
+  if (!payoff || payoff.kind !== 'binary') return null;
+  const payout = Number(payoff.payout);
+  const price = Number(mark);
+  if (!Number.isFinite(payout) || !Number.isFinite(price) || payout <= 0) return null;
+  return Math.min(1, Math.max(0, price / payout));
+}
+
+export function percent(fraction, dp = 1) {
+  if (fraction == null || !Number.isFinite(fraction)) return '—';
+  return `${(fraction * 100).toFixed(dp)}%`;
+}
+
+/**
+ * Walk a ladder the way a marketable order actually would, and report what it
+ * would really cost.
+ *
+ * A size box with no cost beside it is the thing that makes a trading screen
+ * feel like a form rather than an exchange: you are asked to commit before
+ * being told the price. Every venue shows this, and it is computable from the
+ * depth already on screen.
+ *
+ * Returns null when the book cannot fill the whole order, because a partial
+ * average would understate the cost of the part that does not fill.
+ */
+export function walkBook(levels, quantity) {
+  let remaining = Number(quantity);
+  if (!Number.isFinite(remaining) || remaining <= 0) return null;
+  let cost = 0;
+  let filled = 0;
+  for (const [rawPrice, rawSize] of levels || []) {
+    if (remaining <= 0) break;
+    const price = Number(rawPrice);
+    const take = Math.min(remaining, Number(rawSize));
+    cost += take * price;
+    filled += take;
+    remaining -= take;
+  }
+  if (filled <= 0) return null;
+  return {
+    filled,
+    cost,
+    average: cost / filled,
+    complete: remaining <= 0,
+    shortfall: Math.max(0, remaining),
+  };
+}
+
 /* ── charts ──────────────────────────────────────────────────────────── */
 
 /** A bare sparkline: no axes, no labels, just the shape of the last N points. */
