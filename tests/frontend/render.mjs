@@ -137,6 +137,81 @@ check('esc neutralises markup',
 check('sparkline of one point is empty', fmt.sparkline([1]) === '');
 check('chart of one point degrades', fmt.priceChart([1]).includes('Waiting'));
 
+/* ── accessibility, as assertions ─────────────────────────────────────────
+ *
+ * These encode findings from an audit against the Web Interface Guidelines.
+ * Writing them down as tests is the difference between fixing an issue once
+ * and keeping it fixed: the clickable-div problem in particular is the kind of
+ * thing that creeps back in the next time a row needs to be clickable.
+ */
+
+const everyView = ['markets', 'trade', 'portfolio', 'research', 'lab']
+  .map((n) => views[n](store))
+  .join('\n');
+
+// Rows and cards are actions. A div with a click handler cannot be reached by
+// keyboard and is not announced as interactive.
+check('no clickable divs remain',
+      !/<div[^>]*\bdata-(symbol|price)=/.test(everyView),
+      'a div is carrying a click target');
+check('cards are buttons', /<button[^>]*class="card"/.test(everyView));
+check('ladder rows are buttons', /<button[^>]*class="lad-row/.test(everyView));
+
+// Every button must be announceable: visible text or an explicit label.
+const buttons = everyView.match(/<button[\s\S]*?<\/button>/g) || [];
+check('there are buttons to check', buttons.length > 5, `${buttons.length}`);
+for (const button of buttons) {
+  const labelled = /aria-label=/.test(button);
+  const text = button.replace(/<[^>]*>/g, '').replace(/&[a-z]+;/g, '').trim();
+  check('every button is announceable', labelled || text.length > 0,
+        button.slice(0, 70));
+}
+
+// Every form control needs a label. Three forms are all valid: a `for=`
+// pointing at it, an `aria-label`, or a <label> wrapped around it -- the last
+// of which is what a checkbox wants anyway, since it makes the text part of
+// the hit target instead of a dead zone next to it.
+const wrapped = (everyView.match(/<label[\s\S]*?<\/label>/g) || []).join(' ');
+const inputs = everyView.match(/<(input|select)[^>]*>/g) || [];
+check('there are inputs to check', inputs.length > 3, `${inputs.length}`);
+for (const input of inputs) {
+  const id = /id="([^"]+)"/.exec(input)?.[1];
+  const byFor = id ? everyView.includes(`for="${id}"`) : false;
+  const byWrap = wrapped.includes(input);
+  check('every input has a label', byFor || byWrap || /aria-label=/.test(input),
+        input.slice(0, 70));
+}
+
+// Decorative charts must not be announced as content.
+check('sparklines are hidden from assistive tech',
+      !/<span class="spark">/.test(everyView),
+      'a sparkline is missing aria-hidden');
+
+/* ── css hygiene ──────────────────────────────────────────────────────── */
+
+const css = readFileSync(
+  new URL('../../dashboard/static/css/terminal.css', import.meta.url), 'utf8');
+
+check('no transition: all', !/transition:\s*all\b/.test(css),
+      'animates properties nobody asked for');
+check('focus is visible', css.includes(':focus-visible'),
+      'keyboard users cannot see where they are');
+check('reduced motion is honoured', css.includes('prefers-reduced-motion'));
+check('taps are not delayed', css.includes('touch-action'));
+
+const html = readFileSync(
+  new URL('../../dashboard/static/index.html', import.meta.url), 'utf8');
+check('dark colour-scheme declared', /color-scheme:\s*dark/.test(html));
+check('theme-color matches the background', /name="theme-color"/.test(html));
+check('font host is preconnected', html.includes('rel="preconnect"'));
+check('fonts are not @imported from css', !css.includes('@import'),
+      'an @import serialises the stylesheet and the font request');
+check('there is a skip link', html.includes('class="skip"'));
+check('there is exactly one h1', (html.match(/<h1/g) || []).length === 1);
+check('async regions are announced', html.includes('aria-live'));
+check('zoom is not disabled',
+      !/user-scalable=no|maximum-scale=1/.test(html));
+
 if (failures.length) {
   console.error(`FAILED (${failures.length})`);
   failures.forEach((f) => console.error('  - ' + f));

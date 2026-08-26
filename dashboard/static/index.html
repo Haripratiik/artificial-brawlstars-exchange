@@ -1,47 +1,77 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" style="color-scheme: dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08080a">
+  <meta name="description" content="A simulated exchange: live order books, depth, and settlement on Brawl Stars statistics.">
   <title>Arena Markets</title>
+
+  <!-- Fonts as <link> rather than an @import inside the stylesheet. An @import
+       cannot begin downloading until the CSS itself has arrived and parsed, so it
+       serialises two round trips that should overlap; preconnect opens the
+       connection to the font host while the CSS is still in flight. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preload" as="style"
+        href="https://fonts.googleapis.com/css2?family=Chivo:wght@300;400;700;900&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Chivo:wght@300;400;700;900&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
   <link rel="stylesheet" href="/static/css/terminal.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%2308080a'/><rect x='3' y='3' width='10' height='10' fill='%23f5a623'/></svg>">
 </head>
 <body>
+  <a class="skip" href="#main">Skip to the market</a>
+
   <div id="shell">
     <header>
-      <div class="brand"><em>&#9646;</em> ARENA <small>Markets</small></div>
+      <h1 class="brand" translate="no">
+        <span aria-hidden="true">&#9646;</span> Arena <small>Markets</small>
+      </h1>
 
-      <div class="stat"><b id="clock">0.00s</b><span>session</span></div>
-      <div class="stat"><b id="events">0</b><span>events</span></div>
-      <div class="stat"><b id="equity">&mdash;</b><span>equity</span></div>
-      <div class="stat"><b id="pnl">&mdash;</b><span>p&amp;l</span></div>
+      <!-- The header numbers change twenty times a second. Announcing every
+           change would make a screen reader unusable, so the region is polite
+           and only the figures a trader acts on are inside it. -->
+      <div class="stats" aria-live="polite" aria-atomic="false">
+        <div class="stat"><b id="clock" class="mono">0.00s</b><span>Session</span></div>
+        <div class="stat"><b id="events" class="mono">0</b><span>Events</span></div>
+        <div class="stat"><b id="equity" class="mono">&mdash;</b><span>Equity</span></div>
+        <div class="stat"><b id="pnl" class="mono">&mdash;</b><span>P&amp;L</span></div>
+      </div>
 
       <div class="spacer"></div>
 
       <div class="speed">
-        <span class="faint mono" style="font-size:8.5px;letter-spacing:.14em">SPEED</span>
-        <input id="speed" type="range" min="0" max="20" step="0.5" value="1">
-        <b id="speed-label">1.0&times;</b>
+        <label for="speed">Speed</label>
+        <input id="speed" type="range" min="0" max="20" step="0.5" value="1"
+               aria-describedby="speed-label">
+        <b id="speed-label" class="mono">1.0&times;</b>
       </div>
 
-      <div class="health" id="health"><i></i><span id="health-text">conserved</span></div>
+      <!-- Conservation is the invariant the whole ledger rests on. If it ever
+           leaves zero the operator needs to know immediately, so this one is
+           assertive where the rest of the header is polite. -->
+      <p class="health" id="health" aria-live="assertive">
+        <i aria-hidden="true"></i><span id="health-text">Conserved</span>
+      </p>
     </header>
 
-    <nav>
+    <nav aria-label="Sections">
       <div class="nav-links" id="nav">
-        <button data-view="markets" aria-current="true">Markets</button>
-        <button data-view="trade">Trade</button>
-        <button data-view="portfolio">Portfolio</button>
-        <button data-view="research">Research</button>
-        <button data-view="lab">Lab</button>
+        <button type="button" data-view="markets" aria-current="page">Markets</button>
+        <button type="button" data-view="trade">Trade</button>
+        <button type="button" data-view="portfolio">Portfolio</button>
+        <button type="button" data-view="research">Research</button>
+        <button type="button" data-view="lab">Lab</button>
       </div>
-      <div class="watch-head">Instruments</div>
-      <div class="watchlist" id="watchlist"></div>
+      <h2 class="watch-head" id="watch-head">Instruments</h2>
+      <div class="watchlist" id="watchlist" role="list" aria-labelledby="watch-head"></div>
     </nav>
 
-    <main id="main"></main>
+    <main id="main" tabindex="-1"></main>
   </div>
+
+  <div id="toaster" aria-live="polite" aria-atomic="true"></div>
 
   <script type="module" src="/static/js/main.js"></script>
 </body>

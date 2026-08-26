@@ -21,12 +21,40 @@ export const esc = (s) =>
  */
 const missing = (v) => v == null || v === '';
 
+/*
+ * Formatters are built once and reused.
+ *
+ * `toLocaleString` constructs an `Intl.NumberFormat` on every call, and this
+ * runs inside a render loop that fires twenty times a second across a book, a
+ * ladder, a tape and a watchlist — thousands of constructions a second to
+ * produce a few hundred numbers.
+ *
+ * They are pinned to en-US rather than the viewer's locale, which is a
+ * deliberate departure. A price ladder rendered with a decimal comma does not
+ * read differently, it reads *wrongly*: 4.660,25 alongside 4,660.25 is a
+ * correctness hazard on a screen people trade from. Locale is honoured for
+ * language, not for the radix of a price.
+ */
+const NUM = new Map();
+function formatter(dp) {
+  let f = NUM.get(dp);
+  if (!f) {
+    f = new Intl.NumberFormat('en-US', {
+      minimumFractionDigits: dp,
+      maximumFractionDigits: dp,
+    });
+    NUM.set(dp, f);
+  }
+  return f;
+}
+const INTEGER = new Intl.NumberFormat('en-US');
+
 /** Prices arrive as decimal strings so the server never rounds for us. */
 export function price(value, dp = 2) {
   if (missing(value)) return '—';
   const n = Number(value);
   if (!Number.isFinite(n)) return '—';
-  return n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+  return formatter(dp).format(n);
 }
 
 export function money(value) {
@@ -62,7 +90,7 @@ export function count(n) {
   const v = Number(n) || 0;
   if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
   if (v >= 1e4) return `${(v / 1e3).toFixed(0)}k`;
-  return v.toLocaleString('en-US');
+  return INTEGER.format(v);
 }
 
 /** Human-readable contract terms, from the spec the server publishes. */

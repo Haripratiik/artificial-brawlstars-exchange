@@ -31,19 +31,23 @@ export function markets(store) {
       const pct = first ? (change / first) * 100 : 0;
       const session = snapshot.sessions?.[symbol] ?? 'continuous';
 
-      return `<div class="card" data-symbol="${esc(symbol)}" data-session="${esc(session)}"
-                   style="animation-delay:${i * 28}ms">
-        <div class="row1">
+      // A real button rather than a div with a click handler: the card is an
+      // action, and a keyboard user has to be able to reach and fire it. The
+      // children are spans so the markup stays valid inside a button.
+      return `<button type="button" class="card" data-symbol="${esc(symbol)}"
+                   data-session="${esc(session)}" style="animation-delay:${i * 28}ms"
+                   aria-label="${esc(symbol)}, ${price(book.mark)}, ${signed(pct)} percent">
+        <span class="row1">
           <span class="sym">${esc(symbol)}</span>
           <span class="kind">${esc(book.class ?? '')}</span>
-        </div>
-        <div class="price mono ${cls(change)}">${price(book.mark)}</div>
-        <div class="sub">
+        </span>
+        <span class="price mono ${cls(change)}">${price(book.mark)}</span>
+        <span class="sub">
           <span class="${cls(change)}">${signed(change)} (${signed(pct)}%)</span>
           <span class="faint">${count(book.trades)} trades</span>
-        </div>
-        <div class="spark">${sparkline(series)}</div>
-      </div>`;
+        </span>
+        <span class="spark" aria-hidden="true">${sparkline(series)}</span>
+      </button>`;
     })
     .join('');
 
@@ -110,8 +114,10 @@ function instrumentBar(symbol, book, meta, session) {
       &middot; tick ${esc(book.tick ?? '')}</span>
     </div>
     <div class="spacer"></div>
-    <button class="minor" data-act="halt" data-symbol="${esc(symbol)}">Halt</button>
-    <button class="minor" data-act="uncross" data-symbol="${esc(symbol)}">Uncross</button>
+    <button type="button" class="minor" data-act="halt" data-symbol="${esc(symbol)}"
+            aria-label="Halt trading in ${esc(symbol)}">Halt</button>
+    <button type="button" class="minor" data-act="uncross" data-symbol="${esc(symbol)}"
+            aria-label="Run the reopening auction for ${esc(symbol)}">Uncross</button>
   </div>`;
 }
 
@@ -142,13 +148,15 @@ function ladder(book, depth) {
     .map(([p, side], i) => {
       const bidW = ((side.bid || 0) / peak) * 46;
       const askW = ((side.ask || 0) / peak) * 46;
-      return `<div class="lad-row ${i === nearest ? 'at-mark' : ''}" data-price="${p}">
-        <div class="bar bid" style="width:${bidW.toFixed(1)}%"></div>
-        <div class="bar ask" style="width:${askW.toFixed(1)}%"></div>
-        <div class="bidq">${side.bid ? count(side.bid) : ''}</div>
-        <div class="px">${price(p)}</div>
-        <div class="askq">${side.ask ? count(side.ask) : ''}</div>
-      </div>`;
+      return `<button type="button" class="lad-row ${i === nearest ? 'at-mark' : ''}"
+                   data-price="${p}"
+                   aria-label="Price ${price(p)}, ${side.bid || 0} bid, ${side.ask || 0} offered">
+        <span class="bar bid" style="width:${bidW.toFixed(1)}%" aria-hidden="true"></span>
+        <span class="bar ask" style="width:${askW.toFixed(1)}%" aria-hidden="true"></span>
+        <span class="bidq">${side.bid ? count(side.bid) : ''}</span>
+        <span class="px">${price(p)}</span>
+        <span class="askq">${side.ask ? count(side.ask) : ''}</span>
+      </button>`;
     })
     .join('')}</div>`;
 }
@@ -162,7 +170,8 @@ function ticket(symbol, book, session) {
     <div class="row2">
       <div class="field">
         <label for="t-qty">Quantity</label>
-        <input id="t-qty" type="number" min="1" step="1" value="10">
+        <input id="t-qty" type="number" min="1" step="1" value="10"
+               inputmode="numeric" autocomplete="off" spellcheck="false">
       </div>
       <div class="field">
         <label for="t-tif">Time in force</label>
@@ -176,14 +185,15 @@ function ticket(symbol, book, session) {
     </div>
     <div class="field">
       <label for="t-px">Limit price &mdash; blank for market</label>
-      <input id="t-px" type="text" inputmode="decimal" placeholder="market">
+      <input id="t-px" type="text" inputmode="decimal" placeholder="4660.25&hellip;"
+             autocomplete="off" spellcheck="false">
     </div>
-    <button class="send" id="t-send" ${halted ? 'disabled' : ''}>
+    <button type="button" class="send" id="t-send" ${halted ? 'disabled' : ''}>
       ${halted ? `${esc(session.replace('_', ' '))} &mdash; orders rest` : 'Send order'}
     </button>
     <div class="row2">
-      <button class="minor" data-act="cancel_all">Cancel all</button>
-      <button class="minor danger" data-act="flatten">Flatten</button>
+      <button type="button" class="minor" data-act="cancel_all">Cancel All</button>
+      <button type="button" class="minor danger" data-act="flatten">Flatten</button>
     </div>
     <div class="note">Your order joins the same queue as every algorithm here and
       travels the same latency link. Nothing about it is privileged.</div>`;
@@ -197,7 +207,8 @@ function orders(snapshot) {
       (o) => `<tr>
         <td>${esc(o.symbol)}</td>
         <td class="faint">#${o.order_id}</td>
-        <td><button class="minor" data-act="cancel" data-order="${o.order_id}">Cancel</button></td>
+        <td><button type="button" class="minor" data-act="cancel" data-order="${o.order_id}"
+                aria-label="Cancel order ${o.order_id} in ${esc(o.symbol)}">Cancel</button></td>
       </tr>`
     )
     .join('')}</tbody></table>`;
@@ -393,11 +404,13 @@ export function lab(store) {
             <div class="row2">
               <div class="field">
                 <label for="c-seed">Seed</label>
-                <input id="c-seed" type="number" value="${c.seed}">
+                <input id="c-seed" type="number" value="${c.seed}"
+                       inputmode="numeric" autocomplete="off" spellcheck="false">
               </div>
               <div class="field">
                 <label for="c-flow">Flow traders</label>
-                <input id="c-flow" type="number" min="0" max="24" value="${c.flow_traders}">
+                <input id="c-flow" type="number" min="0" max="24" value="${c.flow_traders}"
+                       inputmode="numeric" autocomplete="off" spellcheck="false">
               </div>
             </div>
             <div class="field">
@@ -407,13 +420,14 @@ export function lab(store) {
             <div class="field">
               <label for="c-band">Price band &mdash; blank for none</label>
               <input id="c-band" type="text" inputmode="decimal"
-                     value="${c.price_band ?? ''}" placeholder="none">
+                     value="${c.price_band ?? ''}" placeholder="0.10&hellip;"
+                     autocomplete="off" spellcheck="false">
             </div>
             <label class="check">
               <input id="c-arb" type="checkbox" ${c.arbitrageur ? 'checked' : ''}>
               Cross-instrument arbitrageur
             </label>
-            <button class="send" id="c-apply">Rebuild market</button>
+            <button type="button" class="send" id="c-apply">Rebuild Market</button>
             <div class="note">A configuration change starts a <em>new</em> session
               rather than editing the running one. A population edited mid-flight
               would produce a market no seed could reproduce, and reproducibility
@@ -445,8 +459,10 @@ export function lab(store) {
                   <td style="text-align:left">${esc(sym)}</td>
                   <td><span class="badge ${esc(state)}">${esc(state.replace('_', ' '))}</span></td>
                   <td>
-                    <button class="minor" data-act="halt" data-symbol="${esc(sym)}">Halt</button>
-                    <button class="minor" data-act="uncross" data-symbol="${esc(sym)}">Uncross</button>
+                    <button type="button" class="minor" data-act="halt" data-symbol="${esc(sym)}"
+                            aria-label="Halt trading in ${esc(sym)}">Halt</button>
+                    <button type="button" class="minor" data-act="uncross" data-symbol="${esc(sym)}"
+                            aria-label="Run the reopening auction for ${esc(sym)}">Uncross</button>
                   </td>
                 </tr>`
               )

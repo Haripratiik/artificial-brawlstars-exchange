@@ -279,3 +279,35 @@ def test_every_view_renders_against_a_real_snapshot(client, tmp_path):
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_controller_loads_and_throttles_its_rendering(client, tmp_path):
+    """main.js under a stub DOM, driving frames by hand.
+
+    Two things are being caught. The first is that the controller loads at all
+    -- it owns the socket, the render loop and every binding, and had no
+    coverage. The second is that a burst of snapshots does not turn into a
+    burst of subtree rebuilds: replacing the panel destroys focus, scroll and
+    text selection, so rebuilding on every message at 20Hz made the whole
+    screen impossible to use with a keyboard.
+    """
+    snapshot = runner.market.snapshot()
+    snapshot["generation"] = runner.generation
+    snapshot["sessions"] = {
+        s: runner.market.venue.session(s).value
+        for s in runner.market.venue.registry.symbols
+    }
+    snapshot["speed"] = runner.market.speed
+
+    fixture = tmp_path / "controller.json"
+    fixture.write_text(json.dumps({"snapshot": snapshot}), encoding="utf-8")
+
+    result = subprocess.run(
+        ["node", str(REPO / "tests" / "frontend" / "controller.mjs"), str(fixture)],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

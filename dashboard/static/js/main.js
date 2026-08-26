@@ -102,7 +102,7 @@ async function refreshSlow() {
     store.instruments = instruments.instruments;
     store.session = session;
     store.agents = agents.agents;
-    render();
+    render({ force: true });
   } catch (failure) {
     // A slow-data hiccup must not take the live view down with it.
     console.warn('slow refresh failed', failure);
@@ -121,7 +121,7 @@ async function refreshSymbol() {
     if (store.symbol !== symbol) return;
     store.depth = depth;
     store.diagnostics = diagnostics;
-    render();
+    render({ force: true });
   } catch (failure) {
     console.warn('symbol refresh failed', failure);
   }
@@ -129,28 +129,100 @@ async function refreshSymbol() {
 
 /* ── render ──────────────────────────────────────────────────────────── */
 
+/*
+ * Rendering is decoupled from the socket.
+ *
+ * Snapshots arrive twenty times a second. Rebuilding the main panel that often
+ * was wasteful — the display cannot show more than sixty frames and the socket
+ * bursts can stack several messages into one frame — but the real damage was
+ * not the CPU:
+ *
+ *   * **Focus was destroyed every 50ms.** Replacing the subtree removes the
+ *     focused element, so focus fell back to <body>. Tabbing into the ladder
+ *     and pressing Enter was impossible; the focus ring added for keyboard
+ *     users had nothing to sit on.
+ *   * **Scroll position reset**, so the tape and the agent roster snapped back
+ *     to the top while you were reading them.
+ *   * **Text selection was cleared**, so a price could not be copied.
+ *
+ * So: renders are coalesced into an animation frame (which also stops entirely
+ * when the tab is hidden), the cheap header updates every frame because that is
+ * where the fast-moving numbers are, and the expensive subtree is rebuilt on a
+ * slower cadence with focus and scroll carried across.
+ */
+
 let ticketSignature = null;
+let dirty = false;
+let frame = null;
+let lastHeavy = 0;
 
-function render() {
+// Eight redraws a second for the panels. Fast enough that a ladder still feels
+// live, slow enough that interacting with it is possible.
+const HEAVY_INTERVAL_MS = 120;
+
+function render({ force = false } = {}) {
+  dirty = true;
+  if (force) lastHeavy = 0;
+  if (frame === null) frame = requestAnimationFrame(paint);
+}
+
+function paint(now) {
+  frame = null;
   renderHeader();
+  if (now - lastHeavy < HEAVY_INTERVAL_MS) return;   // the next message re-arms
+  lastHeavy = now;
+  dirty = false;
   renderWatchlist();
+  renderMain();
+}
 
+/** Where focus was, in terms that survive the subtree being replaced. */
+function captureFocus() {
+  const active = document.activeElement;
+  if (!active || !main.contains(active)) return null;
+  if (active.id) return `#${CSS.escape(active.id)}`;
+  const { symbol, price, act, order } = active.dataset;
+  if (act) return `[data-act="${CSS.escape(act)}"]`;
+  if (price) return `[data-price="${CSS.escape(price)}"]`;
+  if (symbol) return `[data-symbol="${CSS.escape(symbol)}"]`;
+  return null;
+}
+
+function renderMain() {
   const view = VIEWS[store.view] ?? markets;
   const signature = `${store.view}:${store.symbol}`;
+  const sameShape = ticketSignature === signature;
 
-  // Re-rendering the trade view wholesale on every tick would blow away the
-  // ticket inputs mid-keystroke, so the ticket is patched around instead.
-  if (store.view === 'trade' && ticketSignature === signature) {
-    const fresh = document.createElement('div');
-    fresh.innerHTML = view(store);
+  const selector = captureFocus();
+  // Panels keep their own scroll. Keyed by position, which is stable as long as
+  // the view itself has not changed.
+  const scrolls = sameShape
+    ? [...main.querySelectorAll('.panel-body')].map((n) => n.scrollTop)
+    : [];
+
+  const fresh = document.createElement('div');
+  fresh.innerHTML = view(store);
+
+  // The ticket holds live input. Rewriting it under someone mid-keystroke is
+  // the fastest way to make a trading screen unusable, so the existing node is
+  // moved across rather than replaced.
+  if (store.view === 'trade' && sameShape) {
     const keep = main.querySelector('#ticket');
     const incoming = fresh.querySelector('#ticket');
     if (keep && incoming) incoming.replaceWith(keep);
-    main.replaceChildren(...fresh.childNodes);
-  } else {
-    main.innerHTML = view(store);
-    ticketSignature = signature;
   }
+
+  main.replaceChildren(...fresh.childNodes);
+  ticketSignature = signature;
+
+  if (sameShape) {
+    const panes = main.querySelectorAll('.panel-body');
+    scrolls.forEach((top, i) => {
+      if (panes[i] && top) panes[i].scrollTop = top;
+    });
+  }
+  if (selector) main.querySelector(selector)?.focus({ preventScroll: true });
+
   bind();
 }
 
@@ -169,8 +241,8 @@ function renderHeader() {
   const health = document.getElementById('health');
   health.classList.toggle('bad', !conserved);
   document.getElementById('health-text').textContent = conserved
-    ? 'conserved'
-    : `leak ${s.conservation}`;
+    ? 'Conserved'
+    : `Leak of ${s.conservation}`;
 }
 
 function renderWatchlist() {
@@ -185,14 +257,16 @@ function renderWatchlist() {
       const last = series.length ? series[series.length - 1] : null;
       const change = first != null && last != null ? last - first : 0;
       const pct = first ? (change / first) * 100 : 0;
-      return `<div class="watch" data-symbol="${symbol}"
-                   aria-current="${symbol === store.symbol}">
+      const current = symbol === store.symbol;
+      return `<button type="button" class="watch" data-symbol="${symbol}"
+                   ${current ? 'aria-current="true"' : ''}
+                   aria-label="${symbol}, ${price(book.mark)}, ${signed(pct)} percent">
         <span class="sym">${symbol}</span>
         <span class="px ${cls(change)}">${price(book.mark)}</span>
         <span class="cls">${book.class ?? ''}</span>
         <span class="chg ${cls(change)}">${signed(pct)}%</span>
-        <span class="spark">${sparklineFor(series)}</span>
-      </div>`;
+        <span class="spark" aria-hidden="true">${sparklineFor(series)}</span>
+      </button>`;
     })
     .join('');
 }
@@ -272,7 +346,14 @@ function submitOrder() {
 async function act(action, data) {
   if (action === 'cancel') return send({ action: 'cancel', order_id: Number(data.order) });
   if (action === 'cancel_all') return send({ action: 'cancel_all' });
-  if (action === 'flatten') return send({ action: 'flatten' });
+  if (action === 'flatten') {
+    // Destructive and irreversible: it sells every position at market, and
+    // there is no undo once the prints land.
+    const open = (store.snapshot?.account?.positions ?? []).length;
+    if (!open) return toast('Already flat.');
+    if (!confirm(`Close ${open} position${open === 1 ? '' : 's'} at market? This cannot be undone.`)) return;
+    return send({ action: 'flatten' });
+  }
 
   if (action === 'halt' || action === 'uncross') {
     try {
@@ -321,12 +402,37 @@ function select(symbol) {
     refreshSymbol();
   }
   syncNav();
-  render();
+  syncUrl();
+  render({ force: true });
 }
 
 function syncNav() {
-  document.querySelectorAll('#nav button').forEach((b) =>
-    b.setAttribute('aria-current', String(b.dataset.view === store.view)));
+  document.querySelectorAll('#nav button').forEach((b) => {
+    if (b.dataset.view === store.view) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  });
+}
+
+/*
+ * The URL carries which screen and which instrument you are looking at, so a
+ * view can be linked, bookmarked and reloaded into. `replaceState` rather than
+ * `pushState`: clicking between instruments is browsing a live screen, not
+ * navigating, and filling the back button with every glance would make the
+ * gesture useless.
+ */
+function syncUrl() {
+  const url = new URL(location.href);
+  url.searchParams.set('view', store.view);
+  if (store.symbol) url.searchParams.set('symbol', store.symbol);
+  history.replaceState(null, '', url);
+}
+
+function readUrl() {
+  const params = new URLSearchParams(location.search);
+  const view = params.get('view');
+  if (view && view in VIEWS) store.view = view;
+  const symbol = params.get('symbol');
+  if (symbol) store.symbol = symbol;
 }
 
 document.getElementById('nav').addEventListener('click', (event) => {
@@ -334,9 +440,10 @@ document.getElementById('nav').addEventListener('click', (event) => {
   if (!button) return;
   store.view = button.dataset.view;
   syncNav();
+  syncUrl();
   if (store.view === 'research') refreshSymbol();
   if (store.view === 'lab') refreshSlow();
-  render();
+  render({ force: true });
 });
 
 document.getElementById('watchlist').addEventListener('click', (event) => {
@@ -353,18 +460,24 @@ speed.addEventListener('input', () => {
 /* ── toast ───────────────────────────────────────────────────────────── */
 
 let toastTimer = null;
+const toaster = document.getElementById('toaster');
+
 function toast(message, bad = false) {
-  document.querySelector('.toast')?.remove();
-  const node = document.createElement('div');
+  // Rendered into the document's polite live region rather than appended to
+  // the body, so a screen reader hears the acknowledgement a sighted user sees.
+  toaster.replaceChildren();
+  const node = document.createElement('p');
   node.className = `toast${bad ? ' bad' : ''}`;
   node.textContent = message;
-  document.body.append(node);
+  toaster.append(node);
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => node.remove(), 2600);
+  toastTimer = setTimeout(() => toaster.replaceChildren(), 2600);
 }
 
 /* ── go ──────────────────────────────────────────────────────────────── */
 
+readUrl();
+syncNav();
 connect();
 refreshSlow();
 setInterval(refreshSlow, 8000);

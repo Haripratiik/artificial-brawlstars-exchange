@@ -10,8 +10,6 @@
  * to the game these contracts settle on, which is a coincidence worth keeping.
  */
 
-@import url('https://fonts.googleapis.com/css2?family=Chivo:ital,wght@0,300;0,400;0,700;0,900&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-
 :root {
   /* Surfaces, deepest to nearest. */
   --void: #08080a;
@@ -26,7 +24,11 @@
 
   --ink: #e9e7e4;
   --ink-dim: #9a9aa4;
-  --ink-faint: #5f5f6a;
+  /* Measured, not chosen by eye. At the old #5f5f6a this was 2.7:1 against the
+   * hover surface and under 3.2:1 everywhere -- and it carries table headers,
+   * field labels and captions, which are text people have to read. 4.53:1 on
+   * the lightest surface it lands on, hue preserved so the blue cast stays. */
+  --ink-faint: #848490;
 
   /* Chrome. */
   --amber: #f5a623;
@@ -40,7 +42,13 @@
   --down-sunk: rgba(255, 95, 86, 0.13);
 
   --halt: #ff9f1c;
-  --closed: #6b6b76;
+  --closed: #84848f;
+
+  /* Hairlines between panels are decoration and are exempt from contrast
+   * rules; the edge of a control is not, because it is what tells you where
+   * the control is. Splitting them lets the rules stay whisper-quiet while
+   * inputs and buttons clear 3:1. */
+  --control-edge: #5f5f71;
 
   --mono: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
   --display: 'Chivo', system-ui, sans-serif;
@@ -75,7 +83,44 @@ body::after {
 }
 
 button, input, select { font-family: inherit; font-size: inherit; color: inherit; }
-button { cursor: pointer; border: none; background: none; }
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  /* Removes the 300ms tap delay; on a ladder you click a lot. */
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Focus. There was none at all, which made the whole terminal unusable by
+ * keyboard -- you could tab through it but never see where you were. Amber
+ * rather than the browser default so it reads as part of the chrome, and
+ * :focus-visible so a mouse click does not leave a ring behind. */
+:where(a, button, input, select, [tabindex]):focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 1px;
+  border-radius: 1px;
+}
+/* Rows are dense and hairline-ruled, so an outline sits better inside them. */
+.card:focus-visible, .watch:focus-visible, .lad-row:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: -2px;
+}
+
+.skip {
+  position: absolute;
+  left: 8px;
+  top: -60px;
+  z-index: 1001;
+  background: var(--amber);
+  color: #16120a;
+  font-weight: 700;
+  padding: 9px 14px;
+  text-decoration: none;
+  transition: top var(--tick);
+}
+.skip:focus { top: 8px; }
+main:focus { outline: none; }
 
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .up { color: var(--up); }
@@ -110,8 +155,7 @@ header {
   align-items: baseline;
   gap: 8px;
 }
-.brand em {
-  font-style: normal;
+.brand > span:first-child {
   color: var(--amber);
   /* The mark: a filled block, like a cursor. */
   font-family: var(--mono);
@@ -210,6 +254,11 @@ nav {
 
 .watchlist { overflow-y: auto; flex: 1; }
 .watch {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: none;
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 2px 8px;
@@ -297,6 +346,11 @@ tbody tr:hover { background: var(--raised); }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 12px; }
 
 .card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  color: inherit;
   background: var(--panel);
   border: 1px solid var(--rule);
   padding: 12px;
@@ -333,11 +387,20 @@ tbody tr:hover { background: var(--raised); }
 
 .ladder { font-family: var(--mono); font-size: 11.5px; }
 .lad-row {
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  background: none;
   display: grid;
   grid-template-columns: 1fr 78px 1fr;
   align-items: center;
   position: relative;
-  height: 21px;
+  /* 24px, not the 21 it started at. Each row is a click target -- it fills the
+   * ticket at that price -- and WCAG 2.2 puts the floor at 24x24. Adjacent
+   * rows touch, so the "no overlapping target" exemption does not apply. It
+   * costs about three visible levels; a target you can actually hit is worth
+   * more than three rows of depth you cannot. */
+  height: 24px;
   border-bottom: 1px solid rgba(35, 35, 43, 0.4);
   cursor: pointer;
 }
@@ -377,13 +440,14 @@ tbody tr:hover { background: var(--raised); }
 .sides { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .sides button {
   padding: 8px;
+  min-height: 24px;
   font-family: var(--mono);
   font-size: 11px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  border: 1px solid var(--rule-bright);
+  border: 1px solid var(--control-edge);
   color: var(--ink-dim);
-  transition: all var(--tick);
+  transition: background var(--tick), border-color var(--tick), color var(--tick);
 }
 .sides button[aria-pressed='true'][data-side='buy'] {
   background: var(--up-sunk); border-color: var(--up); color: var(--up);
@@ -399,7 +463,7 @@ tbody tr:hover { background: var(--raised); }
 }
 .field input, .field select {
   background: var(--sunk);
-  border: 1px solid var(--rule-bright);
+  border: 1px solid var(--control-edge);
   padding: 7px 9px;
   font-family: var(--mono);
   font-size: 12px;
@@ -423,14 +487,16 @@ tbody tr:hover { background: var(--raised); }
 .send:disabled { background: var(--rule-bright); color: var(--ink-faint); cursor: not-allowed; }
 
 .minor {
-  padding: 6px;
-  border: 1px solid var(--rule-bright);
+  /* WCAG 2.2 puts the floor for a pointer target at 24x24 CSS pixels. */
+  min-height: 24px;
+  padding: 6px 8px;
+  border: 1px solid var(--control-edge);
   font-family: var(--mono);
   font-size: 9.5px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--ink-dim);
-  transition: all var(--tick);
+  transition: border-color var(--tick), color var(--tick);
 }
 .minor:hover { border-color: var(--amber); color: var(--amber); }
 .minor.danger:hover { border-color: var(--down); color: var(--down); }
@@ -500,16 +566,18 @@ tbody tr:hover { background: var(--raised); }
 
 .chart { width: 100%; height: 100%; display: block; }
 
-.toast {
+#toaster {
   position: fixed;
   bottom: 16px; right: 16px;
+  z-index: 1000;
+}
+.toast {
   background: var(--raised);
   border: 1px solid var(--rule-bright);
   border-left: 2px solid var(--amber);
   padding: 9px 13px;
   font-family: var(--mono);
   font-size: 11px;
-  z-index: 1000;
   animation: rise 0.2s ease-out;
 }
 .toast.bad { border-left-color: var(--down); color: var(--down); }
@@ -518,3 +586,30 @@ tbody tr:hover { background: var(--raised); }
 ::-webkit-scrollbar-track { background: var(--sunk); }
 ::-webkit-scrollbar-thumb { background: var(--rule-bright); }
 ::-webkit-scrollbar-thumb:hover { background: var(--ink-faint); }
+
+
+/* ── motion ─────────────────────────────────────────────────────────── */
+
+/* Everything animated here is decoration over data that is already legible,
+ * so under a reduced-motion preference it all simply stops. The tape still
+ * updates, the panels still appear -- they just do not move. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── numbers ────────────────────────────────────────────────────────── */
+
+/* Tabular figures everywhere a column of numbers has to line up. Monospace
+ * mostly gives this, but the fallback stacks do not all guarantee it, and a
+ * ladder whose digits drift by half a pixel is hard to read down. */
+table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nums; }
+
+/* ── header live regions ────────────────────────────────────────────── */
+
+.stats { display: flex; gap: 22px; }
+.health { margin: 0; }
