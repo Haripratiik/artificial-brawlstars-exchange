@@ -285,8 +285,10 @@ class Kernel:
         lifecycle, which is what makes stepping possible.
         """
         processed = 0
+        capped = False
         while self._queue:
             if max_events is not None and processed >= max_events:
+                capped = True
                 break
             timestamp, _sequence, event = self._queue[0]
             if until is not None and timestamp > int(until):
@@ -310,7 +312,16 @@ class Kernel:
             else:
                 agent.on_message(ctx, event.sender, event.payload)
 
-        if until is not None:
+        # The clock may only jump to ``until`` if everything scheduled before it
+        # has actually run. Stopping early on the event cap leaves events in the
+        # queue whose timestamps are *behind* ``until``, and moving the clock
+        # past them would strand them in the past -- the next call then raises
+        # "scheduled before current time" on perfectly valid events.
+        #
+        # This mattered exactly where the cap does: it exists so a burst cannot
+        # stall the loop serving the browser, so the corruption appeared only
+        # under load, which is the worst place for a clock to be wrong.
+        if until is not None and not capped:
             self._now = Timestamp(max(int(self._now), int(until)))
         return processed
 

@@ -37,3 +37,6 @@ cpp/build/
 # Editors
 .vscode/
 .idea/
+
+# Live-market UI scratch
+dashboard/static/**/*.map

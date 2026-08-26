@@ -1,0 +1,281 @@
+"""The exchange website: its API, and the views rendered against real data.
+
+Two halves. The Python half exercises the HTTP and WebSocket surface against a
+running market. The JavaScript half runs under node — the views are pure
+functions of a store, so they can be rendered and inspected without a browser,
+which catches the class of bug that looks fine until someone opens the page: a
+server-side rename surfacing as ``undefined``, a decimal string rendering as
+``NaN``, an object interpolated into text.
+
+That does not replace looking at the page. It does mean renaming a field on the
+server fails a test instead of silently blanking a panel.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from dashboard.server import app, runner
+from dashboard.state import FEE_SCHEDULES, MarketConfig
+
+REPO = Path(__file__).resolve().parents[1]
+SYMBOL = "SPIKE_WR_FUT"
+
+
+@pytest.fixture(scope="module")
+def client():
+    """A live server with a market that has actually traded.
+
+    Speed is raised so a few wall-clock seconds buy a few simulated minutes;
+    the market is stepped by the server's own pump, never by the test, because
+    two things advancing one event kernel corrupts it.
+    """
+    with TestClient(app) as test_client:
+        runner.set_speed(40.0)
+        time.sleep(8)
+        runner.set_speed(1.0)
+        yield test_client
+
+
+# --------------------------------------------------------------------------
+# Configuration comes from a browser, so it is never trusted
+# --------------------------------------------------------------------------
+
+
+def test_configuration_clamps_hostile_input():
+    """Every field is bounded. An unbounded agent count or speed would let a
+    page freeze the server that is serving it."""
+    config = MarketConfig.from_dict(
+        {
+            "seed": -1,
+            "speed": 10_000,
+            "flow_traders": 999_999,
+            "fees": "../../etc/passwd",
+            "price_band": 900,
+        }
+    )
+    assert 0 <= config.seed < 2**31
+    assert config.speed <= 50.0
+    assert config.flow_traders <= 24
+    assert config.fees in FEE_SCHEDULES
+    assert config.price_band <= 5.0
+
+
+def test_configuration_survives_an_empty_payload():
+    assert MarketConfig.from_dict({}).seed == 7
+
+
+def test_a_blank_price_band_means_no_breaker():
+    for blank in (None, "", "none"):
+        assert MarketConfig.from_dict({"price_band": blank}).price_band is None
+
+
+# --------------------------------------------------------------------------
+# Reference data
+# --------------------------------------------------------------------------
+
+
+def test_instruments_carry_their_contract_terms(client):
+    """A market where you cannot read the contract is a casino with extra steps."""
+    payload = client.get("/api/instruments").json()["instruments"]
+    assert len(payload) >= 5
+    for instrument in payload:
+        assert instrument["symbol"]
+        assert instrument["spec_digest"]
+        assert instrument["expiry"]
+        assert instrument["session"] in {"continuous", "pre_open", "auction", "closed"}
+
+
+def test_the_session_endpoint_describes_the_venue(client):
+    payload = client.get("/api/session").json()
+    assert set(payload["config"]) >= {"seed", "fees", "flow_traders", "arbitrageur"}
+    assert "maker-taker" in payload["fee_schedules"]
+    assert payload["sessions"][SYMBOL]
+
+
+def test_the_agent_roster_is_published(client):
+    """Who else is in the market is part of the market's information."""
+    agents = client.get("/api/agents").json()["agents"]
+    kinds = {a["kind"] for a in agents}
+    assert "MarketMaker" in kinds
+    assert any(a["fills"] > 0 for a in agents), "nobody traded"
+
+
+def test_the_book_endpoint_returns_a_two_sided_ladder(client):
+    book = client.get(f"/api/book/{SYMBOL}?levels=12").json()
+    assert book["bids"] and book["asks"]
+    best_bid = float(book["bids"][0][0])
+    best_ask = float(book["asks"][0][0])
+    assert best_bid < best_ask, "the published ladder is crossed"
+
+
+def test_the_book_endpoint_bounds_the_level_count(client):
+    """A browser asking for a million levels must not get them."""
+    book = client.get(f"/api/book/{SYMBOL}?levels=100000").json()
+    assert len(book["bids"]) <= 60
+
+
+def test_history_accumulates(client):
+    history = client.get(f"/api/history/{SYMBOL}").json()
+    assert len(history["t"]) > 5
+    assert len(history["t"]) == len(history["mid"])
+
+
+def test_diagnostics_use_the_research_estimators(client):
+    """The same code the papers would quote, not a second implementation."""
+    report = client.get(f"/api/diagnostics/{SYMBOL}").json()
+    if report.get("pending"):
+        pytest.skip("not enough observations yet in this run")
+    names = {v["name"] for v in report["verdicts"]}
+    assert any("Hill" in n for n in names)
+    assert any("variance ratio" in n for n in names)
+
+
+@pytest.mark.parametrize("path", ["/api/history/NOPE", "/api/diagnostics/NOPE", "/api/book/NOPE"])
+def test_unknown_symbols_are_refused(client, path):
+    assert client.get(path).status_code == 404
+
+
+# --------------------------------------------------------------------------
+# Control
+# --------------------------------------------------------------------------
+
+
+def test_halting_and_reopening_round_trips(client):
+    """A halt accumulates orders; the reopen is an auction, not a free-for-all."""
+    halted = client.post(f"/api/session/{SYMBOL}/halt").json()
+    assert halted["ok"] and halted["session"] == "auction"
+
+    reopened = client.post(f"/api/session/{SYMBOL}/uncross").json()
+    assert reopened["ok"] and reopened["session"] == "continuous"
+
+
+def test_uncrossing_a_continuous_symbol_is_refused(client):
+    """There is no call phase to clear, and saying so beats pretending."""
+    client.post(f"/api/session/{SYMBOL}/uncross")
+    again = client.post(f"/api/session/{SYMBOL}/uncross").json()
+    assert again["ok"] is False
+
+
+def test_halting_an_unknown_symbol_is_refused(client):
+    assert client.post("/api/session/NOPE/halt").json()["ok"] is False
+
+
+# --------------------------------------------------------------------------
+# The live socket
+# --------------------------------------------------------------------------
+
+
+def test_the_socket_carries_everything_a_screen_needs(client):
+    with client.websocket_connect("/ws") as socket:
+        payload = socket.receive_json()
+    assert set(payload) >= {
+        "clock", "events", "books", "tape", "account", "orders", "conservation",
+        "sessions", "generation", "speed",
+    }
+    book = payload["books"][SYMBOL]
+    assert set(book) >= {"bids", "asks", "mark", "class", "contract", "tick"}
+    assert book["contract"]["payoff"]
+
+
+def test_value_is_conserved_in_the_served_market(client):
+    """The invariant the header light reports. It must be exactly zero."""
+    with client.websocket_connect("/ws") as socket:
+        payload = socket.receive_json()
+    assert int(payload["conservation"]) == 0
+
+
+@pytest.mark.parametrize("tif", ["gtc", "ioc", "fok", "post_only"])
+def test_every_time_in_force_reaches_the_venue(client, tif):
+    """The browser can reach post-only and fill-or-kill, not just the defaults."""
+    with client.websocket_connect("/ws") as socket:
+        socket.receive_json()
+        socket.send_json(
+            {"action": "submit", "symbol": SYMBOL, "side": "buy",
+             "quantity": 1, "price": "4600", "tif": tif}
+        )
+        for _ in range(40):
+            message = socket.receive_json()
+            if "ack" in message:
+                assert message["ack"]["ok"] is True
+                return
+    pytest.fail("no acknowledgement returned")
+
+
+def test_an_unknown_time_in_force_is_rejected(client):
+    with client.websocket_connect("/ws") as socket:
+        socket.receive_json()
+        socket.send_json(
+            {"action": "submit", "symbol": SYMBOL, "side": "buy",
+             "quantity": 1, "price": "4600", "tif": "whenever"}
+        )
+        for _ in range(40):
+            message = socket.receive_json()
+            if "ack" in message:
+                assert message["ack"]["ok"] is False
+                return
+    pytest.fail("no acknowledgement returned")
+
+
+def test_a_nonsense_action_is_reported_not_ignored(client):
+    with client.websocket_connect("/ws") as socket:
+        socket.receive_json()
+        socket.send_json({"action": "self_destruct"})
+        for _ in range(40):
+            message = socket.receive_json()
+            if "ack" in message:
+                assert message["ack"]["ok"] is False
+                return
+    pytest.fail("no acknowledgement returned")
+
+
+# --------------------------------------------------------------------------
+# The views, rendered under node
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_every_view_renders_against_a_real_snapshot(client, tmp_path):
+    """Renders all five screens and fails on `undefined`, `NaN`, unbalanced tags.
+
+    Uses a genuine snapshot rather than a hand-written one, so a field the
+    server stops sending shows up here rather than as a blank panel later.
+    """
+    snapshot = runner.market.snapshot()
+    snapshot["generation"] = runner.generation
+    snapshot["sessions"] = {
+        s: runner.market.venue.session(s).value
+        for s in runner.market.venue.registry.symbols
+    }
+    snapshot["speed"] = runner.market.speed
+
+    fixture = tmp_path / "fixture.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "snapshot": snapshot,
+                "instruments": client.get("/api/instruments").json()["instruments"],
+                "session": client.get("/api/session").json(),
+                "agents": client.get("/api/agents").json()["agents"],
+                "depth": client.get(f"/api/book/{SYMBOL}?levels=18").json(),
+                "diagnostics": client.get(f"/api/diagnostics/{SYMBOL}").json(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["node", str(REPO / "tests" / "frontend" / "render.mjs"), str(fixture)],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

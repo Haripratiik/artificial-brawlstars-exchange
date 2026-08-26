@@ -30,6 +30,7 @@ from arena.contracts.underlying import Basket, Difference, Single
 from arena.exchange.types import AgentId
 from arena.market.instrument import Instrument
 from arena.market.live import HUMAN_ID, VENUE_ID, HumanAgent, LiveMarket
+from arena.market.fees import FREE, FeeSchedule
 from arena.market.venue import Venue
 from arena.market.venue_agent import VenueAgent
 from arena.settlement.engine import settle
@@ -157,6 +158,8 @@ def build(
     arbitrageur: bool = False,
     recycle_capital: bool = True,
     flow_traders: int = 0,
+    fees: FeeSchedule = FREE,
+    price_band: float | None = None,
 ) -> LiveMarket:
     listed = instruments()
     by_symbol = {i.symbol: i for i in listed}
@@ -167,7 +170,12 @@ def build(
     # collateralisation means that capital is genuinely committed rather than
     # notional. Too little and every agent spends the session rejected, which
     # looks like a broken market rather than a poor one.
-    venue = Venue("arena", starting_cash=40_000_000)
+    venue = Venue(
+        "arena",
+        starting_cash=40_000_000,
+        fees=fees,
+        price_band=price_band,
+    )
     for instrument in listed:
         venue.list_instrument(instrument)
 

@@ -77,8 +77,22 @@ class HumanAgent(TradingAgent):
         for envelope in pending:
             ctx.send(self.venue_id, envelope)
 
-    def on_private(self, ctx: SimulationContext, event: Any) -> None:
-        self.log.append({"t": int(ctx.now), **event.to_dict()})
+    def _on_private(self, ctx: SimulationContext, event: Any, symbol: str) -> None:
+        """Record the event for the blotter, then let the base book it.
+
+        Overridden at the underscore level rather than at ``on_private`` because
+        only this one carries the symbol. Without it a blotter can say a fill
+        happened but not in what -- and the price would be a raw tick count,
+        which for a contract on a 0.25 grid is four times the number a person
+        expects to read.
+        """
+        super()._on_private(ctx, event, symbol)
+        entry: dict[str, Any] = {"t": int(ctx.now), "symbol": symbol, **event.to_dict()}
+        instrument = self.instruments.get(symbol)
+        ticks = entry.get("price")
+        if ticks is not None and instrument is not None:
+            entry["price"] = str(instrument.from_ticks(int(ticks)))
+        self.log.append(entry)
         if len(self.log) > 200:
             del self.log[:-200]
 
@@ -93,20 +107,36 @@ class LiveMarket:
     human: HumanAgent
     agents: list[TradingAgent] = field(default_factory=list)
     speed: float = 1.0
-    _wall_start: float = 0.0
+    _wall_last: float = 0.0
+    _sim_seconds: float = 0.0
     _running: bool = False
 
     def start(self) -> None:
         self.kernel.start()
-        self._wall_start = time.monotonic()
+        self._wall_last = time.monotonic()
+        self._sim_seconds = 0.0
         self._running = True
 
     def step(self) -> int:
-        """Advance simulated time to match the wall clock. Returns events run."""
+        """Advance simulated time to match the wall clock. Returns events run.
+
+        Simulated time is *accumulated* from each slice rather than recomputed
+        from the session start, so that changing speed applies from the moment
+        it changes. Recomputing rescaled the whole history instead: raising the
+        speed made the clock leap forward past events already scheduled, and
+        lowering it would have moved the clock **backwards**, which the kernel
+        rightly refuses to do.
+        """
         if not self._running:
             return 0
-        elapsed = (time.monotonic() - self._wall_start) * self.speed
-        target = Timestamp(int(elapsed * 1_000_000_000))
+        now = time.monotonic()
+        # Clamped so a stalled event loop, a suspended laptop, or a debugger
+        # breakpoint does not hand the kernel an hour of catch-up to run in one
+        # slice and freeze the browser it is meant to be serving.
+        delta = min(1.0, max(0.0, now - self._wall_last))
+        self._wall_last = now
+        self._sim_seconds += delta * self.speed
+        target = Timestamp(int(self._sim_seconds * 1_000_000_000))
         # A cap per slice, so a burst of activity cannot stall the event loop
         # that is serving the browser. Anything left simply runs next slice.
         return self.kernel.advance(until=target, max_events=20_000)
@@ -114,7 +144,12 @@ class LiveMarket:
     # -- human actions -----------------------------------------------------
 
     def submit(
-        self, symbol: str, side: str, quantity: int, price: Decimal | None
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        price: Decimal | None,
+        tif: str = "",
     ) -> dict[str, Any]:
         instrument = self.venue.registry.get(symbol)
         if instrument is None:
@@ -127,13 +162,24 @@ class LiveMarket:
         except ValueError as bad_price:
             return {"ok": False, "error": str(bad_price)}
 
+        # A market order can only ever be immediate; a limit order defaults to
+        # resting. Anything else the caller asks for is honoured, so the browser
+        # can reach post-only and fill-or-kill rather than only the two defaults.
+        if ticks is None:
+            duration = TimeInForce.IOC
+        else:
+            try:
+                duration = TimeInForce(tif.lower()) if tif else TimeInForce.GTC
+            except ValueError:
+                return {"ok": False, "error": f"unknown time in force {tif!r}"}
+
         command = Submit(
             HUMAN_ID,
             Side.BUY if side.lower() == "buy" else Side.SELL,
             Quantity(quantity),
             ticks,
             OrderType.LIMIT if ticks is not None else OrderType.MARKET,
-            TimeInForce.GTC if ticks is not None else TimeInForce.IOC,
+            duration,
         )
         self.human.enqueue(SymbolCommand(symbol, command))
         return {"ok": True}

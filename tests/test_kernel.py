@@ -515,3 +515,66 @@ def test_max_events_stops_a_runaway_loop():
     kernel.add(Spinner())
     kernel.run(max_events=500)
     assert kernel.processed == 500
+
+
+def test_the_event_cap_does_not_strand_events_in_the_past():
+    """Stopping early must not move the clock past what has not run yet.
+
+    ``advance`` used to jump the clock to ``until`` unconditionally, including
+    when it had bailed out on ``max_events``. Every event still queued behind
+    ``until`` was then in the past, and the very next call raised "scheduled
+    before current time" on events that were perfectly valid.
+
+    The cap exists so a burst of activity cannot stall the loop serving the
+    browser -- so the corruption appeared only under load, which is the worst
+    place for a simulation clock to be wrong.
+    """
+    from dataclasses import dataclass, field
+
+    @dataclass
+    class Ticker:
+        agent_id: AgentId = AgentId("ticker")
+        seen: list[int] = field(default_factory=list)
+
+        def on_start(self, ctx):
+            ctx.request_wakeup(millis(1))
+
+        def on_wakeup(self, ctx):
+            self.seen.append(int(ctx.now))
+            ctx.request_wakeup(millis(1))
+
+        def on_finish(self, ctx):
+            pass
+
+        def on_message(self, ctx, sender, message):
+            pass
+
+    kernel = Kernel(seed=1)
+    ticker = Ticker()
+    kernel.add(ticker)
+    kernel.start()
+
+    # Ask for ten seconds of a one-millisecond ticker -- 10,000 events -- but
+    # allow only 50 per slice, so the cap fires on every call.
+    target = seconds(10)
+    for _ in range(20):
+        kernel.advance(until=target, max_events=50)
+
+    assert ticker.seen, "nothing ran"
+    assert int(kernel.now) <= int(target)
+    # The clock must sit on the last event actually processed, not out at the
+    # requested horizon with a thousand events stranded behind it.
+    assert int(kernel.now) == ticker.seen[-1]
+    assert ticker.seen == sorted(ticker.seen)
+
+
+def test_an_uncapped_advance_still_reaches_its_horizon():
+    """The fix must not stop a quiet market's clock from moving.
+
+    With nothing left to run, time still has to pass -- otherwise a market with
+    no activity would freeze rather than idle.
+    """
+    kernel = Kernel(seed=1)
+    kernel.start()
+    kernel.advance(until=seconds(5))
+    assert int(kernel.now) == int(seconds(5))

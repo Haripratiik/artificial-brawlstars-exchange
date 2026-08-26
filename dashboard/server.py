@@ -1,16 +1,29 @@
-"""Serve the live market to a browser.
+"""Arena Markets: the exchange, served to a browser.
 
     python -m dashboard.server
     # then open http://127.0.0.1:8000
 
-A thin shell: it steps the kernel on a timer, pushes snapshots down a WebSocket,
-and forwards the human's orders back in. All the behaviour lives in
-``arena.market.live`` and the layers below it, so the browser is a viewer of the
-simulator rather than a second implementation of it.
+The browser is a *viewer of the simulator*, never a second implementation of it.
+Every order a person clicks is enqueued onto the same human agent an algorithm
+would be, travels the same latency link, and is checked by the same collateral
+code. A UI that applied orders directly would be showing you a market you are
+not actually in.
 
-Single-process and single-market by design. This is an instrument for watching
-and poking at a market, not a service -- a second viewer sees the same market,
-which is the useful behaviour when you want to open the book on one screen and
+Layout of the surface:
+
+    GET  /api/instruments      what is listed, and the terms of each contract
+    GET  /api/session          phases, halts, fees, the running configuration
+    GET  /api/agents           who else is in the market
+    GET  /api/history/{sym}    price path, for charting
+    GET  /api/diagnostics/{s}  stylized-fact report on the live series
+    GET  /api/book/{sym}       a deeper ladder than the socket carries
+    POST /api/config           rebuild the market with a new configuration
+    POST /api/session/{sym}/halt      suspend trading
+    POST /api/session/{sym}/uncross   clear the call and resume
+    WS   /ws                   live snapshot at the tick rate, and order entry
+
+Single-process and single-market by design. A second viewer sees the *same*
+market, which is the useful behaviour when you want the book on one screen and
 the blotter on another.
 """
 
@@ -24,31 +37,30 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from dashboard.build_market import build
+from dashboard.state import FEE_SCHEDULES, MarketConfig, MarketRunner
 
 HERE = Path(__file__).resolve().parent
 STATIC = HERE / "static"
 
-# How often the kernel is advanced, and how often a snapshot goes out. 20 Hz is
-# well past what an eye resolves and cheap enough that the simulation is never
-# waiting on the socket.
+# How often the kernel is advanced and a snapshot goes out. 20 Hz is past what
+# an eye resolves and cheap enough that the simulation never waits on a socket.
 TICK_SECONDS = 0.05
 
 app = FastAPI(title="Arena Markets")
-market = build()
+runner = MarketRunner()
 _pump: asyncio.Task | None = None
 
 
 async def _run_market() -> None:
     """Advance the kernel in step with the wall clock, forever."""
-    market.start()
+    runner.start()
     while True:
         try:
-            market.step()
-        except Exception as failure:  # keep the socket alive to report it
+            runner.step()
+        except Exception as failure:  # keep serving, and report it
             print(f"market step failed: {failure!r}")
         await asyncio.sleep(TICK_SECONDS)
 
@@ -67,19 +79,103 @@ async def _shutdown() -> None:
             await _pump
 
 
+# --------------------------------------------------------------------------
+# Pages
+# --------------------------------------------------------------------------
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC / "index.html")
 
 
+# --------------------------------------------------------------------------
+# Reference data
+# --------------------------------------------------------------------------
+
+
 @app.get("/api/instruments")
 async def api_instruments() -> dict[str, Any]:
-    return {
-        "instruments": [
-            market.venue.registry.require(s).to_dict()
-            for s in market.venue.registry.symbols
-        ]
+    return {"instruments": runner.instruments()}
+
+
+@app.get("/api/session")
+async def api_session() -> dict[str, Any]:
+    payload = runner.session_state()
+    payload["fee_schedules"] = {
+        name: schedule.to_dict() for name, schedule in FEE_SCHEDULES.items()
     }
+    return payload
+
+
+@app.get("/api/agents")
+async def api_agents() -> dict[str, Any]:
+    return {"agents": runner.agents()}
+
+
+@app.get("/api/history/{symbol}")
+async def api_history(symbol: str) -> JSONResponse:
+    series = runner.history.get(symbol)
+    if series is None:
+        return JSONResponse({"error": f"unknown symbol {symbol}"}, status_code=404)
+    return JSONResponse({"symbol": symbol, **series.to_dict()})
+
+
+@app.get("/api/diagnostics/{symbol}")
+async def api_diagnostics(symbol: str) -> JSONResponse:
+    report = runner.diagnostics(symbol)
+    if "error" in report:
+        return JSONResponse(report, status_code=404)
+    return JSONResponse(report)
+
+
+@app.get("/api/book/{symbol}")
+async def api_book(symbol: str, levels: int = 20) -> JSONResponse:
+    """A deeper ladder than the live socket carries.
+
+    The socket sends eight levels because that is what fits a panel and it goes
+    out twenty times a second. A ladder view wants more, and asks for it once.
+    """
+    venue = runner.market.venue
+    instrument = venue.registry.get(symbol)
+    if instrument is None:
+        return JSONResponse({"error": f"unknown symbol {symbol}"}, status_code=404)
+    snapshot = venue.engine(symbol).book.snapshot(max(1, min(60, levels)))
+    return JSONResponse(
+        {
+            "symbol": symbol,
+            "bids": [[str(instrument.from_ticks(p)), int(q)] for p, q in snapshot.bids],
+            "asks": [[str(instrument.from_ticks(p)), int(q)] for p, q in snapshot.asks],
+            "indicative": runner.indicative(symbol),
+            "session": venue.session(symbol).value,
+        }
+    )
+
+
+# --------------------------------------------------------------------------
+# Control
+# --------------------------------------------------------------------------
+
+
+@app.post("/api/config")
+async def api_config(payload: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild the market. Starts a fresh session, and says so."""
+    return runner.reconfigure(MarketConfig.from_dict(payload or {}))
+
+
+@app.post("/api/session/{symbol}/halt")
+async def api_halt(symbol: str) -> dict[str, Any]:
+    return runner.halt(symbol)
+
+
+@app.post("/api/session/{symbol}/uncross")
+async def api_uncross(symbol: str) -> dict[str, Any]:
+    return runner.uncross(symbol)
+
+
+# --------------------------------------------------------------------------
+# Live
+# --------------------------------------------------------------------------
 
 
 @app.websocket("/ws")
@@ -88,7 +184,14 @@ async def stream(socket: WebSocket) -> None:
     receiver = asyncio.create_task(_receive(socket))
     try:
         while True:
-            await socket.send_json(market.snapshot())
+            payload = runner.market.snapshot()
+            payload["generation"] = runner.generation
+            payload["sessions"] = {
+                symbol: runner.market.venue.session(symbol).value
+                for symbol in runner.market.venue.registry.symbols
+            }
+            payload["speed"] = runner.market.speed
+            await socket.send_json(payload)
             await asyncio.sleep(TICK_SECONDS)
     except (WebSocketDisconnect, RuntimeError):
         pass
@@ -103,8 +206,7 @@ async def _receive(socket: WebSocket) -> None:
 
     Orders are queued onto the human agent rather than applied directly, so a
     person's click enters the same event queue as an algorithm's decision and is
-    subject to the same latency. A UI that bypassed the kernel would be showing
-    you a market you are not actually in.
+    subject to the same latency.
     """
     while True:
         try:
@@ -116,21 +218,21 @@ async def _receive(socket: WebSocket) -> None:
         try:
             if action == "submit":
                 price = message.get("price")
-                result = market.submit(
+                result = runner.market.submit(
                     symbol=message["symbol"],
                     side=message["side"],
                     quantity=int(message["quantity"]),
                     price=None if price in (None, "", "market") else Decimal(str(price)),
+                    tif=str(message.get("tif", "")),
                 )
             elif action == "cancel":
-                result = market.cancel(int(message["order_id"]))
+                result = runner.market.cancel(int(message["order_id"]))
             elif action == "flatten":
-                result = market.flatten()
+                result = runner.market.flatten()
             elif action == "cancel_all":
-                result = market.cancel_all()
+                result = runner.market.cancel_all()
             elif action == "speed":
-                market.speed = max(0.0, min(20.0, float(message["value"])))
-                result = {"ok": True, "speed": market.speed}
+                result = runner.set_speed(float(message["value"]))
             else:
                 result = {"ok": False, "error": f"unknown action {action!r}"}
         except (KeyError, ValueError, TypeError, InvalidOperation) as bad:

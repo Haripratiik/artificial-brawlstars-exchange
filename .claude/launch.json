@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "arena",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "dashboard.server"],
+      "port": 8000
+    }
+  ]
+}
