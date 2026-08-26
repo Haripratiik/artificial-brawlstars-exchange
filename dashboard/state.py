@@ -57,8 +57,12 @@ class MarketConfig:
     speed: float = 1.0
     arbitrageur: bool = False
     flow_traders: int = 0
-    fees: str = "free"
-    price_band: float | None = None
+    fees: str = "maker-taker"
+    price_band: float | None = 0.05
+    makers: int = 3
+    opening_auction: bool = True
+    surface: bool = True
+    mechanism: str = "book"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +72,10 @@ class MarketConfig:
             "flow_traders": self.flow_traders,
             "fees": self.fees,
             "price_band": self.price_band,
+            "makers": self.makers,
+            "opening_auction": self.opening_auction,
+            "surface": self.surface,
+            "mechanism": self.mechanism,
         }
 
     @classmethod
@@ -78,8 +86,8 @@ class MarketConfig:
         unbounded agent count or speed would let a page freeze the server that
         is serving it.
         """
-        band = payload.get("price_band")
-        fees = str(payload.get("fees", "free"))
+        band = payload.get("price_band", 0.05)
+        fees = str(payload.get("fees", "maker-taker"))
         return cls(
             seed=int(payload.get("seed", 7)) % (2**31),
             speed=max(0.0, min(50.0, float(payload.get("speed", 1.0)))),
@@ -88,6 +96,14 @@ class MarketConfig:
             fees=fees if fees in FEE_SCHEDULES else "free",
             price_band=(
                 None if band in (None, "", "none") else max(0.001, min(5.0, float(band)))
+            ),
+            makers=max(1, min(8, int(payload.get("makers", 3)))),
+            opening_auction=bool(payload.get("opening_auction", True)),
+            surface=bool(payload.get("surface", True)),
+            mechanism=(
+                "scoring-rule"
+                if str(payload.get("mechanism", "book")) == "scoring-rule"
+                else "book"
             ),
         )
 
@@ -160,6 +176,10 @@ class MarketRunner:
             flow_traders=config.flow_traders,
             fees=FEE_SCHEDULES[config.fees],
             price_band=config.price_band,
+            makers=config.makers,
+            opening_auction=config.opening_auction,
+            surface=config.surface,
+            mechanism=config.mechanism,
         )
         return market
 

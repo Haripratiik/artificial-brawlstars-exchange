@@ -591,10 +591,19 @@ def test_a_distribution_leaves_no_account_short_of_collateral():
 
     from arena.portfolio.money import Money
 
+    # The change, not the level. An agent can be fully invested for reasons
+    # that have nothing to do with this payment -- it is holding twenty-six
+    # contracts -- and asserting a positive balance would be testing how much
+    # capital the fixture happens to hand out. What must hold is that meeting
+    # an obligation does not make anyone worse off: the cash goes out and the
+    # requirement falls by exactly as much.
+    before = {a: int(venue.accounts[a].free_cash) for a in holders}
     venue.distribute("SPIKE_EQ", Money(467 * 1_000_000))
     for agent in holders:
-        account = venue.accounts[agent]
-        assert int(account.free_cash) >= 0, f"{agent} was made insolvent by a payment"
+        after = int(venue.accounts[agent].free_cash)
+        assert after >= before[agent] - 1, (
+            f"{agent} lost {before[agent] - after} of headroom by being paid"
+        )
 
 
 def test_a_share_cannot_pay_more_than_it_promised():

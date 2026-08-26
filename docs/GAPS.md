@@ -211,19 +211,22 @@ each item. Struck items link to what actually happened.
 
 1. ~~The option surface is internally inconsistent.~~ **Fixed**, and the
    cause was not the one named here. See below.
-2. **Fees, auctions, halts and the scoring-rule venue are built and never run.**
-   All tested, all defaulted off, so the live exchange exercises none of them.
+2. ~~Fees, auctions, halts and the scoring-rule venue are built and never
+   run.~~ **All running now**, and switching them on found four bugs in tested
+   code and cost the market half its accuracy. See below.
 3. **No auth.** Every browser shares one account, so two tabs are one trader.
-4. **Liquidity does not replenish, and one maker is the whole other side.**
-   Measured by sweeping 60% of the standing offers on `SPIKE_WR_FUT`: the
-   maker absorbs **89%** of the order, ends short about 1,150 lots, and is then
-   past the point where its collateral lets it quote at all. The offer it was
-   run over at never returns -- the spread goes from 0.50 to 1,021.00 and is
-   **exactly** 1,021.00 three minutes later, with the maker having worked none
-   of the position off. Not a slow repair: no repair. A real book mends in
-   milliseconds because the maker that got run over is one of several; here it
-   is the only one. `test_a_large_order_moves_the_price` asserts this as it is,
-   so the assertion fails on the day replenishment works.
+4. ~~Liquidity does not replenish, and one maker is the whole other side.~~
+   **Fixed by having three of them**, differing in spread, quote size and
+   inventory limit -- identical makers would be one maker with three times the
+   balance sheet. After the same 60% sweep the spread now comes back from 1.25
+   to 2.50 rather than to 24.50, and `test_a_large_order_moves_the_price`
+   asserts the recovery it used to assert the absence of. What it replaced is
+   worth keeping, because the contrast is the finding: against a *single*
+   maker the same sweep was absorbed **89%** by it, left it short about 1,150
+   lots and past the point its collateral allowed a quote, and the spread went
+   from 0.50 to 1,021.00 and was **exactly** 1,021.00 three minutes later. Not
+   a slow repair: no repair. A real book mends in milliseconds because the
+   maker that got run over is one of several; there it was the only one.
 5. **Cancel rate is ~60%, not >90%.** Nothing requotes faster than 300ms.
 6. ~~A share and its future have no relation the arbitrageur knows.~~
    **Fixed by listing the legs.** The 0.4x relation to the four-week future was
@@ -235,6 +238,106 @@ each item. Struck items link to what actually happened.
    windows under the same evidential bar. Settlement confirms it to the tick:
    1,874 + 1,859 + 1,875 + 1,869 = 7,477. `CROW_EQ` deliberately has no legs,
    so one share is arbitrage-linked and one is not.
+
+## Running the machinery, and what that found
+
+Fees, an opening call auction, a circuit breaker and a scoring-rule venue were
+all written, all tested in isolation, and all defaulted off. Turning them on
+found four bugs inside an hour, every one of them in code that had tests.
+
+**A market-on-open order that did not fill stayed in the book.** It rests at a
+sentinel price so that it crosses every candidate the auction considers, which
+is the whole point of it -- and makes it the best offer in a continuous book by
+a margin of 2^61. The first order afterwards matched it *at that price*: trades
+printed at -4,611,686,018,427,387,904, the mark went to zero, and the venue
+billed 4.8e22 in fees. A market order is an instruction about the auction it
+was entered for; once that has cleared there is no price it was ever willing to
+pay.
+
+**Cancelling it back out did not work either.** `Book.remove` reduces a level's
+total and leaves the order in the queue as a tombstone; what makes the matcher
+skip it is its *status* being terminal. The first fix removed without marking,
+so the order vanished from the depth and from every diagnostic that reads
+resting orders while remaining perfectly tradeable. Invisible and matchable is
+the worst of both, and it is why the sentinel prints survived two attempts at
+fixing them.
+
+**`best_bid` and `best_ask` reported sentinel levels as prices.** An order that
+names no price cannot be the best price. The levels still carry them, because
+the auction has to count that interest to know what would trade.
+
+**A venue that pays a maker rebate on both sides of its own auction loses money
+on every cross.** An auction has no aggressor, so billing every fill at the
+maker rate looked right and was: twenty-six opening auctions took venue revenue
+to **minus 1,251**. Exchanges charge for cross executions rather than paying for
+them, so an auction fill now pays the taker rate on both sides.
+
+### Three things that had to change shape
+
+**The breaker needed a second clock.** The calendar decides whether a contract
+has expired; elapsed simulated time decides how long a symbol has been outside
+its band. Sharing one meant the limit-state timer never advanced -- 241
+excursions in three minutes and not one pause.
+
+**The band is a fraction of what a contract can be *worth*, not of what it
+costs.** A percentage of price is what equity venues use and it is meaningless
+for a bounded claim: a binary trading at fifty cents gets two and a half cents
+of room, which any ordinary change of opinion breaks. Under a price-percentage
+band the breaker paused every event contract on the exchange repeatedly while
+never once touching the future, whose 5% is sixteen standard deviations. Every
+contract here has a settlement range, which is the same reasoning that already
+governs the maker's inventory skew.
+
+**Its time constants are ratios, not durations.** Limit up-limit down uses a
+fifteen-second limit state, a five-minute pause and a five-minute trailing
+reference against a six-and-a-half-hour session. Used literally here, where a
+session lasts minutes and does a day of price discovery in the first one, the
+reference is stale for the entire session and the breaker spends its time
+policing the walk to fair value: twelve of twenty-six symbols halted at once.
+Scaled by the same fraction of the session, the reference keeps up.
+
+### The opening auction, and who brings interest to it
+
+Withdrawing the makers from the call was tried, on sound reasoning -- a maker
+that turns up with a mid-range guess makes the guess the official opening
+price, and the market's walk away from it then trips the breaker. It was worse.
+With two informed agents and a crowd of random market orders, an auction with
+no maker in it cleared `SPIKE_WR_FUT` at **9,377** against a fair value of
+4,669. A mediocre anchored open beats a wild unanchored one.
+
+What was genuinely missing is that every agent here reacts to a price, so with
+nobody posting first the auction collected nothing. The informed agents now
+bring two-sided interest at their own valuation, widened by their own
+uncertainty, which is what an opening auction is for.
+
+### What it cost: +4.00 percentage points of pricing error
+
+Six paired seeds, common random numbers, ten minutes of market each. The metric
+is mean |mark - settlement| across all 26 contracts, as a share of each
+contract's range.
+
+| seed | bare | operating | difference |
+|---|---|---|---|
+| 7 | 4.88% | 9.56% | +4.68% |
+| 11 | 6.52% | 8.76% | +2.25% |
+| 19 | 6.06% | 8.63% | +2.57% |
+| 23 | 5.98% | 7.52% | +1.54% |
+| 41 | 4.59% | 11.70% | +7.11% |
+| 97 | 6.64% | 12.48% | +5.85% |
+
+**Mean +4.00%, standard error 0.91%, 95% interval [+2.22%, +5.78%].** Same
+direction on all six. Running an exchange the way exchanges are run roughly
+doubles the pricing error here: a halt stops price discovery by design, a fee
+widens the band inside which a mispricing is not worth correcting, and an
+auction that opens away from fair value gives the market somewhere worse to
+start from. None of that is an argument for switching them off -- it is what
+these mechanisms cost, and the point of building them was to be able to say so
+with a number.
+
+Single-mechanism ablations do not isolate a cause, which is worth stating
+rather than hiding: removing the breaker, the auction or two of the three
+makers each moved the error by less than the run-to-run spread, and removing
+the auction made it *worse*. The cost is of the combination.
 
 ## The option surface, and the bug underneath it
 

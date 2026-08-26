@@ -205,8 +205,11 @@ class LmsrVenue(Venue):
         starting_cash: Decimal | int = 1_000_000,
         subsidy: Decimal | int | float = 2_000,
         clock: Callable[[], Any] | None = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(name=name, starting_cash=starting_cash, clock=clock)
+        super().__init__(
+            name=name, starting_cash=starting_cash, clock=clock, **kwargs
+        )
         self.subsidy = float(subsidy)
         self._pools: dict[str, LmsrPool] = {}
 

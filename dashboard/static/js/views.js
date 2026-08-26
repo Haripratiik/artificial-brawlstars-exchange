@@ -771,10 +771,29 @@ export function lab(store) {
                 <input id="c-flow" type="number" min="0" max="24" value="${c.flow_traders}"
                        inputmode="numeric" autocomplete="off" spellcheck="false">
               </div>
+              <div class="field">
+                <label for="c-makers">Market makers</label>
+                <input id="c-makers" type="number" min="1" max="8" value="${c.makers ?? 3}"
+                       inputmode="numeric" autocomplete="off" spellcheck="false">
+              </div>
             </div>
             <div class="field">
               <label for="c-fees">Fee schedule</label>
               <select id="c-fees">${schedules}</select>
+            </div>
+            <div class="field">
+              <label for="c-mechanism">Mechanism</label>
+              <select id="c-mechanism">
+                <option value="book" ${c.mechanism === 'scoring-rule' ? '' : 'selected'}>
+                  Order book &mdash; every contract</option>
+                <option value="scoring-rule" ${c.mechanism === 'scoring-rule' ? 'selected' : ''}>
+                  Scoring rule &mdash; event contracts only</option>
+              </select>
+              <p class="note">A logarithmic scoring rule is defined on a partition of
+                outcomes, so it can quote a coin flip and not a future. On it the venue
+                is the market maker and subsidises the market instead of profiting from
+                it. Experiment 2 compared the two over 200 paired trials and found the
+                mechanism explains none of the difference in what a market learns.</p>
             </div>
             <div class="field">
               <label for="c-band">Price band &mdash; blank for none</label>
@@ -785,6 +804,14 @@ export function lab(store) {
             <label class="check">
               <input id="c-arb" type="checkbox" ${c.arbitrageur ? 'checked' : ''}>
               Cross-instrument arbitrageur
+            </label>
+            <label class="check">
+              <input id="c-auction" type="checkbox" ${c.opening_auction === false ? '' : 'checked'}>
+              Open with a call auction
+            </label>
+            <label class="check">
+              <input id="c-surface" type="checkbox" ${c.surface === false ? '' : 'checked'}>
+              Price options off one distribution
             </label>
             <button type="button" class="send" id="c-apply">Rebuild Market</button>
           </div>

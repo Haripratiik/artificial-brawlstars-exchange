@@ -562,6 +562,10 @@ async function rebuild() {
     fees: document.getElementById('c-fees').value,
     price_band: band === '' ? null : Number(band),
     arbitrageur: document.getElementById('c-arb').checked,
+    makers: Number(document.getElementById('c-makers').value),
+    opening_auction: document.getElementById('c-auction').checked,
+    surface: document.getElementById('c-surface').checked,
+    mechanism: document.getElementById('c-mechanism').value,
     speed: store.snapshot?.speed ?? 1,
   };
   try {

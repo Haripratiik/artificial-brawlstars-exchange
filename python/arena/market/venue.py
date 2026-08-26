@@ -26,6 +26,7 @@ worst case of the resulting position is arithmetic, not an estimate.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -129,8 +130,13 @@ class Venue:
         name: str = "arena",
         starting_cash: Decimal | int = 1_000_000,
         clock: Callable[[], datetime] | None = None,
+        sim_clock: Callable[[], int] | None = None,
         fees: FeeSchedule = FREE,
         price_band: float | None = None,
+        limit_state_ns: int = 15_000_000_000,
+        pause_ns: int = 300_000_000_000,
+        reference_window_ns: int = 300_000_000_000,
+        min_reference_prints: int = 20,
         balances: dict[AgentId, Decimal | int] | None = None,
     ) -> None:
         self.name = name
@@ -139,6 +145,15 @@ class Venue:
         # its window deliberately -- which every unit test does, since a fixture
         # contract's window is a fixed date in the past or future.
         self._clock = clock
+        # Elapsed simulated time in nanoseconds, which is a different question
+        # from what the calendar says and is answered by a different thing. The
+        # calendar decides whether a contract has expired; elapsed time decides
+        # how long a symbol has been in a limit state and when its pause is
+        # over. Conflating them would ask the kernel what year it is.
+        #
+        # Settable after construction because the venue is built before the
+        # kernel that will drive it.
+        self.sim_clock = sim_clock
         self.registry = InstrumentRegistry()
         # Converted once, here. Everything downstream is integer minor units,
         # so the ledger conserves exactly rather than nearly.
@@ -182,11 +197,44 @@ class Venue:
         # invariant, and venue revenue becomes a number rather than an idea.
         self.fees = fees
         self.fees_collected = Money(0)
-        # How far price may travel from the session's reference before trading
-        # is suspended, as a fraction. None disables the breaker entirely, which
+        # How far price may travel from the reference before trading is
+        # suspended, as a fraction. None disables the breaker entirely, which
         # is the default so existing measurements are unchanged.
         self.price_band = price_band
+        # How long price must stay outside the band before trading pauses, and
+        # how long the pause lasts, in nanoseconds.
+        #
+        # Both exist because a breaker without them is a different mechanism.
+        # The rule this models (the US limit up-limit down plan) does not halt
+        # on a single print outside the band: the symbol enters a *limit state*
+        # and only pauses if it is still there fifteen seconds later, because
+        # most excursions are one bad order and halting on those turns a fat
+        # finger into an outage. The first version here halted immediately on
+        # one print, which is the crude version of the same idea and would have
+        # made the breaker fire far more often than the thing it is named after.
+        self.limit_state_ns = limit_state_ns
+        self.pause_ns = pause_ns
         self._reference: dict[str, Price] = {}
+        # Prints inside the reference window, oldest first, as (time, price).
+        # The reference is their mean rather than the last trade or the open:
+        # a single print can be anywhere, and a breaker referenced to one
+        # measures the print rather than the market.
+        self._recent: dict[str, deque[tuple[int, Price]]] = {}
+        # When each symbol entered its current limit state, if it is in one.
+        self._limit_since: dict[str, int] = {}
+        # How far back the reference mean looks, and how many prints it needs
+        # before the band is enforced at all.
+        #
+        # The second is not a softening of the rule, it is the rule's own
+        # premise. A band is a statement about distance from a *reliable*
+        # price, and one print is not one. Enforced from the first trade, the
+        # breaker measured every symbol's walk away from its opening print --
+        # which on a thinly-attended opening auction is exactly the walk it
+        # should be making -- and paused 24 of 26 symbols inside a minute.
+        self.reference_window_ns = reference_window_ns
+        self.min_reference_prints = min_reference_prints
+        # When each paused symbol may reopen.
+        self._reopen_at: dict[str, int] = {}
         # Every breach, for the record: a halt that leaves no trace is
         # indistinguishable from a market that simply went quiet.
         self.halts: list[dict[str, Any]] = []
@@ -489,7 +537,11 @@ class Venue:
                 book.pop(getattr(event, "order_id", None), None)
 
     def _book_fills(
-        self, symbol: str, instrument: Instrument, events: list[Event]
+        self,
+        symbol: str,
+        instrument: Instrument,
+        events: list[Event],
+        auction: bool = False,
     ) -> None:
         bounds = self.bounds_in_minor(instrument)
         charged = 0
@@ -498,7 +550,7 @@ class Venue:
                 signed = int(event.quantity) * (1 if event.side is Side.BUY else -1)
                 price = instrument.price_in_minor(event.price)
                 fee = self.fees.charge(
-                    abs(int(price) * int(event.quantity)), event.aggressor
+                    abs(int(price) * int(event.quantity)), event.aggressor, auction
                 )
                 charged += int(fee)
                 self.account(event.agent_id).apply_fill(
@@ -603,9 +655,12 @@ class Venue:
         engine = self._engines[symbol]
         result = indicative_auction(engine.book, self._reference.get(symbol))
         events = engine.uncross(self._reference.get(symbol))
-        self._book_fills(symbol, instrument, events)
+        self._book_fills(symbol, instrument, events, auction=True)
         if result is not None and result.volume > 0:
             self._reference[symbol] = result.price
+            self._recent.setdefault(symbol, deque()).append((self._now(), result.price))
+        self._reopen_at.pop(symbol, None)
+        self._limit_since.pop(symbol, None)
         self._set_phase(symbol, SessionState.CONTINUOUS)
         return result
 
@@ -622,17 +677,97 @@ class Venue:
         self._set_phase(symbol, SessionState.AUCTION)
         self.halts.append({"symbol": symbol, "reason": reason})
 
+    def _now(self) -> int:
+        """Elapsed simulated nanoseconds, or zero when nothing is driving time.
+
+        Zero is a deliberate answer rather than an error: a venue used directly
+        in a unit test has no kernel, and a breaker whose clock never advances
+        simply never times anything out, which is the right behaviour for a
+        venue that is being poked rather than run.
+        """
+        return int(self.sim_clock()) if self.sim_clock is not None else 0
+
+    def _reference_price(self, symbol: str) -> Price | None:
+        """The mean of prints inside the reference window.
+
+        The opening print until the window has filled, which is what a venue
+        uses before it has five minutes of trading to average -- and it is the
+        auction price, so it is a price size actually transacted at.
+        """
+        window = self._recent.get(symbol)
+        if not window:
+            return self._reference.get(symbol)
+        cutoff = self._now() - self.reference_window_ns
+        while window and window[0][0] < cutoff:
+            window.popleft()
+        if not window:
+            return self._reference.get(symbol)
+        return Price(sum(int(price) for _t, price in window) // len(window))
+
     def _check_price_band(self, symbol: str, price: Price) -> None:
-        """Trip the breaker if a print landed outside the session's band."""
+        """Track the reference, and pause if price stays outside the band.
+
+        Three states rather than two, which is the whole point of modelling
+        this properly: inside the band, in a *limit state* outside it, and
+        paused. A print outside the band starts a clock; another print outside
+        it once that clock has run enters an auction. One bad order is not an
+        outage.
+        """
+        now = self._now()
+        window = self._recent.setdefault(symbol, deque())
         if self.price_band is None:
+            window.append((now, price))
+            self._reference.setdefault(symbol, price)
             return
-        reference = self._reference.get(symbol)
-        if reference is None:
-            self._reference[symbol] = price
+
+        reference = self._reference_price(symbol)
+        if reference is None or len(window) < self.min_reference_prints:
+            self._reference.setdefault(symbol, price)
+            window.append((now, price))
             return
-        allowed = abs(int(reference)) * self.price_band
-        if abs(int(price) - int(reference)) <= allowed:
+
+        # A fraction of what the contract can be *worth*, not of what it costs.
+        #
+        # A percentage of price is the rule real equity venues use, and it is
+        # meaningless here. A binary trading at fifty cents gets a band of two
+        # and a half cents, which any ordinary tick of opinion breaks, so the
+        # breaker paused every event contract on the exchange repeatedly while
+        # leaving the future -- whose 5% is 233 points, sixteen standard
+        # deviations -- untouched. Percentage bands assume a price with no
+        # natural scale. Every contract here has one: its settlement range. The
+        # same reasoning already governs the maker's inventory skew, and it
+        # makes one parameter mean the same thing on a future and on a coin
+        # flip.
+        low, high = self.registry.require(symbol).tick_bounds
+        allowed = abs(int(high) - int(low)) * self.price_band
+        outside = abs(int(price) - int(reference)) > allowed
+        if not outside:
+            # Back inside: the clock resets, and the print counts toward the
+            # reference. Prints from outside the band deliberately do not --
+            # letting a runaway drag its own reference along is how a breaker
+            # ends up chasing the move it exists to stop.
+            self._limit_since.pop(symbol, None)
+            window.append((now, price))
             return
+
+        since = self._limit_since.get(symbol)
+        if since is None:
+            self._limit_since[symbol] = now
+            self.halts.append(
+                {
+                    "symbol": symbol,
+                    "reason": "limit_state",
+                    "reference": int(reference),
+                    "price": int(price),
+                    "band": self.price_band,
+                }
+            )
+            return
+        if now - since < self.limit_state_ns:
+            return
+
+        self._limit_since.pop(symbol, None)
+        self._reopen_at[symbol] = now + self.pause_ns
         self.halts.append(
             {
                 "symbol": symbol,
@@ -643,6 +778,22 @@ class Venue:
             }
         )
         self._set_phase(symbol, SessionState.AUCTION)
+
+    def reopen_due(self) -> tuple[str, ...]:
+        """Symbols whose pause has run its course, in canonical order.
+
+        The venue does not reopen them itself. Something has to decide *when*
+        time passes, and that is the simulation's business rather than the
+        ledger's -- so this reports and the caller uncrosses.
+        """
+        now = self._now()
+        return tuple(
+            sorted(
+                symbol
+                for symbol, at in self._reopen_at.items()
+                if now >= at and self.session(symbol) is SessionState.AUCTION
+            )
+        )
 
     def close(self, symbol: str) -> None:
         """Stop trading. The outcome is determined; only settlement remains."""

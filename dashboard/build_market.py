@@ -34,9 +34,11 @@ from arena.contracts.spec import (
 )
 from arena.contracts.underlying import Basket, Difference, Single
 from arena.exchange.types import AgentId
-from arena.market.instrument import Instrument
+from arena.market.instrument import Instrument, InstrumentClass
 from arena.market.live import HUMAN_ID, VENUE_ID, HumanAgent, LiveMarket
-from arena.market.fees import FREE, FeeSchedule
+from arena.market.fees import FREE, MAKER_TAKER, FeeSchedule
+from arena.market.operator import SessionOperator
+from arena.market.lmsr_venue import LmsrVenue
 from arena.market.venue import Venue
 from arena.market.venue_agent import VenueAgent
 from arena.settlement.engine import distributions, settle
@@ -375,12 +377,32 @@ def build(
     arbitrageur: bool = False,
     recycle_capital: bool = True,
     flow_traders: int = 0,
-    fees: FeeSchedule = FREE,
-    price_band: float | None = None,
+    fees: FeeSchedule = MAKER_TAKER,
+    price_band: float | None = 0.05,
     human_cash: int = HUMAN_STARTING_CASH,
     surface: bool = True,
+    makers: int = 3,
+    opening_auction: bool = True,
+    session_seconds: float = 600.0,
+    mechanism: str = "book",
 ) -> LiveMarket:
+    # The scoring rule prices a binary and nothing else, so choosing it
+    # narrows the exchange to its event contracts. That is not a limitation
+    # worked around -- a logarithmic market scoring rule is defined on a
+    # partition of outcomes, and there is no honest way to quote a future on it.
+    #
+    # It also removes the market makers, which is the entire point: on this
+    # mechanism the venue *is* the maker, and it subsidises the market rather
+    # than trying to profit from it. Experiment 2 compared the two on 200
+    # paired trials and found the mechanism explains none of the difference in
+    # information aggregation; this is that comparison, reachable by anyone.
+    scoring_rule = mechanism == "scoring-rule"
     listed = instruments()
+    if scoring_rule:
+        listed = [i for i in listed if i.instrument_class == InstrumentClass.EVENT]
+        makers = 0
+        opening_auction = False
+        price_band = None
     by_symbol = {i.symbol: i for i in listed}
     levels = true_levels(listed)
 
@@ -389,11 +411,29 @@ def build(
     # collateralisation means that capital is genuinely committed rather than
     # notional. Too little and every agent spends the session rejected, which
     # looks like a broken market rather than a poor one.
-    venue = Venue(
-        "arena",
+    # The breaker's three time constants, scaled from the rule they model.
+    #
+    # Limit up-limit down uses a fifteen-second limit state, a five-minute
+    # pause, and a five-minute trailing reference, against a six-and-a-half
+    # hour session. Those are ratios, not durations: a session here lasts
+    # minutes and does a day's price discovery in the first one, so real
+    # durations make the reference stale for the whole session and the breaker
+    # spends its time policing the walk to fair value. Measured with the
+    # literal figures: twelve of twenty-six symbols halted at once. Scaled by
+    # the same fraction of the session, the reference keeps up and the breaker
+    # fires on dislocations instead.
+    trading_day = 6.5 * 60 * 60
+    scale = session_seconds / trading_day
+
+    venue_class = LmsrVenue if scoring_rule else Venue
+    venue = venue_class(
+        "arena-lmsr" if scoring_rule else "arena",
         starting_cash=40_000_000,
         fees=fees,
         price_band=price_band,
+        limit_state_ns=max(1, int(15 * scale * 1e9)),
+        pause_ns=max(1, int(300 * scale * 1e9)),
+        reference_window_ns=max(1, int(300 * scale * 1e9)),
         # A person starts with an account they can actually read. The bots keep
         # the large balance because a market maker quoting seven books at once
         # genuinely needs it -- but a trader watching a gain of a hundred against
@@ -403,7 +443,9 @@ def build(
     for instrument in listed:
         venue.list_instrument(instrument)
 
-    maker_id = AgentId("mm-1")
+    maker_ids = [AgentId(f"mm-{n + 1}") for n in range(max(0, makers))]
+    maker_id = maker_ids[0] if maker_ids else AgentId("mm-none")
+    operator_id = AgentId("exchange")
     arb_id = AgentId("arb-1")
     fund_ids = [AgentId("fund-sharp"), AgentId("fund-vague")]
     noise_ids = [AgentId(f"noise-{i:02d}") for i in range(14)]
@@ -412,7 +454,8 @@ def build(
     latency = PairwiseLatency(
         default=millis(4),
         per_agent={
-            maker_id: micros(150),                       # colocated
+            **{a: micros(150 + 40 * n) for n, a in enumerate(maker_ids)},
+            operator_id: micros(1),                      # the venue itself
             arb_id: millis(2),
             fund_ids[0]: millis(3),
             fund_ids[1]: millis(9),
@@ -425,6 +468,11 @@ def build(
     )
 
     kernel = Kernel(seed=seed, latency=latency)
+    # The breaker measures elapsed time, so it needs something that elapses.
+    # Without this its limit-state timer never advanced and a symbol could sit
+    # outside its band forever without ever pausing -- the breaker recorded 241
+    # excursions in three minutes and halted for none of them.
+    venue.sim_clock = lambda: int(kernel.now)
     venue_agent = VenueAgent(VENUE_ID, venue)
     human = HumanAgent(VENUE_ID, by_symbol)
 
@@ -433,31 +481,60 @@ def build(
     # the before-and-after in docs/GAPS.md was measured against -- the comparison
     # has to stay runnable or the numbers in it are just claims.
     maker_class = SurfaceMarketMaker if surface else MarketMaker
-    maker = maker_class(
-        maker_id,
-        VENUE_ID,
-        by_symbol,
-        wake_interval=millis(300),
-        half_spread=5,
-        quote_size=30,
-        max_skew_fraction=0.10,
-        position_limit=1_200,
-        # Opens each book near the middle of its range rather than at the true
-        # value: if the maker started on the answer there would be nothing for
-        # the market to discover.
-        reference={s: float(sum(i.tick_bounds) / 2) for s, i in by_symbol.items()},
-    )
+    opening = {s: float(sum(i.tick_bounds) / 2) for s, i in by_symbol.items()}
 
+    # More than one, because one was measured to be the whole other side of the
+    # market. Sweeping 60% of the offers, the single maker absorbed 89% of the
+    # order, ended short past the point its collateral let it quote, and the
+    # spread it left behind was still ten times its opening width three minutes
+    # later. Not a slow repair: no repair, because the maker that got run over
+    # was the only one there.
+    #
+    # They differ in the three parameters that decide who gets run over first:
+    # a tighter maker is hit sooner and fills its inventory faster, a wider one
+    # is still quoting when the tight one has stopped. Identical makers would be
+    # one maker with three times the capital, which is not what was missing.
+    makers_list = [
+        maker_class(
+            agent_id,
+            VENUE_ID,
+            by_symbol,
+            wake_interval=millis(300 + 90 * n),
+            half_spread=5 + 3 * n,
+            quote_size=30 - 8 * n,
+            max_skew_fraction=0.10,
+            position_limit=1_200 - 250 * n,
+            # The middle of each contract's range, never its true value: if a
+            # maker started on the answer there would be nothing to discover.
+            #
+            # Withdrawing this during the opening call was tried and was worse.
+            # The theory was sound -- a maker that turns up to the auction with
+            # a guess makes the guess the official opening price -- but with
+            # only two informed agents and a crowd of random market orders, an
+            # auction with no maker in it cleared `SPIKE_WR_FUT` at 9,377
+            # against a fair value of 4,669. A mediocre anchored open beats a
+            # wild unanchored one, and the informed interest still pulls the
+            # clearing price toward fair.
+            reference=opening,
+        )
+        for n, agent_id in enumerate(maker_ids)
+    ]
+
+    # They bring interest to the opening call rather than waiting for a price,
+    # which on a venue that opens with an auction is the difference between a
+    # market and an empty book: every other agent here reacts to a price, so
+    # with nobody posting first the auction cleared nothing and the exchange
+    # stayed empty for the whole session.
     funds = [
         FundamentalTrader(
             fund_ids[0], VENUE_ID, by_symbol, levels,
             wake_interval=millis(600), precision=3.0, base_size=20,
-            max_position=900,
+            max_position=900, open_interest=opening_auction,
         ),
         FundamentalTrader(
             fund_ids[1], VENUE_ID, by_symbol, levels,
             wake_interval=millis(1_100), precision=0.8, base_size=12,
-            max_position=600,
+            max_position=600, open_interest=opening_auction,
         ),
     ]
     noise = [
@@ -473,7 +550,10 @@ def build(
         for agent_id in flow_ids
     ]
 
-    agents = [maker, *funds, *noise, *flow]
+    agents = [*makers_list, *funds, *noise, *flow]
+    if opening_auction:
+        # The market opens with a call rather than with whoever arrives first.
+        agents.append(SessionOperator(operator_id, venue))
     if arbitrageur:
         # Off by default, on the evidence. It derives the right identities and
         # trades them, but measured across four paired seeds it improved spread

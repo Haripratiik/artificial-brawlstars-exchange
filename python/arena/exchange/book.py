@@ -25,6 +25,7 @@ import heapq
 from collections import deque
 from dataclasses import dataclass, field
 
+from arena.exchange.session import SENTINEL as _SENTINEL
 from arena.exchange.types import (
     AgentId,
     OrderId,
@@ -113,11 +114,23 @@ class BookSnapshot:
 
     @property
     def best_bid(self) -> Price | None:
-        return self.bids[0][0] if self.bids else None
+        """The best *priced* bid, which is not always the first level.
+
+        Market orders rest at a sentinel price during a call phase so they
+        cross every candidate the auction considers. That makes them the top of
+        the book by a margin of 2^61, and it makes them not prices: an order
+        that names no price cannot be the best price. Reporting one as the
+        touch marked books at zero, produced spreads of 2^62, and fed the
+        market maker a mid that no instrument could quote around.
+
+        The levels themselves keep them, because the auction has to count that
+        interest to know what would trade.
+        """
+        return _first_priced(self.bids)
 
     @property
     def best_ask(self) -> Price | None:
-        return self.asks[0][0] if self.asks else None
+        return _first_priced(self.asks)
 
     @property
     def spread(self) -> int | None:
@@ -131,6 +144,14 @@ class BookSnapshot:
         if self.best_bid is None or self.best_ask is None:
             return None
         return (int(self.best_bid) + int(self.best_ask)) / 2.0
+
+
+def _first_priced(levels: tuple[tuple[Price, Quantity], ...]) -> Price | None:
+    """The first level that names a price rather than "any"."""
+    for price, _quantity in levels:
+        if abs(int(price)) < _SENTINEL:
+            return price
+    return None
 
 
 class OrderBook:

@@ -228,7 +228,13 @@ def test_value_is_conserved_with_realistic_flow(flow_market):
 
 
 def test_the_book_survives_the_churn(flow_market):
-    """Heavy cancellation is exactly what broke depth accounting once before."""
+    """Heavy cancellation is exactly what broke depth accounting once before.
+
+    Depth is checked on every book; the crossing check only on books that are
+    trading. A call phase accumulates orders without matching them, so a
+    crossed book there is the mechanism working rather than failing.
+    """
+    from arena.exchange.session import SessionState
     from arena.exchange.types import Side
 
     for symbol in flow_market.venue.registry.symbols:
@@ -238,6 +244,8 @@ def test_the_book_survives_the_churn(flow_market):
             for price, quantity in ladder:
                 assert int(quantity) > 0
                 assert int(book.depth_at(side, price)) == int(quantity)
+        if flow_market.venue.session(symbol) is not SessionState.CONTINUOUS:
+            continue
         if snapshot.best_bid is not None and snapshot.best_ask is not None:
             assert int(snapshot.best_bid) < int(snapshot.best_ask)
 

@@ -68,6 +68,7 @@ class FundamentalTrader(TradingAgent):
         max_position: int = 150,
         base_size: int = 8,
         patience: float = 0.5,
+        open_interest: bool = False,
     ) -> None:
         super().__init__(agent_id, venue_id, instruments, wake_interval)
         self.truth_level = truth_level
@@ -81,6 +82,8 @@ class FundamentalTrader(TradingAgent):
         self._noise_scale: dict[str, float] = {}
         # One view per underlying, shared by every contract written on it.
         self._views: dict[str, tuple[float, list[float]]] = {}
+        # Whether to post interest into a book that has no price yet.
+        self.open_interest = open_interest
 
     def _draws(self, ctx, instrument, level: float, sigma: float):
         """This agent's view of one underlying: a centre, and a sample around it.
@@ -180,12 +183,47 @@ class FundamentalTrader(TradingAgent):
         for symbol in sorted(self.instruments):
             self._trade(ctx, symbol)
 
+    def _open_interest(
+        self, ctx: SimulationContext, symbol: str, estimate: float, uncertainty: float
+    ) -> None:
+        """Post two-sided interest at this agent's own valuation.
+
+        Only reached when the book has no mid, which on a venue with an opening
+        call is the whole of the pre-open. Every agent here reacts to a price,
+        so with nobody posting first the auction cleared nothing, the market
+        opened empty, and it stayed empty for ten minutes -- a market where
+        every participant is waiting for a price is not a market.
+
+        A trader with a view and no price to react to posts the view, which is
+        what an opening auction is for: it collects the prices people are
+        willing to deal at instead of asking who arrives first. The width is
+        the agent's own uncertainty, so a vague agent brings wide interest and
+        a sharp one brings tight interest, and the auction weighs them by size
+        exactly as it should.
+        """
+        width = max(1.0, uncertainty * self.patience)
+        instrument = self.instruments[symbol]
+        low, high = instrument.tick_bounds
+        bid = Price(int(max(int(low), min(int(high), estimate - width))))
+        ask = Price(int(max(int(low), min(int(high), estimate + width))))
+        if int(ask) <= int(bid):
+            return
+        inventory = self.position.get(symbol, 0)
+        size = max(1, self.base_size // 2)
+        self.cancel_all(ctx, symbol)
+        if inventory < self.max_position:
+            self.quote(ctx, symbol, Side.BUY, bid, size, TimeInForce.GTC)
+        if -inventory < self.max_position:
+            self.quote(ctx, symbol, Side.SELL, ask, size, TimeInForce.GTC)
+
     def _trade(self, ctx: SimulationContext, symbol: str) -> None:
         book = self.books[symbol]
-        if book.mid is None:
-            return
         estimate, uncertainty = self._view(ctx, symbol)
         if estimate != estimate:  # NaN: no view on this symbol
+            return
+        if book.mid is None:
+            if self.open_interest:
+                self._open_interest(ctx, symbol, estimate, uncertainty)
             return
 
         edge = estimate - book.mid

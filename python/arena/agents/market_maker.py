@@ -55,6 +55,7 @@ class MarketMaker(TradingAgent):
         position_limit: int = 400,
         reference: dict[str, float] | None = None,
         trade_weight: float = 0.15,
+        quote_without_reference: bool = True,
     ) -> None:
         super().__init__(agent_id, venue_id, instruments, wake_interval)
         self.half_spread = half_spread
@@ -76,6 +77,19 @@ class MarketMaker(TradingAgent):
         # session that someone is the market maker.
         self.reference = reference or {}
         self.trade_weight = trade_weight
+        # Whether to quote a book that has neither traded nor been given an
+        # opening price, by falling back to the middle of its settlement range.
+        #
+        # False is the right answer on a venue that opens with a call auction,
+        # and it took running one to see why. The auction is the discovery
+        # mechanism; if the maker turns up to it with a mid-range guess, the
+        # auction clears at the guess, that guess becomes the official opening
+        # price, and the market's subsequent walk to fair value is a 6% move
+        # that trips the circuit breaker. Measured: every one of 26 symbols
+        # paused inside the first minute. A real maker does not name the
+        # opening price -- the interest in the auction does, and the maker
+        # quotes around the print.
+        self.quote_without_reference = quote_without_reference
         # A slow average of where trades actually print. This, not the book's
         # mid, is what the maker anchors on -- and the distinction is the whole
         # reason the market can discover a price at all.
@@ -113,6 +127,8 @@ class MarketMaker(TradingAgent):
         if anchor is None:
             anchor = self.reference.get(symbol)
         if anchor is None:
+            if not self.quote_without_reference:
+                return
             low, high = instrument.tick_bounds
             anchor = (int(low) + int(high)) / 2.0
 

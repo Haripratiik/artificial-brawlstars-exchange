@@ -22,7 +22,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from arena.exchange.book import Order, OrderBook
-from arena.exchange.session import SessionState, indicative_auction
+from arena.exchange.session import SENTINEL, SessionState, indicative_auction
 from arena.exchange.events import (
     Acknowledged,
     Cancel,
@@ -242,7 +242,11 @@ class MatchingEngine:
         """
         result = indicative_auction(self.book, reference)
         if result is None or result.volume <= 0:
-            return []
+            # Even a call that clears nothing has to take the market orders
+            # back out. An auction with no crossing interest is the *most*
+            # likely place to leave one behind, and one left behind is a
+            # sentinel-priced order sitting at the touch of a continuous book.
+            return self._cancel_unfilled_market_orders()
 
         limit = int(result.price)
         buys = sorted(
@@ -308,6 +312,43 @@ class MatchingEngine:
             self._tape.append(trade)
             events.append(trade)
 
+        events.extend(self._cancel_unfilled_market_orders())
+        return events
+
+    def _cancel_unfilled_market_orders(self) -> list[Event]:
+        """Take market-on-open orders that did not trade back out of the book.
+
+        They rest at the sentinel price so that they cross every candidate in
+        the auction, which is the whole point of them -- and it is why leaving
+        one behind is catastrophic rather than untidy. An unfilled market sell
+        sits at minus 2^61, which is the best offer in the book by a margin of
+        2^61, so the first continuous buy order matches it *at that price*. Run
+        for the first time, this printed trades at -4,611,686,018,427,387,904,
+        marked the book at zero and billed 4.8e22 in fees before anything else
+        went wrong.
+
+        A market order is an instruction about the auction it was entered for.
+        Once that auction has cleared there is no price it was willing to pay,
+        because it never named one, so cancelling is the only honest outcome --
+        and it is what venues do with unexecuted market-on-open interest.
+        """
+        events: list[Event] = []
+        for order in list(self.book.resting_orders):
+            if abs(int(order.price)) < SENTINEL:
+                continue
+            events.append(
+                Cancelled(self._seq(), order.agent_id, order.order_id, order.remaining)
+            )
+            self.book.remove(order)
+            # The status, and not only the level bookkeeping. `Book.remove`
+            # reduces the level's total and leaves the order in the queue as a
+            # tombstone; what makes the matcher skip it on the way past is its
+            # status being terminal. Removing without marking left an order the
+            # depth no longer counted but the matcher would still fill -- so it
+            # was invisible to every diagnostic that reads resting orders while
+            # remaining perfectly tradeable, which is why the sentinel prints
+            # survived two attempts at fixing them.
+            order.status = OrderStatus.CANCELLED
         return events
 
     def _fillable(self, side: Side, limit: Price, quantity: Quantity) -> bool:

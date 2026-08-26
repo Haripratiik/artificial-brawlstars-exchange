@@ -315,16 +315,23 @@ def test_auction_fills_land_in_accounts_and_conserve_exactly():
     assert venue.conservation_check() == 0
 
 
-def test_an_auction_charges_both_sides_the_maker_rate():
-    """Nobody crossed a spread, so nobody is a taker. Venues that run auctions
-    charge them this way, and the fee path must agree with the fill path."""
+def test_an_auction_is_charged_rather_than_rebated():
+    """Nobody crossed a spread, and that does not make everyone a maker.
+
+    This test used to assert the opposite -- that both sides earn the maker
+    rate, on the reasoning that an auction has no aggressor. The reasoning is
+    right and the conclusion was wrong, and running an opening auction for the
+    first time is what showed it: a maker rate is a rebate, so a venue billing
+    both sides of its own cross *pays out* on every share it crosses. Twenty-six
+    opening auctions took venue revenue to minus 1,251 before anything else went
+    wrong. Exchanges charge for cross executions; they do not pay for them.
+    """
     venue = _venue(fees=MAKER_TAKER)
     venue.begin_session("F")
     _send(venue, "a", B, 18_800, 100)
     _send(venue, "c", S, 18_600, 100)
     venue.uncross("F")
-    # Both sides rebated means the venue paid out, so its balance falls.
-    assert int(venue.fees_collected) < 0
+    assert int(venue.fees_collected) > 0, "the venue paid to open its own market"
     assert venue.conservation_check() == 0
 
 
@@ -344,16 +351,81 @@ def test_a_halt_accumulates_orders_and_reopens_with_an_auction():
     assert venue.conservation_check() == 0
 
 
-def test_the_circuit_breaker_trips_on_a_print_outside_the_band():
-    venue = _venue(price_band=0.02)
+def test_one_print_outside_the_band_is_a_limit_state_and_not_a_halt():
+    """Three states, and the middle one is what makes it the rule it models.
+
+    Limit up-limit down does not pause on a single print outside the band: the
+    symbol enters a limit state, and pauses only if it is still outside when
+    fifteen seconds have run. Halting on one print turns a fat finger into an
+    outage. The first version here halted immediately, which is the crude
+    version of the same idea.
+
+    The clock has to advance for the pause to arrive, so this drives it.
+    """
+    clock = {"now": 0}
+    venue = _venue(price_band=0.02, min_reference_prints=1)
+    venue.sim_clock = lambda: clock["now"]
+
     _send(venue, "c", S, 18_000, 50)
     _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
     assert venue.session("F") is SessionState.CONTINUOUS, "the first print sets the reference"
 
     _send(venue, "c", S, 25_000, 50)
     _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    assert venue.session("F") is SessionState.CONTINUOUS, "one print is not a halt"
+    assert venue.halts[-1]["reason"] == "limit_state"
+
+    # Still outside once the limit state has run its course.
+    clock["now"] = venue.limit_state_ns + 1
+    _send(venue, "c", S, 25_500, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
     assert venue.session("F") is SessionState.AUCTION
     assert venue.halts[-1]["reason"] == "price_band"
+
+
+def test_coming_back_inside_the_band_clears_the_limit_state():
+    """An excursion that corrects itself is not a halt, however far it went."""
+    clock = {"now": 0}
+    venue = _venue(price_band=0.02, min_reference_prints=1)
+    venue.sim_clock = lambda: clock["now"]
+
+    _send(venue, "c", S, 18_000, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    _send(venue, "c", S, 25_000, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    assert venue.halts[-1]["reason"] == "limit_state"
+
+    clock["now"] = venue.limit_state_ns // 2
+    _send(venue, "c", S, 18_100, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+
+    clock["now"] = venue.limit_state_ns * 4
+    _send(venue, "c", S, 18_200, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    assert venue.session("F") is SessionState.CONTINUOUS
+    assert not [h for h in venue.halts if h["reason"] == "price_band"]
+
+
+def test_the_band_scales_with_what_a_contract_can_be_worth():
+    """A fraction of range, not of price.
+
+    A percentage of price gives a contract trading near zero a band of almost
+    nothing, which is why every event contract on the live exchange paused
+    repeatedly while the future -- whose 5% is sixteen standard deviations --
+    was never touched.
+    """
+    venue = _venue(price_band=0.02, min_reference_prints=1)
+    instrument = venue.registry.require("F")
+    low, high = instrument.tick_bounds
+    span = int(high) - int(low)
+
+    _send(venue, "c", S, 100, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    # A move of half the band away from a very low price: enormous in
+    # percentage terms, and correctly ignored.
+    _send(venue, "c", S, 100 + span // 100, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    assert venue.halts == []
 
 
 def test_the_breaker_stays_quiet_inside_the_band():

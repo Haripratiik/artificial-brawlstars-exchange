@@ -247,41 +247,32 @@ def test_a_large_order_moves_the_price():
     assert after.best_ask is None or float(instrument.from_ticks(after.best_ask)) > best_ask
     assert impact > before, f"mark did not move: {before} -> {impact}"
 
-    # And the market does *not* repair itself, which is a defect this test
-    # pins rather than a property it wants.
+    # And then the market repairs itself, which it could not do when there was
+    # one maker.
     #
-    # One maker supplies essentially the whole other side: measured at the time
-    # of writing it absorbs ~89% of the sweep and is left short about two
-    # thousand lots, which is far past the point where its collateral lets it
-    # quote again. So the offer it was run over at never comes back, the spread
-    # stays ten times wider than it started, and a minute later the maker has
-    # worked none of it off. A real book repairs in milliseconds because the
-    # maker that got run over is one of many. Asserted as it is so that the day
-    # replenishment arrives, this test fails and says so.
-    #
-    # The bound is well below the measured figure on purpose. The claim is "one
-    # maker is the whole other side", not "89%" -- and the exact fraction moves
-    # whenever an unrelated contract is listed, because the seeded market takes
-    # a different path. Pinning it tight made this fail twice for reasons that
-    # had nothing to do with what it is testing.
+    # This assertion used to say the opposite, and said so deliberately: with a
+    # single maker, sweeping 60% of the offers left it short past the point its
+    # collateral allowed it to quote, and the spread it left behind was still
+    # ten times its opening width three minutes later. Not a slow repair -- no
+    # repair. The comment there said the test should fail on the day
+    # replenishment worked, and it did: three makers differing in spread, size
+    # and inventory limit mean the one that gets run over is not the only one
+    # there, and the spread comes back from 1.25 to 2.50 rather than to 24.50.
     maker = m.venue.account("mm-1").positions[SYMBOL]
-    assert int(maker.quantity) < 0
-    absorbed = -int(maker.quantity) / int(position.quantity)
-    assert absorbed > 0.75, f"the maker took only {absorbed:.0%} of the sweep"
+    assert int(maker.quantity) < 0, "the maker did not take the other side at all"
 
     before_spread = float(instrument.from_ticks(book.best_ask)) - float(
         instrument.from_ticks(book.best_bid)
     )
     m.kernel.advance(until=seconds(120))
-    stuck = m.venue.engine(SYMBOL).book.snapshot()
-    assert stuck.best_ask is not None and stuck.best_bid is not None
-    after_spread = float(instrument.from_ticks(stuck.best_ask)) - float(
-        instrument.from_ticks(stuck.best_bid)
+    healed = m.venue.engine(SYMBOL).book.snapshot()
+    assert healed.best_ask is not None and healed.best_bid is not None
+    after_spread = float(instrument.from_ticks(healed.best_ask)) - float(
+        instrument.from_ticks(healed.best_bid)
     )
-    assert after_spread > 3 * before_spread, (
-        f"the spread repaired from {before_spread} to {after_spread}; if that is "
-        "real, replenishment now works and this assertion should become the "
-        "recovery test it replaced"
+    assert after_spread <= 4 * before_spread, (
+        f"the spread went from {before_spread} to {after_spread} and stayed there; "
+        "replenishment has stopped working"
     )
 
 
@@ -381,8 +372,17 @@ def test_every_instrument_is_quoted_and_never_crossed(market):
     so a contract the market has decided is worthless can end up offered-only.
     That is adverse selection visible in the book, which is a phenomenon to
     observe rather than to configure away.
+
+    A book in a call phase is *expected* to be crossed -- that is what a call
+    phase is: orders accumulate without matching until the uncross clears them
+    all at one price. So the check applies to books that are trading, and the
+    ones that are not are skipped rather than excused.
     """
+    from arena.exchange.session import SessionState
+
     for symbol in market.venue.registry.symbols:
+        if market.venue.session(symbol) is not SessionState.CONTINUOUS:
+            continue
         book = market.venue.engine(symbol).book.snapshot()
         assert book.bids or book.asks, f"{symbol} has no quotes at all"
         if book.best_bid is not None and book.best_ask is not None:
@@ -460,7 +460,10 @@ def test_agent_populations_are_present(market):
     # By what an agent *is*, not by what it is called. The class-name version
     # of this broke the day a specialised maker was wired in, which is a fact
     # about the test rather than about the population.
-    assert sum(isinstance(a, MarketMaker) for a in market.agents) == 1
+    # Three, and that is the point: one maker is not a market, it is a
+    # counterparty. Sweeping 60% of the offers against a single maker, it
+    # absorbed 89% of the order and the spread it left never recovered.
+    assert sum(isinstance(a, MarketMaker) for a in market.agents) == 3
     kinds = [type(a).__name__ for a in market.agents]
     assert kinds.count("FundamentalTrader") == 2
     assert kinds.count("NoiseTrader") >= 10
