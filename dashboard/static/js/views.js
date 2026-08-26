@@ -30,6 +30,35 @@ import {
 /* ── markets ─────────────────────────────────────────────────────────── */
 
 /**
+ * Asset classes, in the words a person would use.
+ *
+ * The venue's own vocabulary is precise and unhelpful for browsing: "event" is
+ * a prediction market and "call"/"put" are options. Grouping under these makes
+ * the shape of the exchange visible, which a flat grid of seven tiles does not
+ * — you could not tell, looking at the old page, that this venue lists
+ * prediction markets and options at all.
+ */
+const CLASS_GROUPS = [
+  ['event', 'Prediction Markets', 'Pays a fixed amount if the outcome happens.'],
+  ['future', 'Futures', 'Settles at the measured rate itself.'],
+  ['call', 'Options', 'The right to what lies past a strike.'],
+  ['put', 'Options', 'The right to what lies past a strike.'],
+  ['spread', 'Spreads', 'One Brawler priced against another.'],
+  ['index', 'Indices', 'A weighted basket of several Brawlers.'],
+];
+
+const GROUP_ORDER = ['Prediction Markets', 'Futures', 'Options', 'Spreads', 'Indices', 'Other'];
+
+export function groupOf(assetClass) {
+  return CLASS_GROUPS.find(([key]) => key === assetClass)?.[1] ?? 'Other';
+}
+
+function groupBlurb(title) {
+  return CLASS_GROUPS.find(([, name]) => name === title)?.[2] ?? '';
+}
+
+
+/**
  * Discovery. A card carries the question, the odds, activity and time left,
  * and one action.
  *
@@ -50,8 +79,7 @@ export function markets(store) {
     </div></div>`;
   }
 
-  const cards = symbols
-    .map((symbol) => {
+  const card = (symbol) => {
       const book = books[symbol];
       const meta = instruments.find((x) => x.symbol === symbol) || {};
       const series = (history[symbol] || []).slice(-90);
@@ -64,6 +92,7 @@ export function markets(store) {
       const headline = odds != null ? percent(odds, 0) : price(book.mark);
 
       return `<button type="button" class="card" data-symbol="${esc(symbol)}"
+                   data-region="card:${esc(symbol)}"
                    data-session="${esc(session)}"
                    aria-label="${esc(symbol)}, ${headline}, ${signed(pct)} percent">
         <span class="card-top">
@@ -87,10 +116,26 @@ export function markets(store) {
           <span>${expiry(book.contract, meta)}</span>
         </span>
       </button>`;
-    })
+  };
+
+  const buckets = new Map();
+  for (const symbol of symbols) {
+    const title = groupOf(books[symbol].class);
+    (buckets.get(title) ?? buckets.set(title, []).get(title)).push(symbol);
+  }
+
+  const sections = GROUP_ORDER.filter((t) => buckets.has(t))
+    .map((title) => `<section class="class-block">
+      <div class="class-head">
+        <h2>${esc(title)}</h2>
+        <span>${esc(groupBlurb(title))}</span>
+        <b class="mono">${buckets.get(title).length}</b>
+      </div>
+      <div class="grid">${buckets.get(title).map(card).join('')}</div>
+    </section>`)
     .join('');
 
-  return `<div class="view"><div class="grid">${cards}</div></div>`;
+  return `<div class="view">${sections}</div>`;
 }
 
 /**
@@ -118,23 +163,45 @@ function question(contract) {
   const p = contract?.payoff;
   if (!p) return '';
   const subject = esc(subjectName(contract?.underlying));
+  // Only a single-Brawler contract reads naturally with the metric attached.
+  // A basket or a difference already names what it measures, and forcing the
+  // metric in produced "the Assassin index's win rate" and "SPIKE vs CROW's
+  // adjusted win rate" -- grammatical wreckage on the most-read line of the
+  // whole exchange.
+  const simple = contract?.underlying?.kind === 'single';
+  const what = simple ? `${subject}'s ${esc(metricName(contract.underlying))}` : subject;
+
   if (p.kind === 'binary') {
     const direction = String(p.comparison).includes('>') ? 'above' : 'below';
-    return `Will ${subject} finish ${direction} ${p.threshold}?`;
+    return `Will ${what} finish ${direction} ${p.threshold}?`;
   }
-  if (p.kind === 'call') return `${subject} above ${p.strike} at settlement`;
-  if (p.kind === 'put') return `${subject} below ${p.strike} at settlement`;
-  return `Where ${subject} settles`;
+  if (p.kind === 'call') return `${what} above ${p.strike} at settlement`;
+  if (p.kind === 'put') return `${what} below ${p.strike} at settlement`;
+  return `Where ${what} settles`;
 }
 
+/**
+ * The Brawler a contract is written on.
+ *
+ * The metric reference arrives under `ref`, not `metric` -- reading the wrong
+ * key made every question on the exchange read "Will the metric finish above
+ * 0.48?", which is a contract nobody could identify. It failed silently
+ * because the fallback was a plausible English phrase rather than an error.
+ */
 function subjectName(underlying) {
   if (!underlying) return 'the metric';
-  if (underlying.kind === 'single') return underlying.metric?.subject ?? 'the metric';
+  if (underlying.kind === 'single') return underlying.ref?.subject ?? 'the metric';
   if (underlying.kind === 'difference') {
-    return `${subjectName(underlying.left)} minus ${subjectName(underlying.right)}`;
+    return `the gap between ${subjectName(underlying.left)} and ${subjectName(underlying.right)}`;
   }
-  if (underlying.kind === 'basket') return 'the index';
+  if (underlying.kind === 'basket') return 'the Assassin index';
   return 'the metric';
+}
+
+/** "adjusted win rate", from "adjusted_win_rate". */
+function metricName(underlying) {
+  const raw = underlying?.ref?.metric ?? underlying?.left?.ref?.metric;
+  return raw ? String(raw).replace(/_/g, ' ') : 'win rate';
 }
 
 function expiry(contract, meta) {
@@ -165,51 +232,51 @@ export function trade(store) {
 
   return `<div class="market">
     <div class="market-main">
-      ${contractHead(symbol, book, meta, session)}
-      ${resolution(book, meta)}
+      <div data-region="head">${contractHead(symbol, book, meta, session)}</div>
+      <div data-region="resolution">${resolution(book, meta)}</div>
 
-      <div class="panel">
+      <div class="panel" data-region="chart">
         <h2>Price <em>${series.length} points</em></h2>
         <div class="panel-body chart-body">
           ${priceChart(series, { settlesAt: meta.settles_at ?? null, label: symbol })}
         </div>
       </div>
 
-      <div class="panel">
+      <div class="panel" data-region="tape">
         <h2>Recent Trades</h2>
         <div class="panel-body">${tape(snapshot, symbol)}</div>
       </div>
 
-      <div class="panel">
+      <div class="panel" data-region="counterparties">
         <h2>Who Filled You <em>${esc(symbol)}</em></h2>
         <div class="panel-body">${counterparties(snapshot, symbol)}</div>
       </div>
 
-      <details class="panel drop">
+      <details class="panel drop" data-region="book">
         <summary><h2>Order Book</h2><span class="hint">depth at every price</span></summary>
         <div class="panel-body">${ladder(book, depth)}</div>
       </details>
 
-      <details class="panel drop">
+      <details class="panel drop" data-region="spec">
         <summary><h2>Contract Specification</h2><span class="hint">the exact terms</span></summary>
         <div class="panel-body">${specification(book)}</div>
       </details>
     </div>
 
     <aside class="market-side">
-      <div class="panel tkt">
+      <div class="panel tkt" data-region="ticket">
         <h2>Trade</h2>
         <div class="panel-body">
           <div class="ticket" id="ticket">${ticket(symbol, book, session)}</div>
         </div>
       </div>
 
-      <div class="panel">
+      <div class="panel" data-region="position">
         <h2>Your Position</h2>
         <div class="panel-body">${positionCard(position)}</div>
       </div>
 
-      <div class="panel">
+      <div class="panel" data-region="orders">
         <h2>Working Orders <em>${(snapshot.orders || []).length}</em></h2>
         <div class="panel-body">${orders(snapshot)}</div>
       </div>
@@ -457,7 +524,7 @@ function tape(snapshot, symbol) {
   return `<table>
     <thead><tr><th>Time</th><th>Price</th><th>Size</th><th>Taker</th></tr></thead>
     <tbody>${rows
-      .map((t) => `<tr class="tape-row">
+      .map((t) => `<tr>
         <td class="faint">${clock(t.t)}</td>
         <td>${price(t.price)}</td>
         <td>${count(t.quantity)}</td>
@@ -478,14 +545,14 @@ export function portfolio(store) {
     `<div class="panel figure"><span>${label}</span><b class="mono ${klass}">${value}</b></div>`;
 
   return `<div class="view">
-    <div class="figures">
+    <div class="figures" data-region="figures">
       ${figure('Account Value', money(a.equity))}
       ${figure('Profit &amp; Loss', money(a.pnl), cls(Number(a.pnl)))}
       ${figure('Available to Trade', money(a.free_cash))}
       ${figure('Held as Collateral', money(a.collateral))}
     </div>
 
-    <div class="panel">
+    <div class="panel" data-region="positions">
       <h2>Positions <em>${positions.length}</em></h2>
       <div class="panel-body">${
         positions.length
@@ -504,7 +571,7 @@ export function portfolio(store) {
       }</div>
     </div>
 
-    <div class="panel">
+    <div class="panel" data-region="activity">
       <h2>Activity <em>${(s.log || []).length}</em></h2>
       <div class="panel-body">${blotter(s.log)}</div>
     </div>

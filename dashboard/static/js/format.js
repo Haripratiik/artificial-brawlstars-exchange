@@ -115,7 +115,7 @@ export function describe(contract) {
 
 function subjectOf(u) {
   if (!u) return 'the metric';
-  if (u.kind === 'single') return `<code>${esc(u.metric?.subject ?? '?')}</code>`;
+  if (u.kind === 'single') return `<code>${esc(u.ref?.subject ?? '?')}</code>`;
   if (u.kind === 'difference') return `(${subjectOf(u.left)} − ${subjectOf(u.right)})`;
   if (u.kind === 'basket') {
     return `basket(${(u.legs || []).map((l) => `${l.weight}·${subjectOf(l.leg)}`).join(' + ')})`;

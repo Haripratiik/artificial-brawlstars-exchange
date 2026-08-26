@@ -161,9 +161,18 @@ let dirty = false;
 let frame = null;
 let lastHeavy = 0;
 
-// Eight redraws a second for the panels. Fast enough that a ladder still feels
-// live, slow enough that interacting with it is possible.
+/*
+ * How often each screen redraws, in milliseconds.
+ *
+ * A trading screen wants to feel live: eight passes a second is fast enough
+ * that a ladder moves under you and slow enough that you can still click it.
+ * A browsing grid does not -- nobody reads a card seven times a second, and its
+ * sparkline changes on every tick regardless of whether the price did, so at
+ * the trading cadence the cards were rebuilding continuously to show a line
+ * one pixel longer.
+ */
 const HEAVY_INTERVAL_MS = 120;
+const VIEW_INTERVAL_MS = { markets: 500, portfolio: 400, research: 800, lab: 800 };
 
 function render({ force = false } = {}) {
   dirty = true;
@@ -174,7 +183,8 @@ function render({ force = false } = {}) {
 function paint(now) {
   frame = null;
   renderHeader();
-  if (now - lastHeavy < HEAVY_INTERVAL_MS) return;   // the next message re-arms
+  const interval = VIEW_INTERVAL_MS[store.view] ?? HEAVY_INTERVAL_MS;
+  if (now - lastHeavy < interval) return;            // the next message re-arms
   lastHeavy = now;
   dirty = false;
   renderWatchlist();
@@ -193,48 +203,74 @@ function captureFocus() {
   return null;
 }
 
+/**
+ * Update only what changed.
+ *
+ * The previous version replaced the whole subtree on every pass, and that is
+ * what people saw as flicker. Destroying a node restarts every CSS animation on
+ * it, so the tape flashed, rows re-entered and charts repainted several times a
+ * second whether or not a single number had moved. Measured in the browser: a
+ * tagged node did not survive three seconds.
+ *
+ * Every panel now carries a `data-region`. A pass renders the view into a
+ * detached container, compares each region's markup against the one on screen,
+ * and swaps only those that differ. In a quiet market that is nothing at all;
+ * when one trade prints, it is one panel.
+ */
 function renderMain() {
   const view = VIEWS[store.view] ?? markets;
   const signature = `${store.view}:${store.symbol}`;
   const sameShape = ticketSignature === signature;
 
-  const selector = captureFocus();
-  // Panels keep their own scroll. Keyed by position, which is stable as long as
-  // the view itself has not changed.
-  const scrolls = sameShape
-    ? [...main.querySelectorAll('.panel-body')].map((n) => n.scrollTop)
-    : [];
-
   const fresh = document.createElement('div');
   fresh.innerHTML = view(store);
 
-  // The ticket holds live input. Rewriting it under someone mid-keystroke is
-  // the fastest way to make a trading screen unusable, so the existing node is
-  // moved across rather than replaced.
-  if (store.view === 'trade' && sameShape) {
-    const keep = main.querySelector('#ticket');
-    const incoming = fresh.querySelector('#ticket');
-    if (keep && incoming) incoming.replaceWith(keep);
-  }
-
-  main.replaceChildren(...fresh.childNodes);
-  ticketSignature = signature;
-
-  if (sameShape) {
-    const panes = main.querySelectorAll('.panel-body');
-    scrolls.forEach((top, i) => {
-      if (panes[i] && top) panes[i].scrollTop = top;
-    });
-  }
-  if (selector) main.querySelector(selector)?.focus({ preventScroll: true });
-
-  // Only when the screen itself changed. Staggering on every tick would be an
-  // animation nobody asked for, eight times a second.
   if (!sameShape) {
+    main.replaceChildren(...fresh.childNodes);
+    ticketSignature = signature;
+    // Staggered only when the screen itself changed. On a tick it would be an
+    // animation nobody asked for, eight times a second.
     revealAll(main.querySelectorAll('.card, .market-main > *, .figures > *'));
+    bind();
+    return;
   }
 
-  bind();
+  const live = new Map(
+    [...main.querySelectorAll('[data-region]')].map((n) => [n.dataset.region, n]),
+  );
+  const incoming = [...fresh.querySelectorAll('[data-region]')];
+
+  // A region appearing or disappearing is a change of shape rather than of
+  // content, and is the one case that still needs the screen rebuilt.
+  const sameRegions =
+    incoming.length === live.size && incoming.every((n) => live.has(n.dataset.region));
+  if (!sameRegions) {
+    main.replaceChildren(...fresh.childNodes);
+    bind();
+    return;
+  }
+
+  const selector = captureFocus();
+  let touched = 0;
+  for (const next of incoming) {
+    const node = live.get(next.dataset.region);
+    if (node.innerHTML === next.innerHTML) continue;   // nothing moved here
+    // The ticket holds live input and is never rewritten under a keystroke;
+    // its figures are patched in place by updatePreview instead.
+    if (next.querySelector('#ticket')) continue;
+
+    const scrolled = [...node.querySelectorAll('.panel-body')].map((n) => n.scrollTop);
+    node.innerHTML = next.innerHTML;
+    [...node.querySelectorAll('.panel-body')].forEach((n, i) => {
+      if (scrolled[i]) n.scrollTop = scrolled[i];
+    });
+    touched += 1;
+  }
+
+  if (touched) {
+    if (selector) main.querySelector(selector)?.focus({ preventScroll: true });
+    bind();
+  }
 }
 
 function renderHeader() {
@@ -260,13 +296,15 @@ function renderHeader() {
     : `Leak of ${s.conservation}`;
 }
 
+let watchlistHtml = '';
+
 function renderWatchlist() {
   const s = store.snapshot;
   if (!s) return;
   const list = document.getElementById('watchlist');
 
   const shown = Object.entries(s.books).filter(([sym, book]) => matches(sym, book, store.query));
-  list.innerHTML = (shown.length
+  const html = (shown.length
     ? shown
     : [])
     .map(([symbol, book]) => {
@@ -295,6 +333,13 @@ function renderWatchlist() {
       </button>`;
     })
     .join('') || `<p class="empty">No market matches that.</p>`;
+
+  // Same reason the panels are diffed: rewriting this list recreates every row,
+  // which restarts the tick highlight on rows whose price never moved. Twelve
+  // animations were running at once on a list of seven.
+  if (html === watchlistHtml) return;
+  watchlistHtml = html;
+  list.innerHTML = html;
 }
 
 function sparklineFor(series) {

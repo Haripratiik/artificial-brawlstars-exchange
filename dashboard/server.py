@@ -258,8 +258,29 @@ async def _receive(socket: WebSocket) -> None:
             await socket.send_json({"ack": result})
 
 
+class _FreshStatic(StaticFiles):
+    """Static files that a reload actually re-fetches.
+
+    Browsers cache ES modules hard, and the default headers here let them: a
+    change to a view module simply did not appear until someone knew to force a
+    reload, which is a miserable way to develop and an easy way to debug the
+    wrong version of a file for twenty minutes.
+
+    This is a single-process simulator served over localhost, so revalidating
+    every asset costs nothing worth measuring.
+    """
+
+    def is_not_modified(self, response_headers, request_headers) -> bool:  # noqa: D102
+        return False
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        return response
+
+
 if STATIC.is_dir():
-    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+    app.mount("/static", _FreshStatic(directory=STATIC), name="static")
 
 
 def main() -> None:

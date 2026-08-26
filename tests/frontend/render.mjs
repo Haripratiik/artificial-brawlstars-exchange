@@ -175,12 +175,46 @@ check('a missing payoff has no probability', fmt.impliedProbability(1, null) ===
 check('percent formats', fmt.percent(0.425) === '42.5%', fmt.percent(0.425));
 check('percent of nothing is a dash', fmt.percent(null) === '—');
 
+/* ── the contract has to name itself ──────────────────────────────────────
+ *
+ * The metric reference arrives under `ref`. Reading the wrong key made every
+ * question on the exchange read "Will the metric finish above 0.48?" -- and it
+ * failed silently, because the fallback was a plausible English phrase rather
+ * than an error. Nothing crashed, nothing logged, and every card was
+ * unidentifiable.
+ */
+const marketsHtml = views.markets(store);
+check('questions name their subject', !marketsHtml.includes('Will the metric'),
+      'the fallback is showing instead of the Brawler');
+for (const [symbol, book] of Object.entries(fixture.snapshot.books)) {
+  const subject = book.contract?.underlying?.ref?.subject;
+  if (!subject) continue;
+  check(`${symbol} names ${subject}`, marketsHtml.includes(subject),
+        'the card does not say what it is written on');
+}
+
+// Asset classes have to be visible as classes, not as a flat wall of tiles.
+check('markets are grouped by class', marketsHtml.includes('class-head'));
+check('prediction markets are named', marketsHtml.includes('Prediction Markets'));
+check('options are named', marketsHtml.includes('Options'));
+check('the venue vocabulary is translated', views.groupOf('event') === 'Prediction Markets');
+check('an unknown class still groups', views.groupOf('zzz') === 'Other');
+
+// Region keys are what stop the screen being rebuilt under the reader.
+const tradeRegions = (views.trade(store).match(/data-region="/g) || []).length;
+check('the trade screen is divided into regions', tradeRegions >= 8, `${tradeRegions}`);
+check('cards are their own regions', /data-region="card:/.test(marketsHtml));
+
 /* ── search and counterparties ────────────────────────────────────────── */
 
+// Mirrors the real payload: the metric reference lives under `ref`. The first
+// version of this fixture used `metric`, which is the same mistake the view
+// itself was making -- so the fixture agreed with the bug and the test passed
+// while every card on the exchange read "the metric".
 const futureBook = {
   class: 'future',
   contract: { payoff: { kind: 'linear', scale: 10000 },
-              underlying: { kind: 'single', metric: { subject: 'SPIKE' } } },
+              underlying: { kind: 'single', ref: { subject: 'SPIKE', metric: 'adjusted_win_rate' } } },
 };
 check('an empty query matches everything', views.matches('SPIKE_WR_FUT', futureBook, ''));
 check('a null query matches everything', views.matches('SPIKE_WR_FUT', futureBook, null));

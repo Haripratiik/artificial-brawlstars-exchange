@@ -290,8 +290,11 @@ main { overflow: hidden; display: flex; flex-direction: column; }
   display: flex;
   flex-direction: column;
   min-height: 0;
-  animation: rise 0.32s cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
 }
+/* Entrances are run from JS on a view change, never from CSS. A CSS entrance
+ * fires whenever the node is created -- so any panel rebuilt by a price update
+ * re-entered, several times a second, which is exactly what people saw as
+ * flicker. The keyframe stays for the toast, which really is created once. */
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
 
 .panel > h2 {
@@ -358,7 +361,6 @@ tbody tr:hover { background: var(--raised); }
   position: relative;
   overflow: hidden;
   transition: border-color var(--tick), transform var(--tick);
-  animation: rise 0.34s cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
 }
 .card:hover { border-color: var(--rule-bright); transform: translateY(-1px); }
 /* State ribbon down the left edge — the fastest read of session state. */
@@ -431,8 +433,9 @@ tbody tr:hover { background: var(--raised); }
 
 /* ── tape ───────────────────────────────────────────────────────────── */
 
-.tape-row { animation: flash 0.5s ease-out; }
-@keyframes flash { from { background: rgba(245, 166, 35, 0.16); } }
+/* The tape used to flash every row on every pass, because every row was a new
+ * node. It strobed, and it conveyed nothing -- a row that has been sitting
+ * there for a minute is not news. Removed rather than tuned. */
 
 /* ── ticket ─────────────────────────────────────────────────────────── */
 
@@ -925,4 +928,88 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+
+/* ── asset classes ──────────────────────────────────────────────────── */
+
+.class-block + .class-block { margin-top: 22px; }
+.class-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--rule);
+}
+.class-head h2 {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  color: var(--ink);
+}
+.class-head span { font-size: 11.5px; color: var(--ink-faint); flex: 1; }
+.class-head b {
+  font-size: 10px;
+  color: var(--amber);
+  border: 1px solid var(--control-edge);
+  padding: 1px 7px;
+}
+
+
+/* ── narrow viewports ───────────────────────────────────────────────── */
+
+/* A 232px rail is a third of the screen at 700px and most of it at 400. Below
+ * that the rail stops being a column: navigation becomes a scrolling strip and
+ * the market list moves into the flow, so the content gets the width. */
+@media (max-width: 860px) {
+  #shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto 1fr;
+  }
+  header { flex-wrap: wrap; height: auto; padding: 8px 12px; gap: 14px; }
+  header .stats { gap: 14px; order: 3; width: 100%; }
+  .speed { order: 2; }
+
+  nav { border-right: none; border-bottom: 1px solid var(--rule); }
+  .nav-links {
+    display: flex;
+    overflow-x: auto;
+    padding: 0;
+    scrollbar-width: none;
+  }
+  .nav-links::-webkit-scrollbar { display: none; }
+  .nav-links button {
+    width: auto;
+    white-space: nowrap;
+    border-left: none;
+    border-bottom: 2px solid transparent;
+    padding: 10px 14px;
+  }
+  .nav-links button[aria-current='page'] {
+    border-left-color: transparent;
+    border-bottom-color: var(--amber);
+  }
+  .nav-group {
+    border-top: none;
+    border-left: 1px solid var(--rule);
+    margin: 0;
+    padding: 10px 12px 10px 14px;
+    align-self: center;
+  }
+  /* The watchlist duplicates the Markets screen; on a narrow viewport that is
+     a second copy of the same thing competing for the same space. */
+  .watchlist, .watch-head { display: none; }
+  .search { padding: 8px 12px; }
+
+  .market { grid-template-columns: 1fr; padding: 10px; gap: 10px; }
+  .market-side { position: static; }
+  .grid { grid-template-columns: 1fr; }
+  .contract h1.question { font-size: 17px; }
+  .contract-figures { gap: 16px; }
+  .class-head { flex-wrap: wrap; gap: 6px; }
+  .class-head span { flex-basis: 100%; }
+  .resolution li > span { min-width: 0; flex-basis: 100%; }
+  .resolution li > em { padding-left: 0; }
+  .view { padding: 10px; }
 }
