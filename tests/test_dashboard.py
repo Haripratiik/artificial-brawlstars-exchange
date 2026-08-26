@@ -14,8 +14,11 @@ server fails a test instead of silently blanking a panel.
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -234,6 +237,53 @@ def test_a_nonsense_action_is_reported_not_ignored(client):
                 assert message["ack"]["ok"] is False
                 return
     pytest.fail("no acknowledgement returned")
+
+
+# --------------------------------------------------------------------------
+# The entry point
+# --------------------------------------------------------------------------
+
+
+def test_the_server_starts_the_way_it_is_documented():
+    """`python -m dashboard.server` must work outside pytest.
+
+    It did not. The project keeps `arena` under `python/`, and the only thing
+    putting that on the path was `pythonpath` in the pytest configuration -- so
+    every test passed while the documented command, the sole way anyone opens
+    the UI, died on ModuleNotFoundError.
+
+    This runs in a subprocess with a clean environment precisely so pytest's
+    own path setup cannot hide the problem a second time.
+    """
+    environment = dict(os.environ)
+    # Anything that would smuggle the package path in gets removed first.
+    environment.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import dashboard.server; print(dashboard.server.app.title)"],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        env=environment,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Arena Markets" in result.stdout
+
+
+def test_every_static_asset_the_page_asks_for_exists():
+    """A 404 on a module leaves a blank screen and one line in the console."""
+    html = (REPO / "dashboard" / "static" / "index.html").read_text(encoding="utf-8")
+    referenced = re.findall(r'(?:href|src)="(/static/[^"]+)"', html)
+    assert referenced, "the page references no local assets at all"
+    for reference in referenced:
+        asset = REPO / "dashboard" / reference.lstrip("/")
+        assert asset.is_file(), f"{reference} is referenced but missing"
+
+    # And the modules the entry point pulls in behind it.
+    entry = (REPO / "dashboard" / "static" / "js" / "main.js").read_text(encoding="utf-8")
+    for module in re.findall(r"from '\./([\w.]+\.js)'", entry):
+        assert (REPO / "dashboard" / "static" / "js" / module).is_file(), module
 
 
 # --------------------------------------------------------------------------
