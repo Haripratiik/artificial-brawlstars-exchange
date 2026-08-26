@@ -20,6 +20,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from arena.agents.arbitrageur import Arbitrageur
+from arena.agents.flow import FlowTrader
 from arena.agents.fundamental import FundamentalTrader
 from arena.agents.market_maker import MarketMaker
 from arena.agents.noise import NoiseTrader
@@ -155,6 +156,7 @@ def build(
     speed: float = 1.0,
     arbitrageur: bool = False,
     recycle_capital: bool = True,
+    flow_traders: int = 0,
 ) -> LiveMarket:
     listed = instruments()
     by_symbol = {i.symbol: i for i in listed}
@@ -173,6 +175,7 @@ def build(
     arb_id = AgentId("arb-1")
     fund_ids = [AgentId("fund-sharp"), AgentId("fund-vague")]
     noise_ids = [AgentId(f"noise-{i:02d}") for i in range(14)]
+    flow_ids = [AgentId(f"flow-{i:02d}") for i in range(flow_traders)]
 
     latency = PairwiseLatency(
         default=millis(4),
@@ -183,6 +186,7 @@ def build(
             fund_ids[1]: millis(9),
             HUMAN_ID: millis(20),                        # a person on a browser
             **{a: millis(45) for a in noise_ids},        # retail, far away
+            **{a: millis(6) for a in flow_ids},          # brokers' algos
         },
         jitter_fraction=0.15,
         seed=seed,
@@ -224,7 +228,15 @@ def build(
         for a in noise_ids
     ]
 
-    agents = [maker, *funds, *noise]
+    # Off unless asked for. These agents *assume* power-law sizes and bursty
+    # arrivals, so any claim that this market produces fat tails emergently is
+    # only meaningful with them absent -- see arena/agents/flow.py.
+    flow = [
+        FlowTrader(agent_id, VENUE_ID, by_symbol, wake_interval=millis(500))
+        for agent_id in flow_ids
+    ]
+
+    agents = [maker, *funds, *noise, *flow]
     if arbitrageur:
         # Off by default, on the evidence. It derives the right identities and
         # trades them, but measured across four paired seeds it improved spread

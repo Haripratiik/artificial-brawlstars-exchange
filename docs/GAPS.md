@@ -111,6 +111,69 @@ against scoring rule 0.03115, difference +0.00007 with a 95% interval of
 a 70x range does not rescue it either -- error is U-shaped with its minimum at
 the depth-matched point and never approaches the precision-weighted baseline.
 
+## Fees, sessions, halts and realistic flow
+
+All four are built, all four default to off or inert, and each records what it
+actually delivers rather than what it was aimed at.
+
+**Fees** (`arena/market/fees.py`) are maker-taker on notional in basis points.
+They land in a real venue account inside the conservation check, because the
+quiet failure here is charging the right amount and banking it nowhere -- the
+ledger would still balance to within a rounding error. Rounding always goes
+toward the venue, or many tiny fills would extract a fraction of a unit each.
+`POST_ONLY` exists because maker-taker creates it: a maker that crosses by
+accident pays the taker fee instead of earning the rebate.
+
+**Call auctions** (`arena/exchange/session.py`) clear on four tie-breaks --
+maximum volume, minimum surplus, the surplus's own side, nearest the reference.
+Everyone trades at one price, market orders become market-on-open orders, and
+limit IOC/FOK are refused during a call rather than silently rested. Auction
+fills have no aggressor, so both sides book passive and earn the maker rate.
+
+**Sessions and halts** replace the old closed-symbol set with a phase map
+(PRE_OPEN / CONTINUOUS / AUCTION / CLOSED). A halt accumulates orders and
+reopens through an uncross; a price band trips it automatically.
+
+**Realistic order flow** (`arena/agents/flow.py`) carries power-law order sizes,
+power-law placement from the touch, heavy cancellation and Hawkes-clustered
+arrivals, with parameters quoted from the literature rather than fitted here.
+
+### Two things it measured that were not what was expected
+
+**The cancel rate is ~60%, not the >90% of real equity books** -- 58.8% without
+these agents and 60.4% with, so they barely move it. The missing thirty points
+are structural: real cancellation is dominated by makers requoting on every tick
+at microsecond scale, and nothing here requotes faster than 300ms. Left as a gap
+rather than tuned, since a cancel rate reached by inflating one agent's churn
+would be the number without the mechanism.
+
+**Assumed power-law order sizes did not inflate the measured tails.** The
+warning first written into that module said they would, and made the emergence
+result look fragile. Three paired seeds say otherwise:
+
+| statistic | without flow | with flow |
+|---|---|---|
+| Hill tail index | 1.86 | 2.06 (lighter) |
+| excess kurtosis | 152.9 | 131.4 |
+| volatility clustering | 0.16 | 0.14 |
+| bid-ask bounce (lag 1) | +0.13 | **-0.05** |
+
+The extra population deepens the book faster than heavy sizes can move it. The
+bid-ask bounce is the more interesting line: it had the *wrong sign* without
+these agents, and becomes correctly negative with them, because they both post
+and take. Three seeds is not many, so the claim is "did not inflate the tails"
+rather than "reduced them".
+
+### The explosion that was caught
+
+The first Hawkes implementation added excitation in the wrong units with no
+stability condition. One agent reached 26,000x its baseline intensity, its
+inter-arrival time collapsed to microseconds, and it emitted roughly 6,000
+orders a second forever -- the suite simply stopped returning. It is now a real
+Hawkes process parameterised by branching ratio, the constructor refuses any
+value at or above one, and a test checks the realised rate against the
+theoretical `mu / (1 - n)`.
+
 ## What would make it a market rather than a mechanism
 
 In the order that buys the most realism per unit of work:
