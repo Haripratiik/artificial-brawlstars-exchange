@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from arena.exchange.book import Order, OrderBook
+from arena.exchange.session import SessionState, indicative_auction
 from arena.exchange.events import (
     Acknowledged,
     Cancel,
@@ -62,6 +63,9 @@ class MatchingEngine:
         self.instrument = instrument
         self.self_trade_prevention = self_trade_prevention
         self.book = OrderBook()
+        # Continuous by default, so an engine used on its own behaves exactly
+        # as it always has and every existing test keeps its meaning.
+        self.phase = SessionState.CONTINUOUS
         self._sequence = 0
         self._next_order_id = 0
         self._arrival = 0
@@ -133,6 +137,26 @@ class MatchingEngine:
             )
         ]
 
+        if not self.phase.matches_continuously:
+            return events + self._accumulate(command, order)
+
+        # Post-only is decided before anything trades, for the same reason a
+        # maker uses it: the whole point is that no part of it may ever take.
+        if command.time_in_force is TimeInForce.POST_ONLY and self._crossable_levels(
+            command.side, limit
+        ):
+            order.status = OrderStatus.REJECTED
+            self.book.track(order)
+            events.append(
+                Rejected(
+                    self._seq(),
+                    command.agent_id,
+                    RejectReason.POST_ONLY_WOULD_CROSS,
+                    order_id,
+                )
+            )
+            return events
+
         # Fill-or-kill is decided before anything trades, so a partial walk is
         # never left half-done and then unwound. Checking first is simpler and
         # leaves no intermediate state an observer could see.
@@ -151,7 +175,7 @@ class MatchingEngine:
         events.extend(self._match(order))
 
         if order.remaining > 0:
-            if command.time_in_force is TimeInForce.GTC:
+            if command.time_in_force in (TimeInForce.GTC, TimeInForce.POST_ONLY):
                 order.status = (
                     OrderStatus.PARTIALLY_FILLED
                     if order.remaining < order.quantity
@@ -167,6 +191,122 @@ class MatchingEngine:
         else:
             order.status = OrderStatus.FILLED
             self.book.track(order)
+
+        return events
+
+    def _accumulate(self, command: Submit, order: Order) -> list[Event]:
+        """Rest an order during a call phase, where nothing matches yet.
+
+        A *limit* order marked immediate-or-cancel or fill-or-kill is refused
+        rather than silently rested: both are instructions about what to do
+        *right now*, and during a call phase there is no right now. Accepting
+        them would quietly convert a "do not leave this working" order into one
+        that works until the uncross.
+
+        A **market** order is the exception, and not an inconsistency. It is
+        required to be IOC in continuous trading only because an unpriced
+        resting order would match anything forever -- during a call phase nothing
+        matches until the uncross, so the danger does not exist. What it becomes
+        is a market-on-open order: willing to trade at whatever price the
+        auction clears at, which is exactly what such an order means.
+        """
+        if command.order_type is not OrderType.MARKET and command.time_in_force in (
+            TimeInForce.IOC,
+            TimeInForce.FOK,
+        ):
+            order.status = OrderStatus.CANCELLED
+            self.book.track(order)
+            return [
+                Rejected(
+                    self._seq(),
+                    command.agent_id,
+                    RejectReason.NOT_ACCEPTED_IN_AUCTION,
+                    order.order_id,
+                )
+            ]
+        order.status = OrderStatus.NEW
+        self.book.add(order)
+        return []
+
+    def uncross(self, reference: Price | None = None) -> list[Event]:
+        """Clear the accumulated book at a single price.
+
+        Everything trades at the auction price, including orders that were
+        willing to pay more -- the price improvement is the reward for having
+        been in the auction, and it is why the clearing price is trustworthy in
+        a way a first-arrival price is not.
+
+        Nobody is the aggressor here, so every fill is booked as passive. Under
+        a maker-taker schedule that means auction fills earn the maker rate on
+        both sides, which is what venues that run auctions actually charge.
+        """
+        result = indicative_auction(self.book, reference)
+        if result is None or result.volume <= 0:
+            return []
+
+        limit = int(result.price)
+        buys = sorted(
+            (o for o in self.book.resting_orders
+             if o.side is Side.BUY and int(o.price) >= limit),
+            key=lambda o: (-int(o.price), o.priority),
+        )
+        sells = sorted(
+            (o for o in self.book.resting_orders
+             if o.side is Side.SELL and int(o.price) <= limit),
+            key=lambda o: (int(o.price), o.priority),
+        )
+
+        events: list[Event] = []
+        i = j = 0
+        while i < len(buys) and j < len(sells):
+            buy, sell = buys[i], sells[j]
+            if buy.remaining <= 0:
+                i += 1
+                continue
+            if sell.remaining <= 0:
+                j += 1
+                continue
+            if buy.agent_id == sell.agent_id:
+                # A wash print is worse in an auction than in continuous
+                # trading: it would be struck at the official price and could
+                # move a settlement. Drop the older side and carry on, which is
+                # the CANCEL_OLDEST policy applied to a two-sided book.
+                stale = buy if buy.priority <= sell.priority else sell
+                events.append(
+                    Cancelled(self._seq(), stale.agent_id, stale.order_id, stale.remaining)
+                )
+                self.book.remove(stale)
+                i, j = (i + 1, j) if stale is buy else (i, j + 1)
+                continue
+
+            quantity = Quantity(min(int(buy.remaining), int(sell.remaining)))
+            price = Price(limit)
+            for order in (buy, sell):
+                self.book.consume(order, quantity)
+                events.append(
+                    Filled(
+                        self._seq(),
+                        order.agent_id,
+                        order.order_id,
+                        order.side,
+                        quantity,
+                        price,
+                        False,
+                        order.remaining,
+                    )
+                )
+            trade = Traded(
+                self._seq(),
+                quantity,
+                price,
+                # An auction has no aggressor. The surplus side is the closest
+                # honest analogue, so order-flow statistics stay meaningful.
+                result.surplus_side or Side.BUY,
+                buy.order_id,
+                sell.order_id,
+            )
+            self._tape.append(trade)
+            events.append(trade)
 
         return events
 
@@ -453,8 +593,10 @@ def _validate(command: Submit) -> RejectReason | None:
     if command.order_type is OrderType.MARKET:
         if command.price is not None:
             return RejectReason.INVALID_PRICE
-        if command.time_in_force is TimeInForce.GTC:
-            # An unpriced resting order would match anything forever.
+        if command.time_in_force in (TimeInForce.GTC, TimeInForce.POST_ONLY):
+            # An unpriced resting order would match anything forever -- and a
+            # post-only market order is a contradiction in terms, since a market
+            # order is defined by being willing to cross.
             return RejectReason.MARKET_ORDER_MUST_BE_IOC
         return None
     if command.price is None:

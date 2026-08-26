@@ -56,6 +56,8 @@ from arena.exchange.types import (
     SequenceNumber,
     Side,
 )
+from arena.exchange.session import AuctionResult, SessionState, indicative_auction
+from arena.market.fees import FREE, FeeSchedule
 from arena.market.instrument import Instrument
 from arena.portfolio.account import Account
 from arena.portfolio.money import Money, from_money, to_money
@@ -115,6 +117,10 @@ class InstrumentRegistry:
         )
 
 
+# Where fees land. A real account, so the conservation check sees it.
+FEE_ACCOUNT_ID = AgentId("venue-treasury")
+
+
 class Venue:
     """Books, accounts, and settlement across many instruments."""
 
@@ -123,6 +129,8 @@ class Venue:
         name: str = "arena",
         starting_cash: Decimal | int = 1_000_000,
         clock: Callable[[], datetime] | None = None,
+        fees: FeeSchedule = FREE,
+        price_band: float | None = None,
     ) -> None:
         self.name = name
         # Supplies wall-clock or simulated calendar time, so expiries can be
@@ -136,7 +144,7 @@ class Venue:
         self.starting_cash = to_money(starting_cash)
         self._engines: dict[str, MatchingEngine] = {}
         self._accounts: dict[AgentId, Account] = {}
-        self._closed: set[str] = set()
+        self._phase: dict[str, SessionState] = {}
         # Symbols that have settled. Tracked here rather than only on the
         # accounts, because a symbol nobody held would otherwise settle twice
         # without complaint -- and a settlement firing more than once is a
@@ -149,12 +157,30 @@ class Venue:
         # Last traded price per symbol, in ticks. The mark of last resort when
         # a book has no two-sided quote.
         self._last: dict[str, Price] = {}
+        # Fees move value; they do not destroy it. Whatever traders pay lands in
+        # the venue's own account, which is checked for conservation like any
+        # other -- so switching fees on cannot quietly break the ledger's central
+        # invariant, and venue revenue becomes a number rather than an idea.
+        self.fees = fees
+        self.fees_collected = Money(0)
+        # How far price may travel from the session's reference before trading
+        # is suspended, as a fraction. None disables the breaker entirely, which
+        # is the default so existing measurements are unchanged.
+        self.price_band = price_band
+        self._reference: dict[str, Price] = {}
+        # Every breach, for the record: a halt that leaves no trace is
+        # indistinguishable from a market that simply went quiet.
+        self.halts: list[dict[str, Any]] = []
 
     # -- listing and accounts ---------------------------------------------
 
     def list_instrument(self, instrument: Instrument) -> None:
         self.registry.list_instrument(instrument)
         self._engines[instrument.symbol] = MatchingEngine(instrument.symbol)
+        # Listed instruments open continuous, because that is what every
+        # existing caller expects. A venue that wants an opening auction asks
+        # for one with `begin_session`.
+        self._phase[instrument.symbol] = SessionState.CONTINUOUS
 
     def engine(self, symbol: str) -> MatchingEngine:
         return self._engines[symbol]
@@ -216,9 +242,11 @@ class Venue:
         # window has closed the outcome is determined, so anyone still trading
         # is trading against an answer that already exists.
         if self._clock is not None and self._clock() >= instrument.expiry:
-            self._closed.add(symbol)
+            self._set_phase(symbol, SessionState.CLOSED)
 
-        if symbol in self._closed and isinstance(command, (Submit, Replace)):
+        if not self.session(symbol).accepts_orders and isinstance(
+            command, (Submit, Replace)
+        ):
             # Cancels stay legal after the close so an agent can tidy up; new
             # risk cannot be taken once the outcome is determined.
             return [Rejected(SequenceNumber(0), agent_id, RejectReason.ALREADY_TERMINAL)]
@@ -398,25 +426,122 @@ class Venue:
         self, symbol: str, instrument: Instrument, events: list[Event]
     ) -> None:
         bounds = instrument.bounds_in_minor
+        charged = 0
         for event in events:
             if isinstance(event, Filled):
                 signed = int(event.quantity) * (1 if event.side is Side.BUY else -1)
+                price = instrument.price_in_minor(event.price)
+                fee = self.fees.charge(
+                    abs(int(price) * int(event.quantity)), event.aggressor
+                )
+                charged += int(fee)
                 self.account(event.agent_id).apply_fill(
-                    symbol, signed, instrument.price_in_minor(event.price), bounds
+                    symbol, signed, price, bounds, fee
                 )
             elif isinstance(event, Traded):
                 self._last[symbol] = event.price
+                self._check_price_band(symbol, event.price)
+        if charged:
+            # The exact counterpart of what the participants paid, so the two
+            # sides of every fee cancel to the unit.
+            treasury = self.account(FEE_ACCOUNT_ID)
+            treasury.cash = Money(int(treasury.cash) + charged)
+            self.fees_collected = Money(int(self.fees_collected) + charged)
 
     # -- lifecycle ---------------------------------------------------------
+
+    # -- sessions ----------------------------------------------------------
+
+    def session(self, symbol: str) -> SessionState:
+        return self._phase.get(symbol, SessionState.CONTINUOUS)
+
+    def _set_phase(self, symbol: str, state: SessionState) -> None:
+        self._phase[symbol] = state
+        # A venue whose mechanism is not a matching engine (the scoring rule)
+        # keeps the phase without an engine to push it into.
+        engine = self._engines.get(symbol)
+        if engine is not None:
+            engine.phase = state
+
+    def begin_session(self, symbol: str) -> None:
+        """Put a symbol into its opening call phase. Orders rest, nothing trades."""
+        self.registry.require(symbol)
+        self._set_phase(symbol, SessionState.PRE_OPEN)
+
+    def indicative(self, symbol: str) -> AuctionResult | None:
+        """What the auction would clear at right now, changing nothing.
+
+        Published during a call phase as real venues publish indicative prices
+        and opening imbalances, so an agent can respond to the auction rather
+        than only to its result.
+        """
+        return indicative_auction(
+            self._engines[symbol].book, self._reference.get(symbol)
+        )
+
+    def uncross(self, symbol: str) -> AuctionResult | None:
+        """Clear the call phase and return to continuous trading.
+
+        The fills go through exactly the same account path as continuous ones,
+        so collateral, fees and conservation cannot diverge between the two --
+        an auction that settled through its own accounting would be the ideal
+        place for a leak to hide.
+        """
+        instrument = self.registry.require(symbol)
+        engine = self._engines[symbol]
+        result = indicative_auction(engine.book, self._reference.get(symbol))
+        events = engine.uncross(self._reference.get(symbol))
+        self._book_fills(symbol, instrument, events)
+        if result is not None and result.volume > 0:
+            self._reference[symbol] = result.price
+        self._set_phase(symbol, SessionState.CONTINUOUS)
+        return result
+
+    def halt(self, symbol: str, reason: str = "manual") -> None:
+        """Suspend trading. Orders keep arriving; the reopen is an auction.
+
+        Resuming straight into continuous trading would hand the whole
+        dislocation to whichever order arrived first, which is the outcome a
+        halt exists to prevent.
+        """
+        self.registry.require(symbol)
+        if self.session(symbol) is SessionState.CLOSED:
+            return
+        self._set_phase(symbol, SessionState.AUCTION)
+        self.halts.append({"symbol": symbol, "reason": reason})
+
+    def _check_price_band(self, symbol: str, price: Price) -> None:
+        """Trip the breaker if a print landed outside the session's band."""
+        if self.price_band is None:
+            return
+        reference = self._reference.get(symbol)
+        if reference is None:
+            self._reference[symbol] = price
+            return
+        allowed = abs(int(reference)) * self.price_band
+        if abs(int(price) - int(reference)) <= allowed:
+            return
+        self.halts.append(
+            {
+                "symbol": symbol,
+                "reason": "price_band",
+                "reference": int(reference),
+                "price": int(price),
+                "band": self.price_band,
+            }
+        )
+        self._set_phase(symbol, SessionState.AUCTION)
 
     def close(self, symbol: str) -> None:
         """Stop trading. The outcome is determined; only settlement remains."""
         self.registry.require(symbol)
-        self._closed.add(symbol)
+        self._set_phase(symbol, SessionState.CLOSED)
 
     @property
     def closed_symbols(self) -> tuple[str, ...]:
-        return tuple(sorted(self._closed))
+        return tuple(
+            sorted(s for s, p in self._phase.items() if p is SessionState.CLOSED)
+        )
 
     @property
     def settled_symbols(self) -> tuple[str, ...]:
@@ -444,7 +569,7 @@ class Venue:
                 "plausible bug rather than an impossible one."
             )
         self._settled.add(symbol)
-        self._closed.add(symbol)
+        self._set_phase(symbol, SessionState.CLOSED)
         # Nothing can be working on a settled contract. Leaving entries behind
         # would keep reserving collateral against orders that can never fill.
         for key in [k for k in self._working if k[1] == symbol]:
@@ -486,11 +611,16 @@ class Venue:
     def conservation_check(self) -> Money:
         """Total equity minus total starting capital, in minor units.
 
-        Must be **exactly** zero in a closed market with no fees: trading moves
-        value between participants, it does not create it. A non-zero figure
-        means an accounting leak, and this is the single sharpest check
-        available on the whole portfolio layer -- which is why the ledger runs on
-        integers, so "exactly" can be meant literally.
+        Must be **exactly** zero: trading moves value between participants, it
+        does not create it. A non-zero figure means an accounting leak, and this
+        is the single sharpest check available on the whole portfolio layer --
+        which is why the ledger runs on integers, so "exactly" can be meant
+        literally.
+
+        Fees do not change that. They are a transfer to the venue's own account,
+        which is counted here alongside everyone else's, so a schedule with any
+        rates at all still nets to zero. If it ever did not, fees would be
+        creating or destroying value rather than moving it.
         """
         marks = self.marks()
         equity = sum(int(a.equity(marks)) for a in self._accounts.values())

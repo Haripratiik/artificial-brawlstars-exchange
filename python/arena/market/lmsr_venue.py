@@ -65,6 +65,7 @@ from arena.exchange.types import (
 )
 from arena.market.instrument import Instrument
 from arena.market.lmsr import LmsrMarket, liquidity_for_subsidy
+from arena.exchange.session import SessionState
 from arena.market.venue import Venue
 from arena.portfolio.money import Money, to_money
 
@@ -220,6 +221,7 @@ class LmsrVenue(Venue):
                 "quote a number with no meaning behind it."
             )
         self.registry.list_instrument(instrument)
+        self._phase[instrument.symbol] = SessionState.CONTINUOUS
         market = LmsrMarket(
             liquidity_for_subsidy(self.subsidy, float(payoff.payout)),
             payout=float(payoff.payout),
@@ -283,7 +285,7 @@ class LmsrVenue(Venue):
             return [Rejected(SequenceNumber(0), agent_id, RejectReason.UNKNOWN_ORDER)]
 
         if self._clock is not None and self._clock() >= instrument.expiry:
-            self._closed.add(symbol)
+            self._set_phase(symbol, SessionState.CLOSED)
 
         if isinstance(command, Cancel):
             # Nothing rests, so there is never anything to cancel. Answering
@@ -311,7 +313,15 @@ class LmsrVenue(Venue):
                 ]
             return [Rejected(SequenceNumber(0), agent_id, RejectReason.UNKNOWN_ORDER)]
 
-        if symbol in self._closed:
+        if not self.session(symbol).accepts_orders:
+            return [
+                Rejected(SequenceNumber(0), agent_id, RejectReason.ALREADY_TERMINAL)
+            ]
+        if self.session(symbol) is SessionState.AUCTION:
+            # A scoring rule has no call phase to accumulate into: its price is
+            # a function of net flow, and there is no book to clear. A halted
+            # AMM is therefore simply shut, which is the honest behaviour rather
+            # than pretending it can hold an auction.
             return [
                 Rejected(SequenceNumber(0), agent_id, RejectReason.ALREADY_TERMINAL)
             ]

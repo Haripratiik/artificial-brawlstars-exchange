@@ -80,6 +80,11 @@ class TimeInForce(Enum):
     IOC = "ioc"
     # All or nothing, immediately. Fills completely or does not trade at all.
     FOK = "fok"
+    # Rests like GTC, but is rejected outright rather than crossing. Exists
+    # because of maker-taker pricing: a maker that accidentally crosses pays the
+    # taker fee instead of earning the rebate, which can turn a profitable quote
+    # into a losing one. This is the order type that makes that impossible.
+    POST_ONLY = "post_only"
 
 
 class SelfTradePrevention(Enum):
@@ -131,6 +136,10 @@ class RejectReason(Enum):
     MARKET_ORDER_MUST_BE_IOC = "market_order_must_be_ioc"
     LIMIT_ORDER_REQUIRES_PRICE = "limit_order_requires_price"
     FOK_NOT_FILLABLE = "fok_not_fillable"
+    POST_ONLY_WOULD_CROSS = "post_only_would_cross"
+    # Immediate-or-cancel and fill-or-kill are instructions about *now*, and
+    # during a call phase there is no now.
+    NOT_ACCEPTED_IN_AUCTION = "not_accepted_in_auction"
     NOT_ORDER_OWNER = "not_order_owner"
     # Raised by the venue, not the engine: the account could not cover the
     # worst case of the position the order would create. Checked before the
