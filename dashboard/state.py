@@ -108,6 +108,35 @@ class Series:
         }
 
 
+def _role(agent) -> str:
+    """What an agent does, for a reader who does not know the class names.
+
+    Published beside the class so the page can say "market maker" while the
+    diagnostics keep the exact type. It is derived by isinstance rather than
+    by name, so a specialised maker is still a maker -- which is the thing two
+    tests got wrong when the options maker arrived and they went looking for
+    the string "MarketMaker".
+    """
+    from arena.agents.arbitrageur import Arbitrageur
+    from arena.agents.bayesian import BayesianFundamental
+    from arena.agents.flow import FlowTrader
+    from arena.agents.fundamental import FundamentalTrader
+    from arena.agents.market_maker import MarketMaker
+    from arena.agents.noise import NoiseTrader
+
+    for kind, label in (
+        (MarketMaker, "market maker"),
+        (Arbitrageur, "arbitrageur"),
+        (BayesianFundamental, "informed"),
+        (FundamentalTrader, "informed"),
+        (FlowTrader, "order flow"),
+        (NoiseTrader, "uninformed"),
+    ):
+        if isinstance(agent, kind):
+            return label
+    return "participant"
+
+
 class MarketRunner:
     """Owns the live market, steps it, and records what happened."""
 
@@ -221,6 +250,7 @@ class MarketRunner:
                 {
                     "id": str(agent.agent_id),
                     "kind": type(agent).__name__,
+                    "role": _role(agent),
                     "fills": getattr(agent, "fills", 0),
                     "rejects": getattr(agent, "rejects", 0),
                     "positions": {

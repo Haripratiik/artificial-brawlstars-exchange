@@ -209,15 +209,8 @@ each item. Struck items link to what actually happened.
 
 ### Still open, in the order that buys the most per unit of work
 
-1. **The option surface is internally inconsistent.** Measured over ten minutes
-   of a live market: `SPIKE_C4700` marks at 72.7 while `SPIKE_C4600` marks at
-   59.1. A call at a higher strike cannot be worth more than one at a lower
-   strike, so that is a riskless arbitrage sitting in the book, and put-call
-   parity is out by 35 ticks at the same strike. The cause is one thing: the
-   market maker prices every book independently, anchoring each at the middle of
-   its own range. Nothing relates one strike to the next. The fix is a maker
-   that quotes options off the underlying and the replicating portfolio, plus
-   vertical-spread relations in the arbitrageur — and it closes all three.
+1. ~~The option surface is internally inconsistent.~~ **Fixed**, and the
+   cause was not the one named here. See below.
 2. **Fees, auctions, halts and the scoring-rule venue are built and never run.**
    All tested, all defaulted off, so the live exchange exercises none of them.
 3. **No auth.** Every browser shares one account, so two tabs are one trader.
@@ -232,15 +225,111 @@ each item. Struck items link to what actually happened.
    is the only one. `test_a_large_order_moves_the_price` asserts this as it is,
    so the assertion fails on the day replenishment works.
 5. **Cancel rate is ~60%, not >90%.** Nothing requotes faster than 300ms.
-6. **A share and its future have no relation the arbitrageur knows.**
-   `SPIKE_EQ` pays four weekly instalments of 1,000 times the same rate that
-   `SPIKE_WR_FUT` pays 10,000 times once, so one should be worth 0.4 of the
-   other up to the value of getting collateral back early. Measured at three
-   minutes the share trades 2.2% above 0.4x the future -- but the share is 1.6%
-   above its own fair value and the future 0.5% below, so almost all of that
-   gap is two independent errors rather than a term premium. The relation is
-   not in `arbitrageur.py`, which skips anything that pays as it goes, so
-   nothing enforces it and nothing has measured it under controls.
+6. ~~A share and its future have no relation the arbitrageur knows.~~
+   **Fixed by listing the legs.** The 0.4x relation to the four-week future was
+   never an identity -- the four weekly rates are each battle-weighted, so they
+   do not average to the four-week rate, and they differ by 0.08%. Small, and
+   small is what makes it dangerous to trade as though it were exact. So the
+   four weekly futures are listed instead: `SPIKE_EQ` = `SPIKE_WR_W1` + ... +
+   `W4`, exactly, because both sides resolve the same metric over the same
+   windows under the same evidential bar. Settlement confirms it to the tick:
+   1,874 + 1,859 + 1,875 + 1,869 = 7,477. `CROW_EQ` deliberately has no legs,
+   so one share is arbitrage-linked and one is not.
+
+## The option surface, and the bug underneath it
+
+The symptom was a riskless trade sitting in the book: `SPIKE_C4700` marking at
+72.7 while `SPIKE_C4600` marked at 59.1. A call struck higher cannot be worth
+more than one struck lower, because the lower strike pays whatever the higher
+one pays and sometimes more. Put-call parity was out by 35 ticks at the same
+moment.
+
+The diagnosis written here was that the market maker priced each book
+independently. That was true and it was the smaller half.
+
+**The larger half was that every agent held a separate view of the same Brawler
+for every contract written on it.** `FundamentalTrader` drew its estimate, and
+its Monte Carlo sample, per *symbol*. So `SPIKE_C4600` and `SPIKE_C4650` were
+valued from independent draws of the same posterior, the sampling error between
+them was independent, and the ladder the agent believed in was not monotone.
+Measured before the fix: `fund-vague` valued the 4,650 call at **119.03** and
+the strictly more valuable 4,600 call at **36.67** -- and then traded on the
+difference, which was entirely its own Monte Carlo error. `BayesianFundamental`
+had the same shape of bug one level deeper: it drew a fresh posterior per
+symbol, so it observed a different sample of battles for each contract on one
+Brawler.
+
+Both now hold one view per *underlying*, keyed by what the contract is written
+on. Common random numbers make ``max(F - K, 0)`` decreasing in ``K`` draw by
+draw, so monotonicity holds pathwise rather than on average.
+
+The maker was the other half. `SurfaceMarketMaker` quotes an entire chain from
+a **single distribution** of where the underlying settles, which is what real
+desks do and which makes the ladder arbitrage-free by construction: a set of
+call prices at one maturity is free of static arbitrage exactly when it is
+decreasing and convex in strike with slope in [-1, 0] (Davis and Hobson 2007;
+Carr and Madan 2005), and all three are automatic for prices of the form
+``E[(F - K)+]`` under any fixed law. The put is *defined* as the call's parity
+partner, so parity is exact rather than close.
+
+Two things it does not do, because they would make it price the answer:
+
+- the distribution is centred on the **market's** live mid for the underlying,
+  never on the settlement value. If the future is mispriced the whole chain is
+  consistently mispriced, which is the point -- consistency is what was broken,
+  not accuracy.
+- its width is **estimated from the tape**, an exponentially-weighted variance
+  of prints around its anchor, converted to a Beta concentration by matching
+  moments. A constant there would have been a number chosen to make option
+  prices look plausible, and it would have frozen the one quantity an option
+  market is about.
+
+Inventory skews the *underlying*, in units of that estimated dispersion, and
+the whole ladder reprices from the shifted forward. Skewing each strike by a
+fraction of its own settlement range -- what the plain maker does, and what this
+class first copied -- was measured at a 165-point shift from 66 lots of net
+delta, which sent every call in the chain to zero and tripled the puts.
+
+### Measured, over six minutes of live market, seed 7
+
+| | plain maker | plain + arb | surface maker | surface + arb |
+|---|---|---|---|---|
+| every strike two-sided | 71% | 74% | **100%** | **100%** |
+| `SPIKE_C4700` two-sided | 0% | 0% | **100%** | **100%** |
+| monotonicity breached | 0/29 | 0/31 | 0/68 | 0/68 |
+| vertical bound breached | 0/29 | 0/31 | 0/68 | 0/68 |
+| butterfly breached | n/a | n/a | 0/34 | 0/34 |
+| parity gap, mean | n/a | n/a | 14.88 | **8.64** |
+
+The plain maker's zeros are not a pass. `SPIKE_C4700` never has two sides at
+all under it, so a third of the chain has no price, there is no butterfly to
+check and parity cannot be measured -- its consistency is three quotable books
+out of five. Each check is scored only when the books it needs are two-sided,
+which is why the denominators differ.
+
+The arbitrageur now also enforces **bands** rather than only identities, since
+the conditions that make a chain consistent are inequalities. `Relation` gained
+a `[lower, upper]` interval and an identity is the zero-width case, so nothing
+that existed before changed. It derives vertical spreads, butterflies, and the
+strip relation below.
+
+**A latent bug fell out of it.** The arbitrageur keyed contracts by their
+underlying alone, so two contracts differing only in the *window* they measure
+were indistinguishable and the last one listed silently won the lookup. Nothing
+was mispriced by it -- no composite referenced a weekly contract at the time --
+but listing weekly futures is exactly what would have made it start forming
+identities between two things that are not the same thing.
+
+### What is still missing, and it is not consistency
+
+The chain is consistent and carries very little time value, because the
+underlying barely moves: realised dispersion of `SPIKE_WR_FUT` over a ten-minute
+session is **14.6** on a price near 4,670. The market has an information
+*stock*, not an information *flow* -- every agent receives its whole sample at
+t=0 and the price converges within seconds, so there is nothing left to arrive.
+Releasing each agent's evidence progressively would make the underlying
+genuinely diffuse and give options something to be about. That, not the
+surface, is the next thing worth building for them.
 
 ## Asset classes
 

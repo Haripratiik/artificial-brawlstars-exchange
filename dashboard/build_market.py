@@ -24,6 +24,7 @@ from arena.agents.flow import FlowTrader
 from arena.agents.fundamental import FundamentalTrader
 from arena.agents.market_maker import MarketMaker
 from arena.agents.noise import NoiseTrader
+from arena.agents.surface import SurfaceMarketMaker
 from arena.contracts.payoff import Binary, Call, Linear, Put
 from arena.contracts.spec import (
     ContractSpec,
@@ -157,6 +158,14 @@ def instruments() -> list[Instrument]:
             "CROW_GT47",
             _spec("CROW_GT47", _wr("CROW"), Binary(">", 0.47, payout=1.0), tick="0.01"),
         ),
+        # Listed so the index has all three of its legs. Without it the
+        # arbitrageur declines to form the index relation at all -- correctly,
+        # since a basket priced against two of its three components is a bet on
+        # the third -- so ASSASSIN_IDX floated free of the things it is defined
+        # as. One contract closes that.
+        Instrument(
+            "PIPER_WR_FUT", _spec("PIPER_WR_FUT", _wr("PIPER"), Linear(10_000.0))
+        ),
         Instrument(
             "SPIKE_CROW",
             _spec("SPIKE_CROW", Difference(_wr("SPIKE"), _wr("CROW")), Linear(10_000.0)),
@@ -192,6 +201,37 @@ def instruments() -> list[Instrument]:
                 ),
             )
             for strike in (4_700, 4_750)
+        ],
+        # ── the weekly legs a share is made of ───────────────────────────
+        #
+        # One future per delivery week, settling at 1,000 times that week's
+        # adjusted win rate -- which is precisely what SPIKE_EQ pays at the end
+        # of that week. So the share is the sum of these four, exactly, and not
+        # approximately: same metric, same window, same evidential bar, so the
+        # two sides of that equation resolve from the same numbers.
+        #
+        # Listed for that reason. Before them the only relation available was
+        # "the share is worth 0.4 times the four-week future", which is *not*
+        # an identity: the four weekly rates are each battle-weighted, so they
+        # do not average to the four-week rate. Measured, the two differ by
+        # 0.08% -- small, and small is exactly what makes it dangerous to trade
+        # as though it were exact. With the weekly legs listed there is a real
+        # identity to enforce, and the arbitrageur enforces identities only.
+        #
+        # CROW deliberately has no legs, so one share is arbitrage-linked and
+        # one is not. That is a control, not an oversight.
+        *[
+            Instrument(
+                f"SPIKE_WR_W{n + 1}",
+                _spec(
+                    f"SPIKE_WR_W{n + 1}",
+                    _wr("SPIKE"),
+                    Linear(1_000.0),
+                    tick="0.25",
+                    window=week,
+                ),
+            )
+            for n, week in enumerate(DELIVERY_WEEKS)
         ],
         # ── shares ───────────────────────────────────────────────────────
         #
@@ -338,6 +378,7 @@ def build(
     fees: FeeSchedule = FREE,
     price_band: float | None = None,
     human_cash: int = HUMAN_STARTING_CASH,
+    surface: bool = True,
 ) -> LiveMarket:
     listed = instruments()
     by_symbol = {i.symbol: i for i in listed}
@@ -387,7 +428,12 @@ def build(
     venue_agent = VenueAgent(VENUE_ID, venue)
     human = HumanAgent(VENUE_ID, by_symbol)
 
-    maker = MarketMaker(
+    # Options priced off one distribution on the underlying rather than each
+    # book on its own. `surface=False` restores the plain maker, which is what
+    # the before-and-after in docs/GAPS.md was measured against -- the comparison
+    # has to stay runnable or the numbers in it are just claims.
+    maker_class = SurfaceMarketMaker if surface else MarketMaker
+    maker = maker_class(
         maker_id,
         VENUE_ID,
         by_symbol,

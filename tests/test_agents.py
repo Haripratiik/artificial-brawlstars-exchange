@@ -16,13 +16,11 @@ forever. The agent believed it held +7 while the venue held 0.
 
 from __future__ import annotations
 
-from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
 from arena.agents.fundamental import FundamentalTrader
-from arena.determinism import canonical_json
 from arena.market.instrument import Instrument
 from arena.agents.market_maker import MarketMaker
 from arena.agents.noise import NoiseTrader
@@ -459,8 +457,11 @@ def test_the_maker_respects_its_position_limit(market):
 
 
 def test_agent_populations_are_present(market):
+    # By what an agent *is*, not by what it is called. The class-name version
+    # of this broke the day a specialised maker was wired in, which is a fact
+    # about the test rather than about the population.
+    assert sum(isinstance(a, MarketMaker) for a in market.agents) == 1
     kinds = [type(a).__name__ for a in market.agents]
-    assert kinds.count("MarketMaker") == 1
     assert kinds.count("FundamentalTrader") == 2
     assert kinds.count("NoiseTrader") >= 10
 
@@ -496,30 +497,25 @@ def test_relations_are_read_out_of_the_listed_contracts():
 
 
 def test_a_relation_missing_a_leg_is_not_formed():
-    """The index has no relation, because PIPER has no listed future.
+    """Take a leg away and the index relation goes; put it back and it returns.
 
-    A relation traded against a proxy is a bet, not an arbitrage. The agent has
-    to decline it -- and then form it the moment the leg is listed, with no
+    A relation traded against a proxy is a bet, not an arbitrage, so the agent
+    has to decline it -- and then form it the moment the leg is listed, with no
     code change, or the derivation is not really reading the contracts.
+
+    Written by *removing* a listed leg rather than by relying on one being
+    absent. The first version leaned on PIPER having no future, which was true
+    until PIPER was listed precisely so the index would have all three of them;
+    a test whose premise is an accident of the listing stops testing anything
+    the day the listing improves.
     """
     from arena.agents.arbitrageur import derive_relations
 
     listed = {i.symbol: i for i in build_instruments()}
     assert "ASSASSIN_IDX" in listed
+    piper = listed.pop("PIPER_WR_FUT")
     assert not any(r.target == "ASSASSIN_IDX" for r in derive_relations(listed))
 
-    # A PIPER future is the SPIKE future with a different underlying -- built by
-    # replacement rather than by hand, so the test cannot drift from the real
-    # listing conventions.
-    template = listed["SPIKE_WR_FUT"].spec
-    component = next(
-        leg for leg, _ in listed["ASSASSIN_IDX"].spec.underlying.legs
-        if "PIPER" in canonical_json(leg.to_dict())
-    )
-    piper = Instrument(
-        "PIPER_WR_FUT",
-        replace(template, contract_id="PIPER_WR_FUT", underlying=component),
-    )
     listed[piper.symbol] = piper
     index = next(r for r in derive_relations(listed) if r.target == "ASSASSIN_IDX")
     assert dict(index.legs) == {

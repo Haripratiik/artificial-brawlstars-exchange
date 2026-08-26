@@ -693,7 +693,8 @@ export function research(store) {
   const roster = (agents || [])
     .map((a) => `<tr>
       <td style="text-align:left">${esc(a.id)}</td>
-      <td class="faint" style="text-align:left">${esc(a.kind)}</td>
+      <td style="text-align:left">${esc(a.role ?? a.kind)}
+        <span class="faint mono" style="margin-left:6px">${esc(a.kind)}</span></td>
       <td>${count(a.fills)}</td>
       <td class="${a.rejects ? 'down' : 'faint'}">${count(a.rejects)}</td>
       <td>${a.equity == null ? '—' : money(a.equity)}</td>

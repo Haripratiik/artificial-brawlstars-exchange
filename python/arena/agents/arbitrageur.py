@@ -11,9 +11,21 @@ The relations it enforces are mechanical identities of the contracts, not
 statistical estimates, which is what makes this agent connective tissue rather
 than a strategy:
 
-    parity      C - P = F - K          exact at settlement, proven in tests
-    spread      S = LEG_A - LEG_B      the spread's own definition
-    index       I = sum(w_i * LEG_i)   the basket's own weights
+    parity      C - P = F - K            exact at settlement, proven in tests
+    spread      S = LEG_A - LEG_B        the spread's own definition
+    index       I = sum(w_i * LEG_i)     the basket's own weights
+    strip       SHARE = sum(WEEK_i)      a share is its own payment schedule
+    vertical    0 <= C(K1) - C(K2) <= K2 - K1     for K1 < K2
+    butterfly   C(K2) <= w1*C(K1) + w3*C(K3)      for K1 < K2 < K3
+
+The last two are *bounds* rather than equalities, and they are what makes an
+option chain internally consistent. A set of call prices is free of static
+arbitrage exactly when it is decreasing and convex in strike with slope in
+[-1, 0] (Davis and Hobson 2007; Carr and Madan 2005), and those two families
+are that condition written as portfolios. A violated bound is still a riskless
+trade -- buy the cheap side of a vertical and the payoff can never be negative --
+so the same execution path handles both; only the definition of "mispriced"
+changes, from "not zero" to "outside the band".
 
 Relations are *derived from the listed instruments* at construction -- from each
 contract's underlying algebra and payoff -- rather than configured by hand, so
@@ -50,7 +62,14 @@ __all__ = ["Arbitrageur", "Relation", "derive_relations"]
 
 @dataclass(frozen=True, slots=True)
 class Relation:
-    """A linear pricing identity: price(target) = sum(coef * price(leg)) + const.
+    """A linear pricing band: ``price(target) - sum(coef * leg) - const`` in
+    ``[lower, upper]``.
+
+    An identity is the special case where the band has zero width, which is
+    every relation this agent started with. The general form exists because the
+    conditions that make an option chain consistent are inequalities: a call
+    must cost more than the call above it, but not more than the difference in
+    their strikes, and neither statement is an equation.
 
     Everything in *price* units (not ticks), because the legs of one relation
     can trade on different tick grids.
@@ -60,6 +79,21 @@ class Relation:
     target: str
     legs: tuple[tuple[str, float], ...]
     constant: float = 0.0
+    lower: float = 0.0
+    upper: float = 0.0
+
+    def excess(self, target_price: float, leg_prices: dict[str, float]) -> float:
+        """How far outside the band this relation currently sits, signed.
+
+        Zero inside it. Positive means the target is too dear relative to the
+        package, negative too cheap -- the same convention an identity had, so
+        everything downstream is unchanged.
+        """
+        theoretical = self.constant
+        for symbol, coefficient in self.legs:
+            theoretical += coefficient * leg_prices[symbol]
+        raw = target_price - theoretical
+        return raw - min(max(raw, self.lower), self.upper)
 
     @property
     def symbols(self) -> tuple[str, ...]:
@@ -67,7 +101,26 @@ class Relation:
 
 
 def _underlying_key(instrument: Instrument) -> str:
-    return canonical_json(instrument.spec.underlying.to_dict())
+    """What a contract is written on, *and over what period*.
+
+    The window belongs in the key. Without it two contracts that differ only by
+    the week they measure are indistinguishable here, so the last one listed
+    silently wins the lookup and a relation gets formed against the wrong leg --
+    an identity between two things that are not the same thing, traded as
+    though it were free money. Nothing was mispriced by it yet, because no
+    spread or index referenced a weekly contract at the time; listing weekly
+    futures is precisely what would have made it start being wrong.
+    """
+    return _key(instrument.spec.underlying.to_dict(), instrument.spec.window.to_dict())
+
+
+def _key(underlying: dict, window: dict) -> str:
+    """One lookup key for "this thing, measured over this period".
+
+    Takes plain dictionaries because half the callers have an object and half
+    have the serialized shape of a leg they read out of a composite contract.
+    """
+    return canonical_json({"underlying": underlying, "window": window})
 
 
 def derive_relations(instruments: dict[str, Instrument]) -> list[Relation]:
@@ -102,10 +155,11 @@ def derive_relations(instruments: dict[str, Instrument]) -> list[Relation]:
         if not (isinstance(payoff, Linear) and payoff.offset == 0.0):
             continue
         shape = instrument.spec.underlying.to_dict()
+        window = instrument.spec.window.to_dict()
 
         if shape["kind"] == "difference":
-            left = futures.get(canonical_json(shape["left"]))
-            right = futures.get(canonical_json(shape["right"]))
+            left = futures.get(_key(shape["left"], window))
+            right = futures.get(_key(shape["right"], window))
             if left and right and left[1] == payoff.scale == right[1]:
                 relations.append(
                     Relation(
@@ -118,7 +172,7 @@ def derive_relations(instruments: dict[str, Instrument]) -> list[Relation]:
         elif shape["kind"] == "basket":
             legs: list[tuple[str, float]] = []
             for entry in shape["legs"]:
-                component = futures.get(canonical_json(entry["leg"]))
+                component = futures.get(_key(entry["leg"], window))
                 if component is None or component[1] != payoff.scale:
                     legs = []
                     break
@@ -152,6 +206,110 @@ def derive_relations(instruments: dict[str, Instrument]) -> list[Relation]:
                 constant=-strike,
             )
         )
+
+    # -- strips: a share is the sum of the weeks it pays ---------------------
+    #
+    # Exact, not approximate. The share's payment for a week and the future on
+    # that week resolve the same metric over the same window under the same
+    # evidential bar, so they are the same number. Formed only when *every*
+    # week is listed -- a strip missing a leg is a directional bet on the leg
+    # that is missing.
+    for symbol, instrument in sorted(instruments.items()):
+        schedule = instrument.spec.distribution
+        payoff = instrument.spec.payoff
+        if schedule is None or not isinstance(schedule.payoff, Linear):
+            continue
+        if not isinstance(payoff, Linear) or payoff.offset != 0.0:
+            continue
+        if schedule.payoff.offset != 0.0:
+            continue
+
+        legs: list[tuple[str, float]] = []
+        for window in schedule.windows:
+            leg = futures.get(
+                _key(instrument.spec.underlying.to_dict(), window.to_dict())
+            )
+            if leg is None or leg[1] != schedule.payoff.scale:
+                legs = []
+                break
+            legs.append((leg[0], 1.0))
+        if not legs:
+            continue
+        # Anything left at expiry is one more leg, on the contract's own window.
+        if payoff.scale != 0.0:
+            terminal = futures.get(
+                _key(
+                    instrument.spec.underlying.to_dict(),
+                    instrument.spec.window.to_dict(),
+                )
+            )
+            if terminal is None or terminal[1] != payoff.scale:
+                continue
+            legs.append((terminal[0], 1.0))
+        relations.append(
+            Relation(name=f"strip:{symbol}", target=symbol, legs=tuple(legs))
+        )
+
+    # -- the option chain: decreasing and convex in strike -------------------
+    #
+    # These two families are the whole of static arbitrage freedom for calls at
+    # one maturity. They are inequalities, so they are the reason Relation has
+    # a band: a call may be dearer than the call above it by anything from
+    # nothing up to the gap in their strikes, and both ends of that are
+    # tradeable when breached.
+    chains: dict[tuple[str, float, str], list[tuple[float, str]]] = {}
+    for symbol, instrument in sorted(instruments.items()):
+        payoff = instrument.spec.payoff
+        if isinstance(payoff, Call):
+            kind = "call"
+        elif isinstance(payoff, Put):
+            kind = "put"
+        else:
+            continue
+        chains.setdefault(
+            (_underlying_key(instrument), payoff.scale, kind), []
+        ).append((payoff.strike, symbol))
+
+    for (_key_, _scale, kind), rungs in sorted(chains.items()):
+        rungs.sort()
+        if len(rungs) < 2:
+            continue
+
+        # Monotone, and by no more than the strikes differ. For a call the
+        # lower strike is the dearer one; for a put it is the higher.
+        for (low_strike, low_symbol), (high_strike, high_symbol) in zip(rungs, rungs[1:]):
+            width = high_strike - low_strike
+            dear, cheap = (
+                (low_symbol, high_symbol) if kind == "call" else (high_symbol, low_symbol)
+            )
+            relations.append(
+                Relation(
+                    name=f"vertical:{dear}/{cheap}",
+                    target=dear,
+                    legs=((cheap, 1.0),),
+                    lower=0.0,
+                    upper=width,
+                )
+            )
+
+        # Convex: the middle strike cannot cost more than the straight line
+        # between its neighbours. Weighted for uneven spacing, so a ladder does
+        # not have to be evenly struck to be checked.
+        for first, second, third in zip(rungs, rungs[1:], rungs[2:]):
+            (k1, s1), (k2, s2), (k3, s3) = first, second, third
+            span = k3 - k1
+            if span <= 0:
+                continue
+            w1, w3 = (k3 - k2) / span, (k2 - k1) / span
+            relations.append(
+                Relation(
+                    name=f"butterfly:{s2}",
+                    target=s2,
+                    legs=((s1, w1), (s3, w3)),
+                    lower=float("-inf"),
+                    upper=0.0,
+                )
+            )
 
     return relations
 
@@ -247,19 +405,20 @@ class Arbitrageur(TradingAgent):
         if target_mid is None or target_cost is None:
             return
 
-        theoretical = relation.constant
         cost = target_cost
+        leg_prices: dict[str, float] = {}
         for symbol, coefficient in relation.legs:
             leg_mid = self._mid_price(symbol)
             leg_cost = self._half_spread(symbol)
             if leg_mid is None or leg_cost is None:
                 return
-            theoretical += coefficient * leg_mid
+            leg_prices[symbol] = leg_mid
             # Taking a leg costs its half-spread regardless of the weight's
             # sign; the |coefficient| scales how many lots that cost is paid on.
             cost += abs(coefficient) * leg_cost
 
-        gap = target_mid - theoretical
+        # How far outside the band, which for an identity is simply the gap.
+        gap = relation.excess(target_mid, leg_prices)
         held = self._packages.get(relation.name, 0)
 
         if abs(gap) <= cost * self.edge_multiple:

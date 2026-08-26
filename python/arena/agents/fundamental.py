@@ -35,6 +35,23 @@ from arena.sim.time import Duration, millis
 __all__ = ["FundamentalTrader"]
 
 
+def underlying_key(instrument) -> str:
+    """What a contract is written on, ignoring how it pays.
+
+    Every contract on the same thing has to share one belief about that thing.
+    Keying a view by symbol instead gives an agent three different opinions
+    about SPIKE's win rate at once -- one per strike -- and the surface it then
+    quotes is not the surface of any distribution at all. It was measured:
+    `fund-vague` valued the 4,650 call at 119 while valuing the 4,600 call, a
+    strictly more valuable contract, at 37. That is not a small error, and it
+    is not an error of judgement; it is three independent draws being treated
+    as one opinion.
+    """
+    from arena.determinism import canonical_json
+
+    return canonical_json(instrument.spec.underlying.to_dict())
+
+
 class FundamentalTrader(TradingAgent):
     """Trades the gap between price and its own estimate of settlement."""
 
@@ -62,6 +79,22 @@ class FundamentalTrader(TradingAgent):
         self.patience = patience
         self._estimate: dict[str, float] = {}
         self._noise_scale: dict[str, float] = {}
+        # One view per underlying, shared by every contract written on it.
+        self._views: dict[str, tuple[float, list[float]]] = {}
+
+    def _draws(self, ctx, instrument, level: float, sigma: float):
+        """This agent's view of one underlying: a centre, and a sample around it.
+
+        Cached by what the contract is written on, so every contract on the
+        same thing is valued from the same numbers.
+        """
+        key = underlying_key(instrument)
+        cached = self._views.get(key)
+        if cached is None:
+            centre = level + ctx.rng.gauss(0.0, sigma)
+            cached = (centre, [centre + ctx.rng.gauss(0.0, sigma) for _ in range(self.draws)])
+            self._views[key] = cached
+        return cached
 
     def _view(self, ctx: SimulationContext, symbol: str) -> tuple[float, float]:
         """This agent's estimate of settlement, and its own uncertainty.
@@ -81,9 +114,12 @@ class FundamentalTrader(TradingAgent):
         the payoff, which also gives the agent the right sensitivity for free:
         it reacts to a rate change in proportion to the contract's delta.
 
-        Drawn once per symbol and then held. An agent redrawing its view every
-        wakeup would be a noise trader with extra steps -- its "information"
-        would average to nothing and exert no directional pull on price.
+        Drawn once per *underlying* and then held, and both halves of that
+        matter. Once, because an agent redrawing its view every wakeup would be
+        a noise trader with extra steps -- its "information" would average to
+        nothing and exert no directional pull on price. Per underlying, because
+        an agent with a different view of SPIKE for every contract written on
+        SPIKE does not have a view of SPIKE.
         """
         if symbol not in self._estimate:
             instrument = self.instruments[symbol]
@@ -97,7 +133,7 @@ class FundamentalTrader(TradingAgent):
             # A sharper agent has a tighter posterior about the same quantity.
             sigma = self.metric_sigma / self.precision
             payoff = instrument.spec.payoff
-            centre = level + ctx.rng.gauss(0.0, sigma)
+            centre, draws = self._draws(ctx, instrument, level, sigma)
 
             # **E[payoff(level)], not payoff(E[level]).** For a linear future
             # the two coincide, so the distinction is invisible until an option
@@ -111,7 +147,15 @@ class FundamentalTrader(TradingAgent):
             # for a kinked payoff, a step payoff and a linear one without any
             # of them being special-cased -- and because a closed form would
             # need a volatility model this agent has no business owning.
-            draws = [centre + ctx.rng.gauss(0.0, sigma) for _ in range(self.draws)]
+            #
+            # The *same* draws for every contract on this underlying. Fresh
+            # draws per contract is the ordinary way to write this and it is
+            # wrong here: the Monte Carlo error is then independent across
+            # strikes, so the agent's own option ladder is neither monotone nor
+            # convex and it trades on the difference. Common random numbers
+            # make every valuation a function of one sample path, and
+            # monotonicity in strike then holds draw by draw rather than on
+            # average.
             # The whole claim, not only the settlement: a contract that pays
             # as it goes is worth the stream as well as the end, and an
             # agent valuing only the end would price a share at whatever

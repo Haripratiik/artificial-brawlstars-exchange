@@ -46,6 +46,7 @@ from __future__ import annotations
 import math
 
 from arena.agents.base import TradingAgent
+from arena.agents.fundamental import underlying_key
 from arena.contracts.payoff import Binary, Linear
 from arena.exchange.types import AgentId, Price, Side, TimeInForce
 from arena.market.instrument import Instrument
@@ -179,22 +180,50 @@ class BayesianFundamental(TradingAgent):
         self.base_size = base_size
         self.patience = patience
         self.draws = max(16, draws)
+        # Keyed by what the contract is written on, not by symbol. An agent
+        # holding a different posterior for SPIKE per contract on SPIKE does
+        # not have a posterior for SPIKE, and the ladder it quotes off those
+        # is not the ladder of any distribution.
         self._posterior: dict[str, tuple[float, float]] = {}
+        self._levels: dict[str, list[float]] = {}
         self._value: dict[str, float] = {}
         self._dispersion: dict[str, float] = {}
 
     # -- belief ------------------------------------------------------------
 
     def posterior(self, ctx: SimulationContext, symbol: str) -> tuple[float, float] | None:
-        """This agent's Beta posterior over the metric, drawn once and held."""
-        if symbol not in self._posterior:
+        """This agent's Beta posterior over the metric, drawn once and held.
+
+        Once per *underlying*: the battles it observed are battles involving a
+        Brawler, not battles involving a contract, so every contract written on
+        that Brawler is priced off the same sample.
+        """
+        key = underlying_key(self.instruments[symbol])
+        if key not in self._posterior:
             level = self.truth_level.get(symbol)
             if level is None:
                 return None
-            self._posterior[symbol] = posterior_for(
+            self._posterior[key] = posterior_for(
                 level, self.battles, self.prior_mean, self.prior_strength, ctx.rng
             )
-        return self._posterior[symbol]
+        return self._posterior[key]
+
+    def levels(self, ctx: SimulationContext, symbol: str, a: float, b: float) -> list[float]:
+        """A sample from the posterior, shared across every contract on it.
+
+        Common random numbers, and the reason is not efficiency. Drawing fresh
+        each time gives each strike its own Monte Carlo error, so the agent's
+        own option ladder is neither monotone nor convex -- and then it trades
+        on the difference. With one sample path per underlying, ``max(F - K, 0)``
+        is decreasing in ``K`` draw by draw, so the average is too, and the
+        agent's surface is a real surface.
+        """
+        key = underlying_key(self.instruments[symbol])
+        drawn = self._levels.get(key)
+        if drawn is None:
+            drawn = [ctx.rng.betavariate(a, b) for _ in range(self.draws)]
+            self._levels[key] = drawn
+        return drawn
 
     def posterior_mean(self, ctx: SimulationContext, symbol: str) -> float | None:
         posterior = self.posterior(ctx, symbol)
@@ -257,9 +286,7 @@ class BayesianFundamental(TradingAgent):
             # which is what claim_value adds up -- valuing only the payoff
             # would price a pure strip at nothing.
             claim = instrument.spec.claim_value
-            samples = [
-                claim(ctx.rng.betavariate(a, b)) for _ in range(self.draws)
-            ]
+            samples = [claim(level) for level in self.levels(ctx, symbol, a, b)]
             value = sum(samples) / len(samples)
             spread = math.sqrt(
                 sum((s - value) ** 2 for s in samples) / len(samples)

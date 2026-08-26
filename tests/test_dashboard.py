@@ -106,8 +106,12 @@ def test_the_session_endpoint_describes_the_venue(client):
 def test_the_agent_roster_is_published(client):
     """Who else is in the market is part of the market's information."""
     agents = client.get("/api/agents").json()["agents"]
-    kinds = {a["kind"] for a in agents}
-    assert "MarketMaker" in kinds
+    # By role, not by class name. Asserting the class was wrong twice over: it
+    # broke the moment a specialised maker was wired in, and it was checking
+    # an implementation detail to answer a question about the market.
+    roles = {a["role"] for a in agents}
+    assert "market maker" in roles
+    assert {"informed", "uninformed"} <= roles
     assert any(a["fills"] > 0 for a in agents), "nobody traded"
 
 
