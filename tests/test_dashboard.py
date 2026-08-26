@@ -126,9 +126,24 @@ def test_the_book_endpoint_bounds_the_level_count(client):
 
 
 def test_history_accumulates(client):
+    """Waits for the series rather than assuming a sample count.
+
+    An earlier version asserted a bare `> 5` and failed on exactly 5 under a
+    full-suite run: the recorder samples on the server's own tick, so how many
+    points exist by any given moment depends on how loaded the machine is.
+    Timing-dependent thresholds belong in a bounded wait, not an assertion.
+    """
+    deadline = time.monotonic() + 20
     history = client.get(f"/api/history/{SYMBOL}").json()
-    assert len(history["t"]) > 5
+    while len(history["t"]) < 12 and time.monotonic() < deadline:
+        time.sleep(0.4)
+        history = client.get(f"/api/history/{SYMBOL}").json()
+
+    assert len(history["t"]) >= 12, "the recorder never filled a series"
     assert len(history["t"]) == len(history["mid"])
+    # Simulated time only moves forward, so a chart drawn from this cannot
+    # double back on itself.
+    assert history["t"] == sorted(history["t"])
 
 
 def test_diagnostics_use_the_research_estimators(client):
