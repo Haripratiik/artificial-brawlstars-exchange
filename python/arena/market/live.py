@@ -305,5 +305,8 @@ class LiveMarket:
                 for oid, sym in sorted(self.human.live_orders.items())
             ],
             "log": self.human.log[-12:][::-1],
+            # Who actually took the other side of your orders. A simulated
+            # exchange should be able to answer that with names.
+            "counterparties": self.venue.counterparties_for(HUMAN_ID, limit=25),
             "conservation": str(self.venue.conservation_check()),
         }

@@ -29,6 +29,7 @@ from arena.agents.noise import NoiseTrader
 from arena.exchange.events import Submit
 from arena.exchange.types import AgentId, OrderType, Quantity, Side, TimeInForce
 from arena.market.live import HUMAN_ID
+from arena.portfolio.money import from_money
 from arena.market.venue import SymbolCommand
 from arena.sim.kernel import Kernel
 from arena.sim.latency import PairwiseLatency
@@ -204,7 +205,11 @@ def test_a_large_order_moves_the_price():
     fundamental agents push against it. Temporary impact and permanent impact
     are different things, and a market that shows neither is not a market.
     """
-    m = build(seed=7)
+    # Funded explicitly. A person's default account is deliberately small
+    # enough to read a profit against, and this test is about what a *large*
+    # order does to a book -- so it asks for the capital it needs rather than
+    # inheriting whatever the product happens to hand a new user.
+    m = build(seed=7, human_cash=40_000_000)
     m.kernel.start()
     m.kernel.advance(until=seconds(60))
 
@@ -244,8 +249,13 @@ def test_a_market_order_is_collateralised_against_the_book_not_the_range():
     contract quoted near 4,700 -- rejects orders that could never have cost
     anything like that much, for a price they were structurally incapable of
     paying. The symptom was a large order silently vanishing.
+
+    Funded explicitly: the point is that collateral is measured against the
+    *book*, so the account has to be able to cover what the book actually
+    holds. Inheriting a deliberately small default account would make this
+    test pass or fail for the wrong reason.
     """
-    m = build(seed=7)
+    m = build(seed=7, human_cash=40_000_000)
     m.kernel.start()
     m.kernel.advance(until=seconds(60))
 
@@ -508,3 +518,72 @@ def test_the_arbitrageur_sizes_to_the_liquidity_it_can_see(arb_market):
             book = arb.books[symbol]
             resting = book.ask_size if side is Side.BUY else book.bid_size
             assert arb._takeable(symbol, side) <= max(0, resting)
+
+
+# --------------------------------------------------------------------------
+# You can see who took the other side
+# --------------------------------------------------------------------------
+
+
+def test_your_counterparty_is_named_and_is_one_of_the_bots():
+    """"Is anything actually on the other side of this?" deserves a real answer.
+
+    A roster of agents does not answer it; naming the participant on the fill
+    does. The population here is a market maker, two fundamental traders and
+    fourteen noise traders, and a person's order has to end up against one of
+    them rather than against nothing.
+    """
+    market = build(seed=7, human_cash=250_000)
+    market.start()
+    market.kernel.advance(until=seconds(45))
+    market.submit(SYMBOL, "buy", 12, None)
+    market.kernel.advance(until=seconds(50))
+
+    fills = market.venue.counterparties_for(HUMAN_ID)
+    assert fills, "the order never traded against anyone"
+
+    population = {str(a.agent_id) for a in market.agents}
+    for fill in fills:
+        assert fill["counterparty"] in population, fill["counterparty"]
+        assert fill["counterparty"] != str(HUMAN_ID), "you cannot fill yourself"
+        assert fill["symbol"] == SYMBOL
+        assert fill["quantity"] > 0
+
+
+def test_your_fills_survive_the_bots_flooding_the_tape():
+    """The regression that made the feature useless without failing anything.
+
+    The first version kept one rolling window of *every* fill on the venue. The
+    bots print thousands a minute, so a person's single trade was evicted from
+    it within seconds -- the panel was empty in exactly the situation it existed
+    for, and nothing anywhere reported a problem. Logs are per participant now.
+    """
+    market = build(seed=7, human_cash=250_000)
+    market.start()
+    market.kernel.advance(until=seconds(45))
+    market.submit(SYMBOL, "buy", 12, None)
+    market.kernel.advance(until=seconds(50))
+
+    immediately = market.venue.counterparties_for(HUMAN_ID)
+    assert immediately
+
+    # Two more minutes of the population trading among themselves.
+    market.kernel.advance(until=seconds(180))
+    assert market.venue.counterparties_for(HUMAN_ID) == immediately
+
+
+def test_a_person_starts_with_an_account_they_can_read():
+    """A gain of a hundred against forty million teaches nothing.
+
+    The bots keep a large balance because a maker quoting seven books at once
+    genuinely needs one; the person does not, and their opening balance is
+    deliberately a figure a profit is visible against.
+    """
+    from dashboard.build_market import HUMAN_STARTING_CASH
+
+    market = build(seed=7)
+    human = market.venue.account(HUMAN_ID)
+    maker = next(a for a in market.agents if isinstance(a, MarketMaker))
+
+    assert float(from_money(human.starting_cash)) == float(HUMAN_STARTING_CASH)
+    assert human.starting_cash < market.venue.account(maker.agent_id).starting_cash

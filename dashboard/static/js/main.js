@@ -14,7 +14,7 @@
 
 import { clock, count, impliedProbability, money, percent, price, signed, cls,
          walkBook } from './format.js';
-import { lab, markets, portfolio, research, trade } from './views.js';
+import { lab, markets, matches, portfolio, research, trade } from './views.js';
 import { countTo, press, revealAll } from './motion.js';
 
 const store = {
@@ -29,6 +29,7 @@ const store = {
   history: {},          // symbol -> array of mids, built client-side from ticks
   side: 'buy',
   generation: 0,
+  query: '',
   // Last mark seen per symbol, so a change can be shown as a change.
   marks: {},
 };
@@ -264,7 +265,10 @@ function renderWatchlist() {
   if (!s) return;
   const list = document.getElementById('watchlist');
 
-  list.innerHTML = Object.entries(s.books)
+  const shown = Object.entries(s.books).filter(([sym, book]) => matches(sym, book, store.query));
+  list.innerHTML = (shown.length
+    ? shown
+    : [])
     .map(([symbol, book]) => {
       const series = (store.history[symbol] || []).slice(-60);
       const first = series.find((v) => v != null);
@@ -290,7 +294,7 @@ function renderWatchlist() {
         <span class="spark" aria-hidden="true">${sparklineFor(series)}</span>
       </button>`;
     })
-    .join('');
+    .join('') || `<p class="empty">No market matches that.</p>`;
 }
 
 function sparklineFor(series) {
@@ -576,6 +580,14 @@ document.getElementById('nav').addEventListener('click', (event) => {
 document.getElementById('watchlist').addEventListener('click', (event) => {
   const row = event.target.closest('.watch');
   if (row) select(row.dataset.symbol);
+});
+
+const search = document.getElementById('q');
+search.addEventListener('input', () => {
+  store.query = search.value;
+  // Filtering changes what is on screen rather than what the numbers say, so
+  // it repaints immediately instead of waiting out the panel interval.
+  render({ force: true });
 });
 
 const speed = document.getElementById('speed');

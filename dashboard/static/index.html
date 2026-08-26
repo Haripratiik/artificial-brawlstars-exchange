@@ -69,7 +69,13 @@
         <button type="button" data-view="research">Research</button>
         <button type="button" data-view="lab">Lab</button>
       </div>
-      <h2 class="watch-head" id="watch-head">Instruments</h2>
+      <div class="search">
+        <label for="q" class="visually-hidden">Search markets</label>
+        <input id="q" type="search" placeholder="Search markets&hellip;"
+               autocomplete="off" spellcheck="false"
+               aria-describedby="watch-head">
+      </div>
+      <h2 class="watch-head" id="watch-head">Markets</h2>
       <div class="watchlist" id="watchlist" role="list" aria-labelledby="watch-head"></div>
     </nav>
 

@@ -175,6 +175,42 @@ check('a missing payoff has no probability', fmt.impliedProbability(1, null) ===
 check('percent formats', fmt.percent(0.425) === '42.5%', fmt.percent(0.425));
 check('percent of nothing is a dash', fmt.percent(null) === '—');
 
+/* ── search and counterparties ────────────────────────────────────────── */
+
+const futureBook = {
+  class: 'future',
+  contract: { payoff: { kind: 'linear', scale: 10000 },
+              underlying: { kind: 'single', metric: { subject: 'SPIKE' } } },
+};
+check('an empty query matches everything', views.matches('SPIKE_WR_FUT', futureBook, ''));
+check('a null query matches everything', views.matches('SPIKE_WR_FUT', futureBook, null));
+check('search finds a ticker', views.matches('SPIKE_WR_FUT', futureBook, 'spike'));
+check('search finds an asset class', views.matches('SPIKE_WR_FUT', futureBook, 'future'));
+check('search finds the subject', views.matches('XYZ', futureBook, 'spike'),
+      'searching only the ticker means you must already know the ticker');
+check('search rejects a miss', !views.matches('SPIKE_WR_FUT', futureBook, 'zzzz'));
+check('search requires every word',
+      !views.matches('SPIKE_WR_FUT', futureBook, 'spike zzzz'));
+check('search is case insensitive', views.matches('SPIKE_WR_FUT', futureBook, 'SpIkE'));
+
+// A query that matches nothing must explain itself rather than showing a void.
+const noMatch = views.markets({ ...store, query: 'zzzzz' });
+check('an empty result explains itself', noMatch.includes('Nothing matches'));
+check('an empty result echoes the query safely', noMatch.includes('zzzzz'));
+
+// Naming the other side of a fill is what answers "is anything really there?".
+const filled = views.trade({
+  ...store,
+  snapshot: { ...store.snapshot, counterparties: [
+    { symbol: 'SPIKE_WR_FUT', side: 'buy', quantity: 20, price: '4670.25', counterparty: 'mm-1' },
+  ] },
+});
+check('counterparties are named', filled.includes('mm-1'));
+check('the counterparty panel is present', filled.includes('Who Filled You'));
+
+const unfilled = views.trade({ ...store, snapshot: { ...store.snapshot, counterparties: [] } });
+check('an untraded market says so', unfilled.includes('other side'));
+
 /* ── information order ────────────────────────────────────────────────────
  *
  * Prediction-market design guidance is consistent that resolution rules belong

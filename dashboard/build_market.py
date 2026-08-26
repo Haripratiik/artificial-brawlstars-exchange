@@ -44,6 +44,11 @@ from arena.worlds.brawl.reference import load_reference
 
 REPO = Path(__file__).resolve().parents[1]
 REFERENCE_ID = "ref-2026S09-v1"
+
+# What a person opens the exchange with. Large enough to take a real
+# position in the futures, which settle around 4,700 a contract, and small
+# enough that a profit is a number you can see.
+HUMAN_STARTING_CASH = 250_000
 UTC = timezone.utc
 
 POLICY = DataPolicy(
@@ -160,6 +165,7 @@ def build(
     flow_traders: int = 0,
     fees: FeeSchedule = FREE,
     price_band: float | None = None,
+    human_cash: int = HUMAN_STARTING_CASH,
 ) -> LiveMarket:
     listed = instruments()
     by_symbol = {i.symbol: i for i in listed}
@@ -175,6 +181,11 @@ def build(
         starting_cash=40_000_000,
         fees=fees,
         price_band=price_band,
+        # A person starts with an account they can actually read. The bots keep
+        # the large balance because a market maker quoting seven books at once
+        # genuinely needs it -- but a trader watching a gain of a hundred against
+        # forty million learns nothing about what their trade did.
+        balances={HUMAN_ID: human_cash},
     )
     for instrument in listed:
         venue.list_instrument(instrument)

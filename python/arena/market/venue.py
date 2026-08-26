@@ -131,6 +131,7 @@ class Venue:
         clock: Callable[[], datetime] | None = None,
         fees: FeeSchedule = FREE,
         price_band: float | None = None,
+        balances: dict[AgentId, Decimal | int] | None = None,
     ) -> None:
         self.name = name
         # Supplies wall-clock or simulated calendar time, so expiries can be
@@ -142,6 +143,14 @@ class Venue:
         # Converted once, here. Everything downstream is integer minor units,
         # so the ledger conserves exactly rather than nearly.
         self.starting_cash = to_money(starting_cash)
+        # Per-agent opening balances, for participants who should not start with
+        # the same capital as everyone else. A market maker needs a balance
+        # sized to quote every book at once; a person needs one they can read a
+        # profit against. Forty million in an account makes a gain of a hundred
+        # invisible, which is a bad way to learn what your trade did.
+        self._balances: dict[AgentId, Money] = {
+            agent_id: to_money(amount) for agent_id, amount in (balances or {}).items()
+        }
         self._engines: dict[str, MatchingEngine] = {}
         self._accounts: dict[AgentId, Account] = {}
         self._phase: dict[str, SessionState] = {}
@@ -171,6 +180,16 @@ class Venue:
         # Every breach, for the record: a halt that leaves no trace is
         # indistinguishable from a market that simply went quiet.
         self.halts: list[dict[str, Any]] = []
+        # Who filled whom, per participant, most recent last. A trade event
+        # carries order ids rather than agents, so the pairing is resolved while
+        # both orders still resolve -- afterwards the ids are just numbers.
+        #
+        # Kept per agent rather than as one shared window, which was the first
+        # attempt and was quietly useless: the bots print thousands of fills a
+        # minute, so a person's single trade was evicted from a shared buffer
+        # within seconds of making it. The question being answered is "who
+        # filled *me*", and that has to survive everyone else's activity.
+        self.fills_log: dict[str, list[dict[str, Any]]] = {}
 
     # -- listing and accounts ---------------------------------------------
 
@@ -188,7 +207,10 @@ class Venue:
     def account(self, agent_id: AgentId) -> Account:
         account = self._accounts.get(agent_id)
         if account is None:
-            account = Account(agent_id=str(agent_id), starting_cash=self.starting_cash)
+            account = Account(
+                agent_id=str(agent_id),
+                starting_cash=self._balances.get(agent_id, self.starting_cash),
+            )
             self._accounts[agent_id] = account
         return account
 
@@ -440,6 +462,7 @@ class Venue:
                 )
             elif isinstance(event, Traded):
                 self._last[symbol] = event.price
+                self._record_counterparties(symbol, event)
                 self._check_price_band(symbol, event.price)
         if charged:
             # The exact counterpart of what the participants paid, so the two
@@ -449,6 +472,51 @@ class Venue:
             self.fees_collected = Money(int(self.fees_collected) + charged)
 
     # -- lifecycle ---------------------------------------------------------
+
+    def _record_counterparties(self, symbol: str, trade: Traded) -> None:
+        """Name both sides of a print, while the order ids still resolve."""
+        book = self._engines[symbol].book
+        buyer = book.get(trade.buy_order_id)
+        seller = book.get(trade.sell_order_id)
+        if buyer is None or seller is None:
+            return
+        entry = {
+            "symbol": symbol,
+            "quantity": int(trade.quantity),
+            "price": int(trade.price),
+            "buyer": str(buyer.agent_id),
+            "seller": str(seller.agent_id),
+            "aggressor": trade.aggressor_side.value,
+        }
+        for side in (entry["buyer"], entry["seller"]):
+            log = self.fills_log.setdefault(side, [])
+            log.append(entry)
+            if len(log) > 60:
+                del log[:-60]
+
+    def counterparties_for(self, agent_id: AgentId, limit: int = 40) -> list[dict[str, Any]]:
+        """The other side of this agent's recent fills, most recent first."""
+        who = str(agent_id)
+        out: list[dict[str, Any]] = []
+        for entry in reversed(self.fills_log.get(who, ())):
+            mine_is_buy = entry["buyer"] == who
+            instrument = self.registry.get(entry["symbol"])
+            out.append(
+                {
+                    "symbol": entry["symbol"],
+                    "side": "buy" if mine_is_buy else "sell",
+                    "quantity": entry["quantity"],
+                    "price": (
+                        str(instrument.from_ticks(Price(entry["price"])))
+                        if instrument is not None
+                        else str(entry["price"])
+                    ),
+                    "counterparty": entry["seller"] if mine_is_buy else entry["buyer"],
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
 
     # -- sessions ----------------------------------------------------------
 

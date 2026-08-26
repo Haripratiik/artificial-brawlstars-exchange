@@ -40,11 +40,13 @@ import {
 export function markets(store) {
   const { snapshot, instruments, history } = store;
   const books = snapshot?.books ?? {};
-  const symbols = Object.keys(books);
+  const symbols = Object.keys(books).filter((s) => matches(s, books[s], store.query));
   if (!symbols.length) {
     return `<div class="view"><div class="onboard">
-      <h2>Connecting to the exchange&hellip;</h2>
-      <p>Contracts here settle on measured Brawl Stars statistics.</p>
+      <h2>${store.query ? 'Nothing matches that' : 'Connecting to the exchange&hellip;'}</h2>
+      <p>${store.query
+        ? `No market matches &ldquo;${esc(store.query)}&rdquo;. Try a ticker, a Brawler, or a class like future or event.`
+        : 'Contracts here settle on measured Brawl Stars statistics.'}</p>
     </div></div>`;
   }
 
@@ -89,6 +91,26 @@ export function markets(store) {
     .join('');
 
   return `<div class="view"><div class="grid">${cards}</div></div>`;
+}
+
+/**
+ * Does this market match what someone typed?
+ *
+ * Searches the ticker, the asset class and the plain-language question, because
+ * those are the three things a person might have in mind. Matching only the
+ * ticker would mean you had to already know the ticker, which defeats the
+ * point of searching.
+ */
+export function matches(symbol, book, query) {
+  const needle = (query ?? '').trim().toLowerCase();
+  if (!needle) return true;
+  const haystack = [
+    symbol,
+    book?.class ?? '',
+    question(book?.contract),
+    subjectName(book?.contract?.underlying),
+  ].join(' ').toLowerCase();
+  return needle.split(/\s+/).every((word) => haystack.includes(word));
 }
 
 /** The contract as a question, which is how a person holds it in their head. */
@@ -156,6 +178,11 @@ export function trade(store) {
       <div class="panel">
         <h2>Recent Trades</h2>
         <div class="panel-body">${tape(snapshot, symbol)}</div>
+      </div>
+
+      <div class="panel">
+        <h2>Who Filled You <em>${esc(symbol)}</em></h2>
+        <div class="panel-body">${counterparties(snapshot, symbol)}</div>
       </div>
 
       <details class="panel drop">
@@ -372,6 +399,31 @@ function ticket(symbol, book, session) {
 
     <p class="note">Your order joins the same queue as every algorithm here and
       travels the same latency link. Nothing about it is privileged.</p>`;
+}
+
+/**
+ * The other side of your own fills, by name.
+ *
+ * "Is anything actually on the other side of this?" is a fair question to ask
+ * of a simulated exchange, and a roster of agents does not answer it. This
+ * does: every fill here names the participant that took it.
+ */
+function counterparties(snapshot, symbol) {
+  const rows = (snapshot.counterparties ?? []).filter((c) => c.symbol === symbol);
+  if (!rows.length) {
+    return `<div class="empty">Once you trade, the participants who took the
+      other side appear here by name.</div>`;
+  }
+  return `<table>
+    <thead><tr><th>Side</th><th>Qty</th><th>Price</th><th>Counterparty</th></tr></thead>
+    <tbody>${rows
+      .map((c) => `<tr>
+        <td class="${c.side === 'buy' ? 'up' : 'down'}" style="text-align:left">${esc(c.side)}</td>
+        <td>${count(c.quantity)}</td>
+        <td>${price(c.price)}</td>
+        <td class="mono">${esc(c.counterparty)}</td>
+      </tr>`)
+      .join('')}</tbody></table>`;
 }
 
 function positionCard(position) {
