@@ -175,6 +175,47 @@ check('a missing payoff has no probability', fmt.impliedProbability(1, null) ===
 check('percent formats', fmt.percent(0.425) === '42.5%', fmt.percent(0.425));
 check('percent of nothing is a dash', fmt.percent(null) === '—');
 
+/* ── information order ────────────────────────────────────────────────────
+ *
+ * Prediction-market design guidance is consistent that resolution rules belong
+ * above the pricing detail and that the order book belongs collapsed. This
+ * interface had both backwards, so the ordering is pinned rather than trusted
+ * to survive the next edit.
+ */
+
+const tradeHtml = views.trade(store);
+
+const atResolution = tradeHtml.indexOf('How This Resolves');
+const atBook = tradeHtml.indexOf('Order Book');
+const atChart = tradeHtml.indexOf('<svg');
+check('resolution rules are present', atResolution > -1);
+check('resolution comes before the order book', atResolution < atBook,
+      `resolution at ${atResolution}, book at ${atBook}`);
+check('resolution comes before the chart', atResolution < atChart,
+      `resolution at ${atResolution}, chart at ${atChart}`);
+
+// <details> without an `open` attribute is closed. Leading with a depth ladder
+// is an operator's view of the world.
+const bookBlock = tradeHtml.slice(tradeHtml.indexOf('<details'), atBook + 40);
+check('the order book is a disclosure', bookBlock.includes('<details'));
+check('the order book is closed by default', !/<details[^>]*open/.test(tradeHtml),
+      'a disclosure is open on first render');
+
+// The simple layer is visible; the technical layer is not.
+const beforeAdvanced = tradeHtml.slice(0, tradeHtml.indexOf('<details class="advanced"'));
+check('quantity is on the simple layer', beforeAdvanced.includes('t-qty'));
+check('the cost preview is on the simple layer', beforeAdvanced.includes('t-preview'));
+check('time in force is behind Advanced', !beforeAdvanced.includes('t-tif'),
+      'the ticket opens on time-in-force');
+check('limit price is behind Advanced', !beforeAdvanced.includes('t-px'));
+
+// Cards are for browsing, not for specifications.
+const cardHtml = views.markets(store);
+check('cards ask the question', /class="question"/.test(cardHtml));
+check('cards carry no spec digest', !cardHtml.includes('digest'));
+check('cards carry no tick size', !/tick size/i.test(cardHtml));
+check('cards show time remaining', /left|settles/.test(cardHtml));
+
 /* ── accessibility, as assertions ─────────────────────────────────────────
  *
  * These encode findings from an audit against the Web Interface Guidelines.

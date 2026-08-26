@@ -57,10 +57,15 @@
     </header>
 
     <nav aria-label="Sections">
+      <!-- Split deliberately. Rebuilding the market with a different seed is
+           not something a person trading on the exchange should be offered
+           beside "Portfolio"; it is an operator's control and is labelled as
+           one. -->
       <div class="nav-links" id="nav">
         <button type="button" data-view="markets" aria-current="page">Markets</button>
         <button type="button" data-view="trade">Trade</button>
         <button type="button" data-view="portfolio">Portfolio</button>
+        <p class="nav-group">Operator</p>
         <button type="button" data-view="research">Research</button>
         <button type="button" data-view="lab">Lab</button>
       </div>

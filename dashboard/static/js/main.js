@@ -15,6 +15,7 @@
 import { clock, count, impliedProbability, money, percent, price, signed, cls,
          walkBook } from './format.js';
 import { lab, markets, portfolio, research, trade } from './views.js';
+import { countTo, press, revealAll } from './motion.js';
 
 const store = {
   view: 'markets',
@@ -226,6 +227,12 @@ function renderMain() {
   }
   if (selector) main.querySelector(selector)?.focus({ preventScroll: true });
 
+  // Only when the screen itself changed. Staggering on every tick would be an
+  // animation nobody asked for, eight times a second.
+  if (!sameShape) {
+    revealAll(main.querySelectorAll('.card, .market-main > *, .figures > *'));
+  }
+
   bind();
 }
 
@@ -234,10 +241,14 @@ function renderHeader() {
   if (!s) return;
   document.getElementById('clock').textContent = clock(s.clock);
   document.getElementById('events').textContent = count(s.events);
-  document.getElementById('equity').textContent = money(s.account.equity);
+  // Money slides to its new figure. A number that moves says "this changed and
+  // by roughly this much", which the digits alone cannot; and because there is
+  // always a static cue beside it, nothing is lost if the motion is switched
+  // off or missed.
+  countTo(document.getElementById('equity'), Number(s.account.equity), money);
 
   const pnl = document.getElementById('pnl');
-  pnl.textContent = money(s.account.pnl);
+  countTo(pnl, Number(s.account.pnl), money);
   pnl.className = `mono ${cls(Number(s.account.pnl))}`;
 
   const conserved = Number(s.conservation) === 0;
@@ -314,10 +325,18 @@ function bind() {
 
   main.querySelectorAll('.lad-row').forEach((row) => {
     row.addEventListener('click', () => {
+      // Clicking a level fills the limit box, so open Advanced to show where it
+      // went -- otherwise the click appears to do nothing at all.
+      const advanced = main.querySelector('.advanced');
+      if (advanced) advanced.open = true;
       const input = document.getElementById('t-px');
       if (input) input.value = row.dataset.price;
+      updatePreview();
     });
   });
+
+  const sendButtonEl = main.querySelector('#t-send');
+  if (sendButtonEl) sendButtonEl.addEventListener('pointerdown', () => press(sendButtonEl));
 
   main.querySelectorAll('.sides button').forEach((button) => {
     button.addEventListener('click', () => {

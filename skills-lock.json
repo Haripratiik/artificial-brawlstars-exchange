@@ -7,6 +7,18 @@
       "skillPath": "skills/accessibility/SKILL.md",
       "computedHash": "88c64dead9bb55925c7b983f5fd95cfecf30bd8c076fd384cdb17019d1becd87"
     },
+    "better-ui": {
+      "source": "jakubkrehel/skills",
+      "sourceType": "github",
+      "skillPath": "skills/better-ui/SKILL.md",
+      "computedHash": "703f24c7577f514d37f773c1b32b75cda53b98603f8ba841e9d57bacfa5b83cd"
+    },
+    "design-taste-frontend": {
+      "source": "leonxlnx/taste-skill",
+      "sourceType": "github",
+      "skillPath": "skills/taste-skill/SKILL.md",
+      "computedHash": "899b84384f74f540ea5284d9b2e9234e050998b42eacc805410b518d4226c0b3"
+    },
     "performance": {
       "source": "addyosmani/web-quality-skills",
       "sourceType": "github",

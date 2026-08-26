@@ -1,28 +1,55 @@
-/* The five screens.
+/* The screens.
  *
- * Each view is a pure function from store state to HTML, plus an optional
- * `bind` that wires events after the render. Keeping them pure means the live
- * socket can re-render on every tick without any view holding its own state
- * that could drift from the market's.
+ * Each view is a pure function from store state to HTML. Keeping them pure
+ * means the socket can re-render without any view holding state that could
+ * drift from the market's. The one exception is the order ticket, which holds
+ * live input and is moved across a re-render rather than rebuilt.
  *
- * The exception is the trade ticket: an input the user is typing into must not
- * be rewritten underneath them, so it is rendered once per symbol change and
- * left alone afterwards.
+ * The information order on the trade screen is not arbitrary. Prediction-market
+ * design guidance is consistent about it, and this interface previously had it
+ * backwards:
+ *
+ *   1. what the contract is, and the odds
+ *   2. **how it resolves** — above the fold, not buried
+ *   3. the price history
+ *   4. recent trades
+ *   5. the order book, *collapsed by default*
+ *   6. contract specifications
+ *
+ * Leading with a depth ladder is right for an operator and wrong for everyone
+ * else: it was the most technical thing on the page and it was the first thing
+ * you saw, while the resolution rules were squeezed into a strip above it —
+ * which is the documented anti-pattern, burying the terms beneath the pricing.
  */
 
-import { clock, cls, count, describe, esc, impliedProbability, money, percent,
-         price, priceChart, signed, sparkline, walkBook } from './format.js';
+import {
+  clock, cls, count, describe, esc, impliedProbability, money, percent,
+  price, priceChart, signed, sparkline,
+} from './format.js';
 
 /* ── markets ─────────────────────────────────────────────────────────── */
 
+/**
+ * Discovery. A card carries the question, the odds, activity and time left,
+ * and one action.
+ *
+ * Deliberately *not* on a card: order-book depth, tick size, settlement bounds,
+ * spec digests. Those are specifications, and putting them on a browsing
+ * surface is the fastest way to make an exchange feel like a database viewer.
+ */
 export function markets(store) {
   const { snapshot, instruments, history } = store;
   const books = snapshot?.books ?? {};
   const symbols = Object.keys(books);
-  if (!symbols.length) return `<div class="view"><div class="empty">Connecting&hellip;</div></div>`;
+  if (!symbols.length) {
+    return `<div class="view"><div class="onboard">
+      <h2>Connecting to the exchange&hellip;</h2>
+      <p>Contracts here settle on measured Brawl Stars statistics.</p>
+    </div></div>`;
+  }
 
   const cards = symbols
-    .map((symbol, i) => {
+    .map((symbol) => {
       const book = books[symbol];
       const meta = instruments.find((x) => x.symbol === symbol) || {};
       const series = (history[symbol] || []).slice(-90);
@@ -31,26 +58,32 @@ export function markets(store) {
       const change = first != null && last != null ? last - first : 0;
       const pct = first ? (change / first) * 100 : 0;
       const session = snapshot.sessions?.[symbol] ?? 'continuous';
+      const odds = impliedProbability(book.mark, book.contract?.payoff);
+      const headline = odds != null ? percent(odds, 0) : price(book.mark);
 
-      // A real button rather than a div with a click handler: the card is an
-      // action, and a keyboard user has to be able to reach and fire it. The
-      // children are spans so the markup stays valid inside a button.
       return `<button type="button" class="card" data-symbol="${esc(symbol)}"
-                   data-session="${esc(session)}" style="animation-delay:${i * 28}ms"
-                   aria-label="${esc(symbol)}, ${price(book.mark)}, ${signed(pct)} percent">
-        <span class="row1">
+                   data-session="${esc(session)}"
+                   aria-label="${esc(symbol)}, ${headline}, ${signed(pct)} percent">
+        <span class="card-top">
           <span class="sym">${esc(symbol)}</span>
-          <span class="kind">${esc(book.class ?? '')}</span>
+          ${session !== 'continuous'
+            ? `<span class="badge ${esc(session)}">${esc(session.replace('_', ' '))}</span>`
+            : `<span class="kind">${esc(book.class ?? '')}</span>`}
         </span>
-        <span class="price mono ${cls(change)}">${
-          impliedProbability(book.mark, book.contract?.payoff) != null
-            ? percent(impliedProbability(book.mark, book.contract?.payoff), 0)
-            : price(book.mark)}</span>
-        <span class="sub">
-          <span class="${cls(change)}">${signed(change)} (${signed(pct)}%)</span>
-          <span class="faint">${count(book.trades)} trades</span>
+
+        <span class="question">${question(book.contract)}</span>
+
+        <span class="card-figure">
+          <span class="price mono ${cls(change)}">${headline}</span>
+          <span class="chg mono ${cls(change)}">${signed(pct)}%</span>
         </span>
+
         <span class="spark" aria-hidden="true">${sparkline(series)}</span>
+
+        <span class="card-foot">
+          <span>${count(book.trades)} trades</span>
+          <span>${expiry(book.contract, meta)}</span>
+        </span>
       </button>`;
     })
     .join('');
@@ -58,80 +91,180 @@ export function markets(store) {
   return `<div class="view"><div class="grid">${cards}</div></div>`;
 }
 
+/** The contract as a question, which is how a person holds it in their head. */
+function question(contract) {
+  const p = contract?.payoff;
+  if (!p) return '';
+  const subject = esc(subjectName(contract?.underlying));
+  if (p.kind === 'binary') {
+    const direction = String(p.comparison).includes('>') ? 'above' : 'below';
+    return `Will ${subject} finish ${direction} ${p.threshold}?`;
+  }
+  if (p.kind === 'call') return `${subject} above ${p.strike} at settlement`;
+  if (p.kind === 'put') return `${subject} below ${p.strike} at settlement`;
+  return `Where ${subject} settles`;
+}
+
+function subjectName(underlying) {
+  if (!underlying) return 'the metric';
+  if (underlying.kind === 'single') return underlying.metric?.subject ?? 'the metric';
+  if (underlying.kind === 'difference') {
+    return `${subjectName(underlying.left)} minus ${subjectName(underlying.right)}`;
+  }
+  if (underlying.kind === 'basket') return 'the index';
+  return 'the metric';
+}
+
+function expiry(contract, meta) {
+  const raw = contract?.expiry ?? meta.expiry;
+  if (!raw) return '';
+  const days = Math.round((new Date(raw) - Date.now()) / 86_400_000);
+  if (!Number.isFinite(days)) return esc(String(raw));
+  if (days < 0) return 'settled';
+  if (days === 0) return 'settles today';
+  return `${days}d left`;
+}
+
 /* ── trade ───────────────────────────────────────────────────────────── */
 
 export function trade(store) {
   const { snapshot, instruments, symbol, history, depth } = store;
   const book = snapshot?.books?.[symbol];
-  if (!book) return `<div class="view"><div class="empty">Select an instrument.</div></div>`;
+  if (!book) {
+    return `<div class="view"><div class="onboard">
+      <h2>Pick a market</h2><p>Choose a contract from the list to start trading.</p>
+    </div></div>`;
+  }
 
   const meta = instruments.find((x) => x.symbol === symbol) || {};
   const session = snapshot.sessions?.[symbol] ?? 'continuous';
   const series = history[symbol] || [];
+  const position = (snapshot.account?.positions ?? []).find((p) => p.symbol === symbol);
 
-  return `<div class="trade">
-    <div class="bar-top">${instrumentBar(symbol, book, meta, session)}</div>
+  return `<div class="market">
+    <div class="market-main">
+      ${contractHead(symbol, book, meta, session)}
+      ${resolution(book, meta)}
 
-    <div class="panel lad">
-      <h2>Depth <em>${esc(symbol)}</em></h2>
-      <div class="panel-body">${ladder(book, depth)}</div>
-    </div>
-
-    <div class="panel">
-      <h2>Price <em>${series.length} pts</em></h2>
-      <div class="panel-body" style="padding:6px">
-        ${priceChart(series, { settlesAt: meta.settles_at ?? null, label: symbol })}
+      <div class="panel">
+        <h2>Price <em>${series.length} points</em></h2>
+        <div class="panel-body chart-body">
+          ${priceChart(series, { settlesAt: meta.settles_at ?? null, label: symbol })}
+        </div>
       </div>
-    </div>
 
-    <div class="panel tkt">
-      <h2>Ticket</h2>
-      <div class="panel-body">
-        <div class="ticket" id="ticket">${ticket(symbol, book, session)}</div>
+      <div class="panel">
+        <h2>Recent Trades</h2>
+        <div class="panel-body">${tape(snapshot, symbol)}</div>
       </div>
-      <h2 style="border-top:1px solid var(--rule)">Working <em>${(snapshot.orders || []).length}</em></h2>
-      <div class="panel-body">${orders(snapshot)}</div>
+
+      <details class="panel drop">
+        <summary><h2>Order Book</h2><span class="hint">depth at every price</span></summary>
+        <div class="panel-body">${ladder(book, depth)}</div>
+      </details>
+
+      <details class="panel drop">
+        <summary><h2>Contract Specification</h2><span class="hint">the exact terms</span></summary>
+        <div class="panel-body">${specification(book)}</div>
+      </details>
     </div>
 
-    <div class="panel">
-      <h2>Tape</h2>
-      <div class="panel-body">${tape(snapshot, symbol)}</div>
-    </div>
+    <aside class="market-side">
+      <div class="panel tkt">
+        <h2>Trade</h2>
+        <div class="panel-body">
+          <div class="ticket" id="ticket">${ticket(symbol, book, session)}</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Your Position</h2>
+        <div class="panel-body">${positionCard(position)}</div>
+      </div>
+
+      <div class="panel">
+        <h2>Working Orders <em>${(snapshot.orders || []).length}</em></h2>
+        <div class="panel-body">${orders(snapshot)}</div>
+      </div>
+    </aside>
   </div>`;
 }
 
-function instrumentBar(symbol, book, meta, session) {
-  const spread = book.spread == null ? '—' : price(book.spread);
-  return `<div class="instrument-bar" data-session="${esc(session)}">
-    <div>
-      <div class="name">${esc(symbol)}</div>
-      <div class="kind mono faint">${esc(book.class ?? '')}</div>
+function contractHead(symbol, book, meta, session) {
+  const odds = impliedProbability(book.mark, book.contract?.payoff);
+  return `<header class="contract" data-session="${esc(session)}">
+    <div class="contract-id">
+      <span class="sym mono">${esc(symbol)}</span>
+      <span class="badge ${esc(session)}">${esc(session.replace('_', ' '))}</span>
+      <span class="kind">${esc(book.class ?? '')}</span>
     </div>
-    <span class="badge ${esc(session)}">${esc(session.replace('_', ' '))}</span>
-    <div class="stat"><b>${price(book.mark)}</b><span>mark</span></div>
-    ${impliedProbability(book.mark, book.contract?.payoff) != null
-      ? `<div class="stat"><b class="amber">${percent(impliedProbability(book.mark, book.contract?.payoff))}</b>
-           <span>implied odds</span></div>` : ''}
-    <div class="stat"><b>${spread}</b><span>spread</span></div>
-    <div class="stat"><b>${count(book.trades)}</b><span>trades</span></div>
-    ${meta.settles_at != null
-      ? `<div class="stat"><b class="up">${price(meta.settles_at)}</b><span>settles at</span></div>` : ''}
-    <div class="terms">${describe(book.contract)}
-      <span class="faint mono"> &middot; expiry ${esc(book.contract?.expiry ?? '?')}
-      &middot; tick ${esc(book.tick ?? '')}</span>
+    <h1 class="question">${question(book.contract)}</h1>
+    <div class="contract-figures">
+      ${odds != null
+        ? `<div class="stat big"><b class="mono amber">${percent(odds)}</b>
+             <span>Implied Odds</span></div>`
+        : ''}
+      <div class="stat big"><b class="mono">${price(book.mark)}</b><span>Last</span></div>
+      <div class="stat"><b class="mono">${book.spread == null ? '—' : price(book.spread)}</b><span>Spread</span></div>
+      <div class="stat"><b class="mono">${count(book.trades)}</b><span>Trades</span></div>
+      <div class="stat"><b class="mono">${expiry(book.contract, meta)}</b><span>Expiry</span></div>
     </div>
-    <div class="spacer"></div>
-    <button type="button" class="minor" data-act="halt" data-symbol="${esc(symbol)}"
-            aria-label="Halt trading in ${esc(symbol)}">Halt</button>
-    <button type="button" class="minor" data-act="uncross" data-symbol="${esc(symbol)}"
-            aria-label="Run the reopening auction for ${esc(symbol)}">Uncross</button>
-  </div>`;
+  </header>`;
 }
 
 /**
- * The ladder. Bids and asks share a price column, so the shape of the book is
- * one vertical scan rather than two tables to compare, and each row is
- * click-to-trade at that price.
+ * How this contract resolves, stated plainly and placed above the fold.
+ *
+ * Burying resolution rules beneath the price is the documented anti-pattern,
+ * and it is the one that matters most: a contract whose terms nobody can read
+ * is not a market, it is a slot machine with a chart attached.
+ */
+function resolution(book, meta) {
+  const p = book.contract?.payoff ?? {};
+  const settles = meta.settles_at;
+  const bounds = (book.bounds ?? []).map((b) => price(b)).join(' and ');
+  return `<section class="resolution">
+    <h2>How This Resolves</h2>
+    <p>${describe(book.contract)}</p>
+    <ul>
+      <li><span>Measured over</span>
+          <b>the observation window ending ${esc(book.contract?.expiry ?? 'expiry')}</b></li>
+      <li><span>Settles between</span><b class="mono">${bounds || '—'}</b></li>
+      ${p.kind === 'binary'
+        ? `<li><span>Pays</span><b class="mono">${price(p.payout)} if it happens, ${price(0)} if not</b></li>`
+        : ''}
+      ${settles != null
+        ? `<li><span>Will actually settle at</span><b class="mono up">${price(settles)}</b>
+             <em>visible only because this is a simulation &mdash; a real venue could not tell you</em></li>`
+        : ''}
+    </ul>
+  </section>`;
+}
+
+function specification(book) {
+  const rows = [
+    ['Contract', book.contract?.id],
+    ['Class', book.class],
+    ['Tick size', book.tick],
+    ['Settlement range', (book.bounds ?? []).join(' … ')],
+    ['Expiry', book.contract?.expiry],
+    ['Spec digest', book.contract?.digest],
+  ];
+  return `<table><tbody>${rows
+    .map(([label, value]) => `<tr>
+      <td style="text-align:left" class="faint">${esc(label)}</td>
+      <td>${value == null || value === '' ? '—' : esc(String(value))}</td>
+    </tr>`)
+    .join('')}</tbody></table>`;
+}
+
+/**
+ * The ladder, now behind a disclosure.
+ *
+ * Bids and asks share a price column so the shape of the book is one vertical
+ * scan; the bars show *cumulative* size, because that is what answers the
+ * question anyone sizing an order is actually asking — what it costs to get
+ * through a level. Each row fills the ticket at its price.
  */
 function ladder(book, depth) {
   const bids = (depth?.bids ?? book.bids ?? []).map(([p, q]) => [Number(p), q]);
@@ -142,9 +275,6 @@ function ladder(book, depth) {
   bids.forEach(([p, q]) => byPrice.set(p, { ...(byPrice.get(p) || {}), bid: q }));
   asks.forEach(([p, q]) => byPrice.set(p, { ...(byPrice.get(p) || {}), ask: q }));
 
-  // Cumulative size outward from the touch. Per-level size tells you what is
-  // at a price; the running total tells you what it costs to get through it,
-  // which is the question anyone sizing an order is actually asking.
   const cumulativeBid = new Map();
   let runningBid = 0;
   for (const [p, q] of bids) { runningBid += q; cumulativeBid.set(p, runningBid); }
@@ -155,7 +285,6 @@ function ladder(book, depth) {
   const peak = Math.max(1, runningBid, runningAsk);
   const mark = Number(book.mark);
   const rows = [...byPrice.entries()].sort((a, b) => b[0] - a[0]);
-  // The row nearest the mark, so the eye lands on the middle of the book.
   let nearest = 0;
   rows.forEach(([p], i) => {
     if (Math.abs(p - mark) < Math.abs(rows[nearest][0] - mark)) nearest = i;
@@ -163,8 +292,6 @@ function ladder(book, depth) {
 
   return `<div class="ladder">${rows
     .map(([p, side], i) => {
-      // Bars show the cumulative book, so their shape is the liquidity profile
-      // rather than a row-by-row sawtooth.
       const bidW = ((cumulativeBid.get(p) || 0) / peak) * 46;
       const askW = ((cumulativeAsk.get(p) || 0) / peak) * 46;
       return `<button type="button" class="lad-row ${i === nearest ? 'at-mark' : ''}"
@@ -180,84 +307,110 @@ function ladder(book, depth) {
     .join('')}</div>`;
 }
 
+/**
+ * The ticket, in two layers.
+ *
+ * Everything a first-time trader needs is visible: which side, how many, and
+ * what it costs against what it pays. Limit price, time in force and post-only
+ * are real and reachable, but they sit behind a disclosure — a form that opens
+ * on "time in force" has already lost most of the people looking at it.
+ */
 function ticket(symbol, book, session) {
   const halted = session !== 'continuous';
   const binary = book.contract?.payoff?.kind === 'binary';
-  // On a binary, buying is a bet the event happens and selling is a bet it does
-  // not. Prediction markets label the buttons that way rather than making the
-  // reader translate, and the translation is where people make mistakes.
-  const buyLabel = binary ? 'Buy Yes' : 'Buy';
-  const sellLabel = binary ? 'Buy No' : 'Sell';
   return `<div class="sides">
-      <button type="button" data-side="buy" aria-pressed="true">${buyLabel}</button>
-      <button type="button" data-side="sell" aria-pressed="false">${sellLabel}</button>
+      <button type="button" data-side="buy" aria-pressed="true">
+        ${binary ? 'Yes' : 'Buy'}<em>${binary ? 'it happens' : 'go long'}</em>
+      </button>
+      <button type="button" data-side="sell" aria-pressed="false">
+        ${binary ? 'No' : 'Sell'}<em>${binary ? 'it does not' : 'go short'}</em>
+      </button>
     </div>
-    <div class="row2">
-      <div class="field">
-        <label for="t-qty">Quantity</label>
-        <input id="t-qty" type="number" min="1" step="1" value="10"
-               inputmode="numeric" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="field">
-        <label for="t-tif">Time in force</label>
-        <select id="t-tif">
-          <option value="gtc">GTC</option>
-          <option value="ioc">IOC</option>
-          <option value="fok">FOK</option>
-          <option value="post_only">Post only</option>
-        </select>
-      </div>
-    </div>
+
     <div class="field">
-      <label for="t-px">Limit price &mdash; blank for market</label>
-      <input id="t-px" type="text" inputmode="decimal" placeholder="4660.25&hellip;"
-             autocomplete="off" spellcheck="false">
+      <label for="t-qty">Contracts</label>
+      <input id="t-qty" type="number" min="1" step="1" value="10"
+             inputmode="numeric" autocomplete="off" spellcheck="false">
     </div>
     <div class="quick" role="group" aria-label="Quick size">
       ${[5, 25, 100, 250].map((n) => `<button type="button" data-qty="${n}">${n}</button>`).join('')}
     </div>
-    <!-- What it costs, before you commit to it. -->
+
     <div class="preview" id="t-preview" aria-live="polite"></div>
+
     <button type="button" class="send" id="t-send" ${halted ? 'disabled' : ''}>
-      ${halted ? `${esc(session.replace('_', ' '))} &mdash; orders rest` : 'Send order'}
+      ${halted ? `${esc(session.replace('_', ' '))} &mdash; orders will rest` : 'Place Order'}
     </button>
-    <div class="row2">
-      <button type="button" class="minor" data-act="cancel_all">Cancel All</button>
-      <button type="button" class="minor danger" data-act="flatten">Flatten</button>
-    </div>
-    <div class="note">Your order joins the same queue as every algorithm here and
-      travels the same latency link. Nothing about it is privileged.</div>`;
+
+    <details class="advanced">
+      <summary>Advanced</summary>
+      <div class="field">
+        <label for="t-px">Limit price &mdash; blank trades at market</label>
+        <input id="t-px" type="text" inputmode="decimal" placeholder="4660.25&hellip;"
+               autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="t-tif">Time in force</label>
+        <select id="t-tif">
+          <option value="gtc">Good till cancelled</option>
+          <option value="ioc">Immediate or cancel</option>
+          <option value="fok">Fill or kill</option>
+          <option value="post_only">Post only</option>
+        </select>
+      </div>
+      <div class="row2">
+        <button type="button" class="minor" data-act="cancel_all">Cancel All</button>
+        <button type="button" class="minor danger" data-act="flatten">Flatten</button>
+      </div>
+      <div class="row2">
+        <button type="button" class="minor" data-act="halt" data-symbol="${esc(symbol)}"
+                aria-label="Halt trading in ${esc(symbol)}">Halt</button>
+        <button type="button" class="minor" data-act="uncross" data-symbol="${esc(symbol)}"
+                aria-label="Run the reopening auction for ${esc(symbol)}">Uncross</button>
+      </div>
+    </details>
+
+    <p class="note">Your order joins the same queue as every algorithm here and
+      travels the same latency link. Nothing about it is privileged.</p>`;
+}
+
+function positionCard(position) {
+  if (!position || position.quantity === 0) {
+    return `<div class="empty">No position in this contract.</div>`;
+  }
+  return `<div class="pos">
+    <div><span>Contracts</span><b class="mono ${cls(position.quantity)}">${signed(position.quantity, 0)}</b></div>
+    <div><span>Average price</span><b class="mono">${price(position.average_price)}</b></div>
+    <div><span>Unrealised</span><b class="mono ${cls(Number(position.unrealized))}">${money(position.unrealized)}</b></div>
+    <div><span>Realised</span><b class="mono ${cls(Number(position.realized))}">${money(position.realized)}</b></div>
+  </div>`;
 }
 
 function orders(snapshot) {
   const rows = snapshot.orders || [];
-  if (!rows.length) return `<div class="empty">No working orders.</div>`;
+  if (!rows.length) return `<div class="empty">Nothing working.</div>`;
   return `<table><tbody>${rows
-    .map(
-      (o) => `<tr>
-        <td>${esc(o.symbol)}</td>
-        <td class="faint">#${o.order_id}</td>
-        <td><button type="button" class="minor" data-act="cancel" data-order="${o.order_id}"
-                aria-label="Cancel order ${o.order_id} in ${esc(o.symbol)}">Cancel</button></td>
-      </tr>`
-    )
+    .map((o) => `<tr>
+      <td style="text-align:left">${esc(o.symbol)}</td>
+      <td class="faint">#${o.order_id}</td>
+      <td><button type="button" class="minor" data-act="cancel" data-order="${o.order_id}"
+            aria-label="Cancel order ${o.order_id} in ${esc(o.symbol)}">Cancel</button></td>
+    </tr>`)
     .join('')}</tbody></table>`;
 }
 
 function tape(snapshot, symbol) {
-  const rows = (snapshot.tape || []).filter((t) => t.symbol === symbol).slice(0, 40);
-  if (!rows.length) return `<div class="empty">No prints yet.</div>`;
+  const rows = (snapshot.tape || []).filter((t) => t.symbol === symbol).slice(0, 30);
+  if (!rows.length) return `<div class="empty">No trades yet.</div>`;
   return `<table>
-    <thead><tr><th>Time</th><th>Price</th><th>Size</th><th>Aggressor</th></tr></thead>
+    <thead><tr><th>Time</th><th>Price</th><th>Size</th><th>Taker</th></tr></thead>
     <tbody>${rows
-      .map(
-        (t) => `<tr class="tape-row">
-          <td class="faint">${clock(t.t)}</td>
-          <td>${price(t.price)}</td>
-          <td>${count(t.quantity)}</td>
-          <td class="${t.side === 'buy' ? 'up' : 'down'}">${esc(t.side)}</td>
-        </tr>`
-      )
+      .map((t) => `<tr class="tape-row">
+        <td class="faint">${clock(t.t)}</td>
+        <td>${price(t.price)}</td>
+        <td>${count(t.quantity)}</td>
+        <td class="${t.side === 'buy' ? 'up' : 'down'}">${esc(t.side)}</td>
+      </tr>`)
       .join('')}</tbody></table>`;
 }
 
@@ -265,42 +418,37 @@ function tape(snapshot, symbol) {
 
 export function portfolio(store) {
   const s = store.snapshot;
-  if (!s) return `<div class="view"><div class="empty">Connecting&hellip;</div></div>`;
+  if (!s) return `<div class="view"><div class="onboard"><h2>Connecting&hellip;</h2></div></div>`;
   const a = s.account;
   const positions = a.positions || [];
 
-  const stat = (label, value, klass = '') =>
-    `<div class="panel" style="padding:12px">
-      <div class="mono faint" style="font-size:8.5px;letter-spacing:.15em;text-transform:uppercase">${label}</div>
-      <div class="mono ${klass}" style="font-size:22px;letter-spacing:-.03em;margin-top:5px">${value}</div>
-    </div>`;
+  const figure = (label, value, klass = '') =>
+    `<div class="panel figure"><span>${label}</span><b class="mono ${klass}">${value}</b></div>`;
 
   return `<div class="view">
-    <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(160px,1fr));margin-bottom:12px">
-      ${stat('Equity', money(a.equity))}
-      ${stat('Profit &amp; loss', money(a.pnl), cls(Number(a.pnl)))}
-      ${stat('Free cash', money(a.free_cash))}
-      ${stat('Collateral', money(a.collateral))}
+    <div class="figures">
+      ${figure('Account Value', money(a.equity))}
+      ${figure('Profit &amp; Loss', money(a.pnl), cls(Number(a.pnl)))}
+      ${figure('Available to Trade', money(a.free_cash))}
+      ${figure('Held as Collateral', money(a.collateral))}
     </div>
 
-    <div class="panel" style="margin-bottom:12px">
+    <div class="panel">
       <h2>Positions <em>${positions.length}</em></h2>
       <div class="panel-body">${
         positions.length
           ? `<table>
-              <thead><tr><th>Symbol</th><th>Qty</th><th>Avg price</th><th>Unrealised</th><th>Realised</th></tr></thead>
+              <thead><tr><th>Contract</th><th>Qty</th><th>Avg</th><th>Unrealised</th><th>Realised</th></tr></thead>
               <tbody>${positions
-                .map(
-                  (p) => `<tr data-symbol="${esc(p.symbol)}">
-                    <td>${esc(p.symbol)}</td>
-                    <td class="${cls(p.quantity)}">${signed(p.quantity, 0)}</td>
-                    <td>${price(p.average_price)}</td>
-                    <td class="${cls(Number(p.unrealized))}">${money(p.unrealized)}</td>
-                    <td class="${cls(Number(p.realized))}">${money(p.realized)}</td>
-                  </tr>`
-                )
+                .map((p) => `<tr data-symbol="${esc(p.symbol)}">
+                  <td>${esc(p.symbol)}</td>
+                  <td class="${cls(p.quantity)}">${signed(p.quantity, 0)}</td>
+                  <td>${price(p.average_price)}</td>
+                  <td class="${cls(Number(p.unrealized))}">${money(p.unrealized)}</td>
+                  <td class="${cls(Number(p.realized))}">${money(p.realized)}</td>
+                </tr>`)
                 .join('')}</tbody></table>`
-          : `<div class="empty">Flat.</div>`
+          : `<div class="empty">You are flat. Pick a market to place your first trade.</div>`
       }</div>
     </div>
 
@@ -316,14 +464,13 @@ export function portfolio(store) {
  *
  * These arrive as structured events, not sentences. An earlier version
  * interpolated the whole object into a cell, which rendered `[object Object]`
- * whenever anything happened — invisible in a quiet market and useless in a
- * busy one.
+ * whenever anything happened.
  */
 function blotter(log) {
   if (!log || !log.length) return `<div class="empty">Nothing yet.</div>`;
   const tone = { fill: 'up', reject: 'down', cancel: 'dim', ack: 'faint' };
   return `<table>
-    <thead><tr><th>Time</th><th>Event</th><th>Symbol</th><th>Side</th>
+    <thead><tr><th>Time</th><th>Event</th><th>Contract</th><th>Side</th>
                <th>Qty</th><th>Price</th><th>Detail</th></tr></thead>
     <tbody>${log
       .map((e) => {
@@ -345,37 +492,33 @@ function blotter(log) {
       .join('')}</tbody></table>`;
 }
 
-/* ── research ────────────────────────────────────────────────────────── */
+/* ── research (operator) ─────────────────────────────────────────────── */
 
 export function research(store) {
   const { diagnostics, agents, symbol } = store;
 
   const rows = (diagnostics?.verdicts ?? [])
-    .map(
-      (v) => `<tr>
-        <td style="text-align:left">${esc(v.name)}</td>
-        <td>${v.value == null ? '—' : Number(v.value).toFixed(3)}</td>
-        <td class="faint" style="text-align:left">${esc(v.expected)}</td>
-        <td class="${v.verdict === 'as expected' ? 'verdict-ok' : 'verdict-no'}">${esc(v.verdict)}</td>
-      </tr>`
-    )
+    .map((v) => `<tr>
+      <td style="text-align:left">${esc(v.name)}</td>
+      <td>${v.value == null ? '—' : Number(v.value).toFixed(3)}</td>
+      <td class="faint" style="text-align:left">${esc(v.expected)}</td>
+      <td class="${v.verdict === 'as expected' ? 'verdict-ok' : 'verdict-no'}">${esc(v.verdict)}</td>
+    </tr>`)
     .join('');
 
   const roster = (agents || [])
-    .map(
-      (a) => `<tr>
-        <td style="text-align:left">${esc(a.id)}</td>
-        <td class="faint" style="text-align:left">${esc(a.kind)}</td>
-        <td>${count(a.fills)}</td>
-        <td class="${a.rejects ? 'down' : 'faint'}">${count(a.rejects)}</td>
-        <td>${a.equity == null ? '—' : money(a.equity)}</td>
-      </tr>`
-    )
+    .map((a) => `<tr>
+      <td style="text-align:left">${esc(a.id)}</td>
+      <td class="faint" style="text-align:left">${esc(a.kind)}</td>
+      <td>${count(a.fills)}</td>
+      <td class="${a.rejects ? 'down' : 'faint'}">${count(a.rejects)}</td>
+      <td>${a.equity == null ? '—' : money(a.equity)}</td>
+    </tr>`)
     .join('');
 
   return `<div class="view">
     <div class="panel" style="margin-bottom:12px">
-      <h2>Stylized facts <em>${esc(symbol)}</em></h2>
+      <h2>Stylized Facts <em>${esc(symbol ?? '')}</em></h2>
       <div class="panel-body">${
         diagnostics?.pending
           ? `<div class="empty">Collecting observations&hellip; (${diagnostics.observations ?? 0} so far)</div>`
@@ -387,12 +530,10 @@ export function research(store) {
       }</div>
     </div>
 
-    <div class="note" style="margin-bottom:12px">
-      These are the same estimators the research harness uses, run on the live
-      price series &mdash; not a second implementation that could disagree with it.
-      A verdict of &ldquo;unexpected&rdquo; is information, not a failure: three of
-      four predictions made before the first run turned out wrong.
-    </div>
+    <p class="note" style="margin-bottom:12px">The same estimators the research
+      harness uses, run on the live price series &mdash; not a second
+      implementation that could disagree with it. A verdict of
+      &ldquo;unexpected&rdquo; is information, not a failure.</p>
 
     <div class="panel">
       <h2>Participants <em>${(agents || []).length}</em></h2>
@@ -407,7 +548,7 @@ export function research(store) {
   </div>`;
 }
 
-/* ── lab ─────────────────────────────────────────────────────────────── */
+/* ── lab (operator) ──────────────────────────────────────────────────── */
 
 export function lab(store) {
   const s = store.session;
@@ -415,20 +556,23 @@ export function lab(store) {
   const c = s.config;
 
   const schedules = Object.entries(s.fee_schedules || {})
-    .map(
-      ([name, f]) =>
-        `<option value="${esc(name)}" ${name === c.fees ? 'selected' : ''}>
-          ${esc(name)} — taker ${f.taker_bps}bp / maker ${f.maker_bps}bp
-        </option>`
-    )
+    .map(([name, f]) => `<option value="${esc(name)}" ${name === c.fees ? 'selected' : ''}>
+        ${esc(name)} — taker ${f.taker_bps}bp / maker ${f.maker_bps}bp
+      </option>`)
     .join('');
 
   const halts = (s.halts || []).slice().reverse();
 
   return `<div class="view">
+    <p class="note" style="margin-bottom:12px">Operator controls. Changing any of
+      these starts a <em>new</em> session rather than editing the running one
+      &mdash; a population edited mid-flight would produce a market no seed could
+      reproduce, and reproducibility is most of what makes a result here worth
+      anything.</p>
+
     <div class="two">
       <div class="panel">
-        <h2>Configuration <em>gen ${s.generation}</em></h2>
+        <h2>Configuration <em>generation ${s.generation}</em></h2>
         <div class="panel-body">
           <div class="controls">
             <div class="row2">
@@ -458,10 +602,6 @@ export function lab(store) {
               Cross-instrument arbitrageur
             </label>
             <button type="button" class="send" id="c-apply">Rebuild Market</button>
-            <div class="note">A configuration change starts a <em>new</em> session
-              rather than editing the running one. A population edited mid-flight
-              would produce a market no seed could reproduce, and reproducibility
-              is most of what makes a result here worth anything.</div>
           </div>
         </div>
       </div>
@@ -484,18 +624,16 @@ export function lab(store) {
           <h2>Sessions</h2>
           <div class="panel-body">
             <table><tbody>${Object.entries(s.sessions || {})
-              .map(
-                ([sym, state]) => `<tr>
-                  <td style="text-align:left">${esc(sym)}</td>
-                  <td><span class="badge ${esc(state)}">${esc(state.replace('_', ' '))}</span></td>
-                  <td>
-                    <button type="button" class="minor" data-act="halt" data-symbol="${esc(sym)}"
-                            aria-label="Halt trading in ${esc(sym)}">Halt</button>
-                    <button type="button" class="minor" data-act="uncross" data-symbol="${esc(sym)}"
-                            aria-label="Run the reopening auction for ${esc(sym)}">Uncross</button>
-                  </td>
-                </tr>`
-              )
+              .map(([sym, state]) => `<tr>
+                <td style="text-align:left">${esc(sym)}</td>
+                <td><span class="badge ${esc(state)}">${esc(state.replace('_', ' '))}</span></td>
+                <td>
+                  <button type="button" class="minor" data-act="halt" data-symbol="${esc(sym)}"
+                          aria-label="Halt trading in ${esc(sym)}">Halt</button>
+                  <button type="button" class="minor" data-act="uncross" data-symbol="${esc(sym)}"
+                          aria-label="Run the reopening auction for ${esc(sym)}">Uncross</button>
+                </td>
+              </tr>`)
               .join('')}</tbody></table>
           </div>
         </div>
@@ -507,16 +645,14 @@ export function lab(store) {
       <div class="panel-body">${
         halts.length
           ? `<table>
-              <thead><tr><th>Symbol</th><th>Reason</th><th>Reference</th><th>Price</th></tr></thead>
+              <thead><tr><th>Contract</th><th>Reason</th><th>Reference</th><th>Price</th></tr></thead>
               <tbody>${halts
-                .map(
-                  (h) => `<tr>
-                    <td style="text-align:left">${esc(h.symbol)}</td>
-                    <td style="text-align:left" class="${h.reason === 'price_band' ? 'down' : 'dim'}">${esc(h.reason)}</td>
-                    <td>${h.reference ?? '—'}</td>
-                    <td>${h.price ?? '—'}</td>
-                  </tr>`
-                )
+                .map((h) => `<tr>
+                  <td style="text-align:left">${esc(h.symbol)}</td>
+                  <td style="text-align:left" class="${h.reason === 'price_band' ? 'down' : 'dim'}">${esc(h.reason)}</td>
+                  <td>${h.reference ?? '—'}</td>
+                  <td>${h.price ?? '—'}</td>
+                </tr>`)
                 .join('')}</tbody></table>`
           : `<div class="empty">No halts this session.</div>`
       }</div>

@@ -678,3 +678,221 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .tick-down { animation: tick-down 0.55s ease-out; }
 @keyframes tick-up { from { background: var(--up-sunk); } }
 @keyframes tick-down { from { background: var(--down-sunk); } }
+
+/* ══ user-facing exchange ═════════════════════════════════════════════ */
+
+/* Press feedback lives in CSS rather than the motion library, because a CSS
+ * transition can be interrupted mid-flight and a keyframe cannot. 0.96 exactly:
+ * below about 0.95 a press reads as a bounce rather than a button giving. */
+.card, .send, .minor, .quick button, .sides button, .lad-row, .watch {
+  transition-property: background-color, border-color, color, transform, opacity;
+  transition-duration: 130ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+.card:active, .send:active, .minor:active,
+.quick button:active, .sides button:active { transform: scale(0.96); }
+
+/* ── discovery cards ────────────────────────────────────────────────── */
+
+.card {
+  display: grid;
+  gap: 9px;
+  padding: 14px;
+  min-height: 176px;
+  grid-template-rows: auto auto auto 1fr auto;
+}
+.card:hover { border-color: var(--rule-bright); background: var(--raised); }
+.card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+/* The contract as a question. This is the line that tells someone what they
+ * would be betting on, so it gets the weight, not the ticker. */
+.question {
+  font-size: 13.5px;
+  line-height: 1.4;
+  color: var(--ink);
+  text-wrap: balance;
+}
+.card-figure { display: flex; align-items: baseline; gap: 9px; }
+.card-figure .price { font-size: 28px; letter-spacing: -0.035em; }
+.card-figure .chg { font-size: 12px; }
+.card-foot {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  border-top: 1px solid var(--rule);
+  padding-top: 8px;
+}
+.card .spark { height: 36px; align-self: end; }
+
+/* ── market detail ──────────────────────────────────────────────────── */
+
+.market {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 330px;
+  gap: 14px;
+  padding: 14px;
+  align-items: start;
+}
+.market-main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.market-side { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 14px; }
+
+.contract {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--up);
+  padding: 16px 18px;
+}
+.contract[data-session='auction'] { border-left-color: var(--halt); }
+.contract[data-session='pre_open'] { border-left-color: var(--amber); }
+.contract[data-session='closed'] { border-left-color: var(--closed); }
+.contract-id { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.contract-id .sym { font-size: 12px; font-weight: 600; letter-spacing: -0.02em; }
+.contract h1.question { font-size: 21px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 14px; }
+.contract-figures { display: flex; flex-wrap: wrap; gap: 26px; }
+.stat.big b { font-size: 25px; letter-spacing: -0.035em; }
+
+/* Resolution rules sit here, above the price history and above the book,
+ * because a contract nobody can read the terms of is not a market. */
+.resolution {
+  background: var(--sunk);
+  border: 1px solid var(--rule);
+  border-left: 2px solid var(--amber);
+  padding: 14px 18px;
+}
+.resolution h2 {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--amber);
+  margin-bottom: 9px;
+}
+.resolution p { font-size: 13px; line-height: 1.5; margin-bottom: 11px; text-wrap: pretty; }
+.resolution ul { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.resolution li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 12px; }
+.resolution li > span {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  min-width: 148px;
+}
+.resolution li > em { font-style: normal; font-size: 11px; color: var(--ink-faint); flex-basis: 100%; padding-left: 156px; }
+
+.chart-body { padding: 6px; min-height: 260px; }
+
+/* ── disclosures ────────────────────────────────────────────────────── */
+
+/* The order book and the specification are real and reachable, and neither is
+ * the first thing a person needs. Collapsed by default is the documented
+ * pattern; leading with a depth ladder is an operator's view of the world. */
+.drop > summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 9px 11px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid transparent;
+  transition: background-color 130ms cubic-bezier(0.2, 0, 0, 1);
+}
+.drop > summary::-webkit-details-marker { display: none; }
+.drop > summary::before {
+  content: '+';
+  font-family: var(--mono);
+  color: var(--amber);
+  font-size: 13px;
+  line-height: 1;
+}
+.drop[open] > summary::before { content: '\2212'; }
+.drop[open] > summary { border-bottom-color: var(--rule); }
+.drop > summary:hover { background: var(--raised); }
+.drop > summary h2 { border: none; padding: 0; }
+.hint { font-size: 10.5px; color: var(--ink-faint); }
+
+.advanced { border-top: 1px solid var(--rule); padding-top: 9px; }
+.advanced > summary {
+  list-style: none;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding: 3px 0;
+}
+.advanced > summary::-webkit-details-marker { display: none; }
+.advanced > summary::before { content: '+ '; color: var(--amber); }
+.advanced[open] > summary::before { content: '\2212 '; }
+.advanced > summary:hover { color: var(--amber); }
+.advanced > * + * { margin-top: 9px; }
+
+/* ── ticket ─────────────────────────────────────────────────────────── */
+
+.sides button { display: flex; flex-direction: column; gap: 2px; padding: 10px 8px; }
+.sides button em {
+  font-style: normal;
+  font-family: var(--display);
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  opacity: 0.7;
+}
+
+.pos { display: flex; flex-direction: column; gap: 7px; padding: 11px; }
+.pos > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.pos span {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.pos b { font-size: 13px; }
+
+/* ── portfolio figures ──────────────────────────────────────────────── */
+
+.figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.figure { padding: 14px; gap: 5px; }
+.figure span {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.figure b { font-size: 24px; letter-spacing: -0.035em; }
+
+/* ── empty and first-run states ─────────────────────────────────────── */
+
+.onboard { padding: 56px 24px; max-width: 520px; }
+.onboard h2 { font-size: 19px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 8px; }
+.onboard p { font-size: 13px; line-height: 1.55; color: var(--ink-dim); }
+
+/* ── nav grouping ───────────────────────────────────────────────────── */
+
+.nav-group {
+  padding: 10px 16px 5px;
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  border-top: 1px solid var(--rule);
+  margin-top: 6px;
+}
+
+@media (max-width: 1100px) {
+  .market { grid-template-columns: minmax(0, 1fr); }
+  .market-side { position: static; }
+}
