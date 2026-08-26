@@ -32,6 +32,7 @@ __all__ = [
     "ObservationWindow",
     "DataPolicy",
     "MissingDataPolicy",
+    "DistributionSchedule",
     "ContractSpec",
 ]
 
@@ -124,6 +125,62 @@ class DataPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class DistributionSchedule:
+    """Cash paid to holders while the contract is still alive.
+
+    This is the whole difference between a share and a future. A future pays
+    once, at the end; a share pays as it goes and is worth the stream of what
+    is left. Everything else about the two is the same machinery, which is why
+    this is a field on the spec rather than a new kind of contract.
+
+    Each window is measured separately, so the amount paid in one period is a
+    different number from the amount paid in the next -- the point of a
+    dividend, and the reason a share's price moves on news about one quarter
+    rather than only on news about the end of its life.
+
+    What this deliberately is *not* is a perpetual claim. Every contract here
+    settles inside a known interval, which is what makes collateral arithmetic
+    rather than a value-at-risk estimate, and a claim that never settles has no
+    such interval. The honest finite version is this: a stream with a last
+    payment, after which the contract is worth whatever its terminal payoff
+    says -- zero, for a pure strip. Perpetuity would need funding rates and
+    margin calls, which is a different risk model from the one this venue is
+    built on, and adopting it silently would weaken the guarantee everything
+    else here depends on.
+    """
+
+    windows: tuple[ObservationWindow, ...]
+    # Applied to the metric level measured over each window, exactly as the
+    # contract's own payoff is applied to the level over the whole window.
+    payoff: Payoff
+
+    def __post_init__(self) -> None:
+        if not self.windows:
+            raise ValueError(
+                "a distribution schedule with no windows is a future; leave "
+                "distribution unset instead"
+            )
+        for earlier, later in zip(self.windows, self.windows[1:]):
+            if earlier.end > later.start:
+                raise ValueError(
+                    f"distribution windows overlap: {_iso(earlier.end)} runs past "
+                    f"{_iso(later.start)}. Overlapping periods would pay for the "
+                    "same battles twice."
+                )
+
+    def bounds(self, level_bounds: tuple[float, float]) -> tuple[float, float]:
+        """The range the whole stream can pay, across every window."""
+        low, high = self.payoff.bounds(level_bounds)
+        return (low * len(self.windows), high * len(self.windows))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "windows": [window.to_dict() for window in self.windows],
+            "payoff": self.payoff.to_dict(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ContractSpec:
     """Everything needed to settle a contract, and nothing that could change."""
 
@@ -141,6 +198,9 @@ class ContractSpec:
     tick_size: str = "0.01"
     lot_size: int = 1
     metadata: tuple[tuple[str, str], ...] = field(default=())
+    # Interim payments, if this contract makes any. Unset for everything
+    # that pays once at the end, which is every contract but a share.
+    distribution: DistributionSchedule | None = None
 
     def __post_init__(self) -> None:
         if not self.contract_id:
@@ -159,6 +219,18 @@ class ContractSpec:
             raise ValueError("tick_size must be positive")
         if self.lot_size <= 0:
             raise ValueError("lot_size must be positive")
+        if self.distribution is not None:
+            first = self.distribution.windows[0]
+            last = self.distribution.windows[-1]
+            if first.start < self.window.start or last.end > self.window.end:
+                raise ValueError(
+                    f"{self.contract_id}: distributions run "
+                    f"{_iso(first.start)}..{_iso(last.end)}, outside the "
+                    f"observation window {_iso(self.window.start)}.."
+                    f"{_iso(self.window.end)}. A payment measured outside "
+                    "the window the contract observes is measured on "
+                    "evidence the contract never claimed to be about."
+                )
 
     def atoms(self) -> tuple[MetricRef, ...]:
         """Every metric the oracle must resolve to settle this contract."""
@@ -181,6 +253,41 @@ class ContractSpec:
             quantize_to_tick(high, self.tick_size),
         )
 
+    @property
+    def value_bounds(self) -> tuple[Decimal, Decimal]:
+        """The range the whole claim can be worth: settlement and every payment.
+
+        The same thing as :attr:`settlement_bounds` for every contract that
+        pays once. For a contract that pays as it goes, a short can be asked
+        for the stream as well as for the settlement, so this is what
+        collateral has to cover -- and it is still arithmetic, because a
+        bounded metric paid a fixed number of times is bounded too.
+        """
+        low, high = self.settlement_bounds
+        if self.distribution is None:
+            return (low, high)
+        stream_low, stream_high = self.distribution.bounds(self.underlying.bounds())
+        return (
+            low + quantize_to_tick(stream_low, self.tick_size),
+            high + quantize_to_tick(stream_high, self.tick_size),
+        )
+
+    def claim_value(self, level: float) -> float:
+        """What the whole claim pays, at one level of the underlying.
+
+        Every payment priced off the same level, which is what someone holding
+        a single view of the underlying can do -- and a single view is what an
+        agent here has. Settlement resolves each window separately, so the
+        realised stream will not be flat; this is the expectation, not the
+        path.
+        """
+        total = self.payoff.apply(level)
+        if self.distribution is not None:
+            total += self.distribution.payoff.apply(level) * len(
+                self.distribution.windows
+            )
+        return total
+
     def collateral_for(self, quantity: int, price: Decimal) -> Decimal:
         """Worst-case loss on ``quantity`` lots opened at ``price``.
 
@@ -188,7 +295,7 @@ class ContractSpec:
         must be posted for the position to be fully collateralised in the sense
         Kalshi uses: the holder can lose it all, and can never owe more.
         """
-        low, high = self.settlement_bounds
+        low, high = self.value_bounds
         if quantity >= 0:
             return Decimal(quantity) * (price - low)
         return Decimal(-quantity) * (high - price)
@@ -205,6 +312,9 @@ class ContractSpec:
             "tick_size": self.tick_size,
             "lot_size": self.lot_size,
             "metadata": [list(pair) for pair in self.metadata],
+            "distribution": (
+                None if self.distribution is None else self.distribution.to_dict()
+            ),
         }
 
     @property

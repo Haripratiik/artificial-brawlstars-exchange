@@ -51,6 +51,10 @@ class InstrumentClass:
     # the contract, so these come in term structures and their prices carry
     # information about carry rather than only about the level.
     COMMODITY = "commodity"
+    # A claim that pays while it is alive and settles at the end, rather
+    # than paying once. What a share is, minus the perpetuity that this
+    # venue's collateral model cannot express.
+    EQUITY = "equity"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,11 +100,24 @@ class Instrument:
 
     @property
     def settlement_bounds(self) -> tuple[Decimal, Decimal]:
+        """What the contract can settle at, at the end."""
         return self.spec.settlement_bounds
 
     @property
+    def value_bounds(self) -> tuple[Decimal, Decimal]:
+        """What the whole claim can be worth, payments included.
+
+        Identical to :attr:`settlement_bounds` for anything that pays once,
+        which is everything but a share. Collateral, price bands and the
+        opening anchor all work from this rather than from the settlement
+        range, because a short in something that pays as it goes can be asked
+        for the stream too.
+        """
+        return self.spec.value_bounds
+
+    @property
     def tick_bounds(self) -> tuple[Price, Price]:
-        low, high = self.settlement_bounds
+        low, high = self.value_bounds
         return (self.to_ticks(low), self.to_ticks(high))
 
     @property
@@ -110,7 +127,7 @@ class Instrument:
 
     @property
     def bounds_in_minor(self) -> tuple[Money, Money]:
-        low, high = self.settlement_bounds
+        low, high = self.value_bounds
         return (to_money(low), to_money(high))
 
     def price_in_minor(self, ticks: Price | int) -> Money:
@@ -147,6 +164,10 @@ class Instrument:
             return InstrumentClass.PUT
         if isinstance(self.spec.payoff, Binary):
             return InstrumentClass.EVENT
+        # Paying before it settles is what makes a share a share, so it decides
+        # ahead of what the payments are written on.
+        if self.spec.distribution is not None:
+            return InstrumentClass.EQUITY
         if isinstance(self.spec.underlying, Difference):
             return InstrumentClass.SPREAD
         if isinstance(self.spec.underlying, Basket):

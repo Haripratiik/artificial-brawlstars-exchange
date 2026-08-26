@@ -185,7 +185,7 @@ check('percent of nothing is a dash', fmt.percent(null) === '—');
 const revealed = { ...store, reveal: false };
 const quiet = views.trade(revealed);
 check('the settlement value is not on the page', !quiet.includes('Will actually settle at'));
-check('there is a way to reveal it', quiet.includes('Reveal what this will settle at'));
+check('there is a way to reveal it', quiet.includes('Reveal what this is worth'));
 check('the reveal starts closed', !/<details class="spoiler"[^>]*open/.test(quiet));
 // The target line is the only thing that draws a dashed stroke, so that is
 // what to look for -- the word "settles" also appears in the resolution copy
@@ -219,6 +219,28 @@ check('prediction markets are named', marketsHtml.includes('Prediction Markets')
 check('options are named', marketsHtml.includes('Options'));
 check('the venue vocabulary is translated', views.groupOf('event') === 'Prediction Markets');
 check('an unknown class still groups', views.groupOf('zzz') === 'Other');
+check('shares are named', marketsHtml.includes('Shares'));
+check('commodities are named', marketsHtml.includes('Commodities'));
+
+/* A share and a commodity each say something a future does not, and each has a
+ * way of silently reading as a future instead. The share's terminal payoff is
+ * zero, so anything that describes it from the payoff alone truthfully reports
+ * that it settles at nothing -- which is the one sentence guaranteed to make a
+ * reader skip it. The commodity's week *is* the contract, so a description
+ * that omits the week makes four distinct instruments read identically. */
+for (const [symbol, book] of Object.entries(fixture.snapshot.books)) {
+  const terms = fmt.describe(book.contract);
+  if (book.class === 'equity') {
+    check(`${symbol} is described as a share`, /share of/i.test(terms), terms);
+    check(`${symbol} does not read as worthless`, !/Settles at 0 /.test(terms), terms);
+    check(`${symbol} says how many payments`, /weeks/.test(terms), terms);
+  }
+  if (book.class === 'commodity') {
+    check(`${symbol} names its delivery week`,
+          /delivered/.test(views.question(book.contract) ?? ''),
+          'a delivery contract that does not say when is four copies of itself');
+  }
+}
 
 // Region keys are what stop the screen being rebuilt under the reader.
 const tradeRegions = (views.trade(store).match(/data-region="/g) || []).length;

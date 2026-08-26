@@ -226,9 +226,28 @@ This is where the C++ half lands, and the ordering is the point: the Python engi
 - Brier decomposition into calibration + resolution + uncertainty against known `p*`.
 - **Exit:** a defensible result with error bars, including the case where the market *loses*.
 
-### Phase 7 — Multi-asset and microstructure
+### Phase 7 — Multi-asset and microstructure — **mostly done**
 Spreads, class indices, cross-market arbitrage, stat-arb; then latency tiers, maker/taker fees,
 queue position, adverse-selection diagnostics.
+
+Eight instrument classes now, all derived from the contract rather than declared:
+`future`, `event`, `call`, `put`, `spread`, `index`, `commodity`, `equity`. The last two
+are the ones that needed new machinery rather than a new combination.
+
+A **commodity** is written on an amount delivered rather than on a proportion, which
+makes its delivery window part of the contract and gives consecutive weeks a term
+structure instead of four copies of one thing. A **share** pays before it settles, which
+is the whole difference between a share and a future, and it needed a distribution that
+moves cash between holders while narrowing the range collateral is computed from — so
+that meeting an obligation cannot be what makes an account insolvent.
+
+Deliberately not built: a perpetual. Every contract here settles inside a known interval,
+which is what makes collateral arithmetic rather than a value-at-risk estimate, and a
+claim that never settles has none. `docs/GAPS.md` carries the reasoning.
+
+Still open in this phase: the option surface is internally inconsistent because the maker
+prices every book independently, and the arbitrageur knows no relation between a share and
+the future on the same underlying.
 
 ### Phase 8 — Real historical replay
 Only now, once Track A has accrued enough. Same harness, `BrawlReplayWorld`, one real patch as

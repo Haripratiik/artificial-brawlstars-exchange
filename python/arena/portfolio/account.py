@@ -160,6 +160,37 @@ class Account:
                 position.quantity, average, bounds
             )
 
+    def distribute(
+        self, symbol: str, per_unit: Money, bounds: tuple[Money, Money]
+    ) -> Money:
+        """Pay (or charge) a distribution on this symbol, and re-post collateral.
+
+        Longs receive, shorts pay, and the two are the same line of arithmetic
+        because a short position is a negative quantity. Nothing is realised:
+        the holder gets cash and the contract is worth exactly that much less,
+        so equity does not move. That is the correct accounting and it is also
+        the thing most likely to be got wrong -- booking a dividend as profit
+        would report a holder as making money for holding.
+
+        ``bounds`` are the claim's range *after* this payment, which is what
+        makes the collateral work out. Paying ``d`` per unit lowers both ends of
+        what is left by ``d``, so a short's requirement falls by exactly the
+        cash it just paid and a long's rises by exactly the cash it just
+        received. Neither can be made insolvent by a payment it was always
+        going to make.
+        """
+        position = self.positions.get(symbol)
+        if position is None or position.quantity == 0:
+            return Money(0)
+
+        amount = Money(position.quantity * int(per_unit))
+        self.cash = Money(int(self.cash) + int(amount))
+        average = Money(int(position.cost_basis) // position.quantity)
+        self.collateral[symbol] = self.collateral_required(
+            position.quantity, average, bounds
+        )
+        return amount
+
     # -- settlement --------------------------------------------------------
 
     def settle(self, symbol: str, settlement_value: Money) -> Money:

@@ -53,6 +53,24 @@ VENUE_ID = AgentId("venue")
 HUMAN_ID = AgentId("you")
 
 
+def _distribution(instrument) -> dict[str, object] | None:
+    """The payment stream, for a contract that has one.
+
+    Only shares do. What a trader needs is how many payments are left and what
+    each is written on, because that -- not the settlement -- is what they are
+    buying.
+    """
+    schedule = instrument.spec.distribution
+    if schedule is None:
+        return None
+    return {
+        "periods": len(schedule.windows),
+        "payoff": schedule.payoff.to_dict(),
+        "first": schedule.windows[0].end.strftime("%Y-%m-%d"),
+        "last": schedule.windows[-1].end.strftime("%Y-%m-%d"),
+    }
+
+
 class HumanAgent(TradingAgent):
     """The person at the browser, as an ordinary participant.
 
@@ -242,7 +260,12 @@ class LiveMarket:
                 ),
                 "class": instrument.instrument_class,
                 "tick": str(instrument.tick_size),
-                "bounds": [str(b) for b in instrument.settlement_bounds],
+                # What the claim can be worth, not only what it settles at.
+                # A share settles at nothing because it has paid everything
+                # out, so the settlement range would say a share is worth
+                # zero to zero -- true at the last instant and useless
+                # before it.
+                "bounds": [str(b) for b in instrument.value_bounds],
                 "trades": len(self.venue.engine(symbol).tape),
                 # What the contract actually is, so a trader can see the terms
                 # rather than only the price. A market where you cannot read the
@@ -253,6 +276,7 @@ class LiveMarket:
                     "underlying": instrument.spec.underlying.to_dict(),
                     "expiry": instrument.expiry.strftime("%Y-%m-%d"),
                     "digest": instrument.spec.spec_digest[7:19],
+                    "distribution": _distribution(instrument),
                 },
             }
 

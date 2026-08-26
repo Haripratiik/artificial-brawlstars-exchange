@@ -50,6 +50,16 @@ and a resting order is an offer about the present, so the mark is now held
 inside whichever side of the touch is standing. It was found by a test that had
 been passing for the wrong reason.
 
+**The revealed truth was in the wrong unit, now fixed.** Every contract page
+offers to show what it will actually be worth, which exists so the market's
+price can be checked against the answer -- the single most useful thing a
+simulated exchange can offer. It was reported in ticks while every price beside
+it was in contract units, so a future marking at 4,663 revealed a "settlement"
+of 18,677 and the chart drew that as a target line four times off the top of
+its own series. On a commodity at a 0.05 tick the factor was twenty. It
+survived because the wrong number looks exactly like a number, and it was found
+by opening the page and reading it rather than by any test.
+
 ## What is genuinely absent
 
 Checked for, and not present:
@@ -213,22 +223,30 @@ each item. Struck items link to what actually happened.
 3. **No auth.** Every browser shares one account, so two tabs are one trader.
 4. **Liquidity does not replenish, and one maker is the whole other side.**
    Measured by sweeping 60% of the standing offers on `SPIKE_WR_FUT`: the
-   maker absorbs **98%** of the order, ends short 2,181 lots, and is then past
-   the point where its collateral lets it quote at all. The offer it was run
-   over at never returns -- the spread goes from 2.75 to 24.50 and is still
-   24.50 three minutes later, and the maker has worked none of the position
-   off. A real book repairs in milliseconds because the maker that got run over
-   is one of several; here it is the only one. `test_a_large_order_moves_the_price`
-   asserts this as it is, so the assertion fails on the day replenishment works.
+   maker absorbs **89%** of the order, ends short about 1,150 lots, and is then
+   past the point where its collateral lets it quote at all. The offer it was
+   run over at never returns -- the spread goes from 0.50 to 1,021.00 and is
+   **exactly** 1,021.00 three minutes later, with the maker having worked none
+   of the position off. Not a slow repair: no repair. A real book mends in
+   milliseconds because the maker that got run over is one of several; here it
+   is the only one. `test_a_large_order_moves_the_price` asserts this as it is,
+   so the assertion fails on the day replenishment works.
 5. **Cancel rate is ~60%, not >90%.** Nothing requotes faster than 300ms.
-6. **Stocks.** Commodities exist now; a stock needs a dividend stream, and a
-   perpetual one would break the bounded-settlement invariant that makes
-   collateral arithmetic here rather than an estimate. See below.
+6. **A share and its future have no relation the arbitrageur knows.**
+   `SPIKE_EQ` pays four weekly instalments of 1,000 times the same rate that
+   `SPIKE_WR_FUT` pays 10,000 times once, so one should be worth 0.4 of the
+   other up to the value of getting collateral back early. Measured at three
+   minutes the share trades 2.2% above 0.4x the future -- but the share is 1.6%
+   above its own fair value and the future 0.5% below, so almost all of that
+   gap is two independent errors rather than a term premium. The relation is
+   not in `arbitrageur.py`, which skips anything that pays as it goes, so
+   nothing enforces it and nothing has measured it under controls.
 
 ## Asset classes
 
-Six classes, derived from the contract rather than declared: `future`, `event`,
-`call`, `put`, `spread`, `index`, and now `commodity`.
+Eight classes, derived from the contract rather than declared: `future`,
+`event`, `call`, `put`, `spread`, `index`, and now `commodity` and `equity`.
+Twenty-one contracts listed on the live exchange.
 
 **Commodities** are a claim on an *amount delivered* rather than on a
 proportion, which is what makes the delivery window part of the contract and
@@ -240,16 +258,45 @@ that it measures volume **in the canonical corpus, not in the game** — a wider
 crawl sees more battles. Sample-based volume indices trade on that footing in
 the real world; the honest move is to say so rather than imply a census.
 
-**A stock is not built, and the reason is structural.** What distinguishes a
-stock from a future is a dividend stream and no expiry. The stream is easy — a
-periodic distribution that pays holders and charges shorts, conserving exactly.
-The perpetual part is not: every instrument here settles inside a known
-interval, which is precisely what makes collateral arithmetic rather than a
-value-at-risk estimate, and a contract that never settles has no such interval.
-Real perpetuals solve this with funding rates and margin calls, which is a
-different risk model from the one this venue is built on. The honest version is
-a finite-lived claim that *also* pays a distribution each week — an equity strip
-rather than a share — and that would fit without weakening anything.
+**Shares** pay before they settle, which is the entire difference between a
+share and a future. `SPIKE_EQ` pays 1,000 times a Brawler's adjusted win rate
+at the end of each of four weeks and then expires worth nothing, because it has
+paid everything out. Each week is measured on its own evidence, so a bad week
+is a smaller payment rather than a smaller number at the end -- and the price is
+the stream that is left, which is why a share reprices on news about one period
+rather than only on news about its last day.
+
+Three pieces of machinery had to be honest for that to work, and each is the
+kind of thing that would have looked fine while being wrong:
+
+- **A distribution is not profit.** The holder receives cash and the contract is
+  worth exactly that much less, so equity does not move. Booking it as realised
+  gain would report a holder as making money for holding.
+- **Collateral narrows in the same instant the cash moves.** Paying `d` per unit
+  lowers both ends of what is left by `d`, so a short's requirement falls by
+  precisely the cash it just paid. Without that, meeting an obligation it always
+  had would look like a margin breach.
+- **The range a contract collateralises against is not the range it settles in.**
+  A share settles at zero; it is worth up to 4,000. `value_bounds` covers the
+  claim and `settlement_bounds` covers the ending, and collateral uses the
+  first.
+
+**What is deliberately absent is the perpetuity.** A stock has no expiry, and
+every contract here settles inside a known interval -- which is exactly what
+makes collateral arithmetic rather than a value-at-risk estimate. A claim that
+never settles has no such interval. Real perpetuals live without one by using
+funding rates and margin calls, which is a different risk model from the one
+this venue is built on, and adopting it quietly to make the word "stock" fit
+would weaken the guarantee everything else here depends on. What is listed is
+the honest finite version, and it is called a share rather than a stock for
+that reason.
+
+**What is missing to make the timing matter.** With no interest rate, a stream
+and a lump sum of the same size are worth the same, so a share and 0.4 of the
+matching future differ only in when collateral comes back. That should be worth
+something here, because Experiment 1 found capital is the binding constraint on
+this market -- but it is a prediction, not a result, and measuring it needs the
+relation in the arbitrageur and a controlled run.
 
 ## Superseded reasoning, kept for the record
 

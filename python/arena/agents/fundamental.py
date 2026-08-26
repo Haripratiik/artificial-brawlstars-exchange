@@ -112,7 +112,11 @@ class FundamentalTrader(TradingAgent):
             # of them being special-cased -- and because a closed form would
             # need a volatility model this agent has no business owning.
             draws = [centre + ctx.rng.gauss(0.0, sigma) for _ in range(self.draws)]
-            values = [payoff.apply(d) for d in draws]
+            # The whole claim, not only the settlement: a contract that pays
+            # as it goes is worth the stream as well as the end, and an
+            # agent valuing only the end would price a share at whatever
+            # is left after the last payment -- nothing, for a pure strip.
+            values = [instrument.spec.claim_value(d) for d in draws]
             value = sum(values) / len(values)
 
             # Dispersion of the payoff under the agent's own uncertainty. This

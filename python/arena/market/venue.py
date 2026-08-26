@@ -166,6 +166,16 @@ class Venue:
         # Last traded price per symbol, in ticks. The mark of last resort when
         # a book has no two-sided quote.
         self._last: dict[str, Price] = {}
+        # Distributions already paid, per symbol, per unit and cumulative.
+        #
+        # A contract that pays as it goes is worth less afterwards by exactly
+        # what it paid, so this is subtracted from both ends of its range. That
+        # is not bookkeeping tidiness: collateral is computed from those ends,
+        # so without it a short would keep reserving against a stream it has
+        # already paid out, and would look insolvent for having met its
+        # obligations.
+        self._distributed: dict[str, Money] = {}
+        self._distributions_paid: dict[str, int] = {}
         # Fees move value; they do not destroy it. Whatever traders pay lands in
         # the venue's own account, which is checked for conservation like any
         # other -- so switching fees on cannot quietly break the ledger's central
@@ -253,13 +263,28 @@ class Venue:
         if last is not None:
             reference = int(last) * tick
         else:
-            low, high = instrument.bounds_in_minor
+            low, high = self.bounds_in_minor(instrument)
             reference = (int(low) + int(high)) // 2
         if book.best_bid is not None:
             reference = max(reference, int(book.best_bid) * tick)
         if book.best_ask is not None:
             reference = min(reference, int(book.best_ask) * tick)
         return Money(reference)
+
+    def bounds_in_minor(self, instrument: Instrument) -> tuple[Money, Money]:
+        """The claim's remaining range, after whatever it has already paid.
+
+        The instrument declares the range it had when it was written. The venue
+        is the only thing that knows how much of it has since been handed over,
+        so the adjustment lives here rather than on the contract -- which must
+        stay immutable, because every price ever printed against it was an
+        opinion about the terms as written.
+        """
+        low, high = instrument.bounds_in_minor
+        paid = int(self._distributed.get(instrument.symbol, Money(0)))
+        if not paid:
+            return (low, high)
+        return (Money(int(low) - paid), Money(int(high) - paid))
 
     def marks(self) -> dict[str, Money]:
         return {symbol: self.mark(symbol) for symbol in self.registry.symbols}
@@ -339,7 +364,7 @@ class Venue:
         """
         symbol = instrument.symbol
         account = self.account(agent_id)
-        bounds = instrument.bounds_in_minor
+        bounds = self.bounds_in_minor(instrument)
         working = dict(self._working.get((agent_id, symbol), {}))
 
         if isinstance(command, Replace):
@@ -466,7 +491,7 @@ class Venue:
     def _book_fills(
         self, symbol: str, instrument: Instrument, events: list[Event]
     ) -> None:
-        bounds = instrument.bounds_in_minor
+        bounds = self.bounds_in_minor(instrument)
         charged = 0
         for event in events:
             if isinstance(event, Filled):
@@ -694,6 +719,48 @@ class Venue:
                 )
             ),
         }
+
+    def distribute(self, symbol: str, per_unit: Money) -> Money:
+        """Pay ``per_unit`` to every holder of ``symbol``, charged to every short.
+
+        Returns the gross amount that moved, which is a measurement rather than
+        a total: the net is always zero, because every contract outstanding has
+        someone long it and someone short it, and the same integer is added on
+        one side and subtracted on the other. That is why this cannot break
+        conservation even in principle, and the test still checks it.
+
+        The remaining range narrows by exactly what was paid, so collateral
+        follows the cash in the same instant rather than a moment later.
+        """
+        instrument = self.registry.require(symbol)
+        if instrument.spec.distribution is None:
+            raise ValueError(
+                f"{symbol} declares no distribution schedule; paying one would be "
+                "a payment its holders never agreed to and its shorts never "
+                "collateralised"
+            )
+        if symbol in self._settled:
+            raise ValueError(f"{symbol} has already settled")
+
+        scheduled = len(instrument.spec.distribution.windows)
+        already = self._distributions_paid.get(symbol, 0)
+        if already >= scheduled:
+            raise ValueError(
+                f"{symbol} has already paid all {scheduled} of its scheduled "
+                f"distributions; a further payment would take the claim below "
+                "the range its collateral was computed from"
+            )
+
+        self._distributed[symbol] = Money(
+            int(self._distributed.get(symbol, Money(0))) + int(per_unit)
+        )
+        self._distributions_paid[symbol] = already + 1
+        bounds = self.bounds_in_minor(instrument)
+
+        moved = 0
+        for account in self._accounts.values():
+            moved += abs(int(account.distribute(symbol, per_unit, bounds)))
+        return Money(moved)
 
     def conservation_check(self) -> Money:
         """Total equity minus total starting capital, in minor units.

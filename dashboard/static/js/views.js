@@ -43,13 +43,14 @@ const CLASS_GROUPS = [
   ['future', 'Futures', 'Settles at the measured rate itself.'],
   ['call', 'Options', 'The right to what lies past a strike.'],
   ['put', 'Options', 'The right to what lies past a strike.'],
+  ['equity', 'Shares', 'Pays out every week it is alive, then expires. Worth the payments that are left.'],
   ['commodity', 'Commodities', 'An amount delivered in one week, not a rate. Each week trades separately.'],
   ['spread', 'Spreads', 'One Brawler priced against another.'],
   ['index', 'Indices', 'A weighted basket of several Brawlers.'],
 ];
 
-const GROUP_ORDER = ['Prediction Markets', 'Futures', 'Commodities', 'Options',
-                     'Spreads', 'Indices', 'Other'];
+const GROUP_ORDER = ['Prediction Markets', 'Futures', 'Shares', 'Commodities',
+                     'Options', 'Spreads', 'Indices', 'Other'];
 
 export function groupOf(assetClass) {
   return CLASS_GROUPS.find(([key]) => key === assetClass)?.[1] ?? 'Other';
@@ -161,7 +162,7 @@ export function matches(symbol, book, query) {
 }
 
 /** The contract as a question, which is how a person holds it in their head. */
-function question(contract) {
+export function question(contract) {
   const p = contract?.payoff;
   if (!p) return '';
   const subject = esc(subjectName(contract?.underlying));
@@ -181,6 +182,12 @@ function question(contract) {
   // a different week is a different instrument, which is what gives a commodity
   // its term structure. Saying "where it settles" would hide the only thing
   // distinguishing one rung from the next.
+  // A share is worth the stream, so the stream is the question. Saying
+  // "where it settles" would be the one number that is always zero.
+  const stream = contract?.distribution;
+  if (stream) {
+    return `A share of ${what}, paid out over ${count(stream.periods)} weeks`;
+  }
   if (contract?.underlying?.ref?.kind === 'quantity') {
     return `How many thousand battles ${subject} plays, delivered ${esc(week(contract))}`;
   }
@@ -338,21 +345,32 @@ function resolution(book, meta) {
   const p = book.contract?.payoff ?? {};
   const settles = meta.settles_at;
   const bounds = (book.bounds ?? []).map((b) => price(b)).join(' and ');
+  // A share settles at nothing and is worth the stream, so the range is what
+  // it can be *worth*, and the revealed number is what it pays out in total.
+  const stream = book.contract?.distribution;
   return `<section class="resolution">
     <h2>How This Resolves</h2>
     <p>${describe(book.contract)}</p>
     <ul>
       <li><span>Measured over</span>
           <b>the observation window ending ${esc(book.contract?.expiry ?? 'expiry')}</b></li>
-      <li><span>Settles between</span><b class="mono">${bounds || '—'}</b></li>
+      <li><span>${stream ? 'Can be worth' : 'Settles between'}</span>
+          <b class="mono">${bounds || '—'}</b></li>
+      ${stream
+        ? `<li><span>Pays</span><b>${count(stream.periods)} times, the last on
+             ${esc(stream.last)}</b></li>`
+        : ''}
       ${p.kind === 'binary'
         ? `<li><span>Pays</span><b class="mono">${price(p.payout)} if it happens, ${price(0)} if not</b></li>`
         : ''}
     </ul>
     ${settles != null
       ? `<details class="spoiler">
-           <summary>Reveal what this will settle at</summary>
-           <p>This contract settles at <b class="mono up">${price(settles)}</b>.</p>
+           <summary>Reveal what this is worth</summary>
+           <p>${stream
+             ? `This share pays out <b class="mono up">${price(settles)}</b> in total
+                across its life.`
+             : `This contract settles at <b class="mono up">${price(settles)}</b>.`}</p>
            <p class="note">Only a simulation can tell you this, and printing it on
              the page turns a prediction market into a countdown: there is nothing
              left to discover and nothing to disagree about. Kept behind a click so
@@ -368,7 +386,8 @@ function specification(book) {
     ['Contract', book.contract?.id],
     ['Class', book.class],
     ['Tick size', book.tick],
-    ['Settlement range', (book.bounds ?? []).join(' … ')],
+    [book.contract?.distribution ? 'Value range' : 'Settlement range',
+     (book.bounds ?? []).join(' … ')],
     ['Expiry', book.contract?.expiry],
     ['Spec digest', book.contract?.digest],
   ];

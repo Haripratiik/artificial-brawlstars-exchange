@@ -237,22 +237,28 @@ class BayesianFundamental(TradingAgent):
         payoff = instrument.spec.payoff
         tick = float(instrument.tick_size)
 
-        if isinstance(payoff, Binary):
+        pays_as_it_goes = instrument.spec.distribution is not None
+
+        if isinstance(payoff, Binary) and not pays_as_it_goes:
             probability = self._binary_view(a, b, payoff)
             value = probability * payoff.payout
             # A Bernoulli payout: variance is p(1-p) times the payout squared.
             spread = math.sqrt(max(0.0, probability * (1.0 - probability))) * abs(payoff.payout)
-        elif isinstance(payoff, Linear):
+        elif isinstance(payoff, Linear) and not pays_as_it_goes:
             mean = a / (a + b)
             variance = a * b / ((a + b) ** 2 * (a + b + 1.0))
             value = payoff.apply(mean)
             spread = abs(payoff.scale) * math.sqrt(variance)
         else:
-            # Kinked or otherwise non-linear: sample the posterior. E[payoff]
-            # and payoff(E) differ here, and the difference is the option's
-            # time value.
+            # Kinked, otherwise non-linear, or paying as it goes: sample the
+            # posterior. E[payoff] and payoff(E) differ for a kinked payoff,
+            # and the difference is the option's time value. A share takes
+            # this path because what it is worth is the stream plus the end,
+            # which is what claim_value adds up -- valuing only the payoff
+            # would price a pure strip at nothing.
+            claim = instrument.spec.claim_value
             samples = [
-                payoff.apply(ctx.rng.betavariate(a, b)) for _ in range(self.draws)
+                claim(ctx.rng.betavariate(a, b)) for _ in range(self.draws)
             ]
             value = sum(samples) / len(samples)
             spread = math.sqrt(

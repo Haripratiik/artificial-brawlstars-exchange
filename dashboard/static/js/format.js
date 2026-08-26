@@ -99,6 +99,18 @@ export function describe(contract) {
   const p = contract.payoff || {};
   const u = contract.underlying || {};
   const subject = subjectOf(u);
+  // A share is described by what it pays on the way, not by what is left at
+  // the end -- which is nothing, because it has all been paid out. Reading the
+  // terminal payoff would truthfully report "settles at 0 times SPIKE", and
+  // anyone who read that would conclude the contract was worthless.
+  const stream = contract.distribution;
+  if (stream) {
+    const d = stream.payoff || {};
+    return `A share of ${subject}. Pays ${d.scale} &times; its measured rate at the `
+      + `end of each of ${stream.periods} weeks, the last on ${esc(stream.last)}, `
+      + `then expires worth nothing &mdash; by then it has paid out everything it `
+      + `was ever going to.`;
+  }
   switch (p.kind) {
     case 'binary':
       return `Pays ${p.payout} for every contract if ${subject}'s measured rate `

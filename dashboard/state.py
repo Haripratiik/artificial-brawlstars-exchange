@@ -269,10 +269,21 @@ class MarketRunner:
             payload = instrument.to_dict()
             payload["session"] = venue.session(symbol).value
             payload["trades"] = len(venue.engine(symbol).tape)
-            # What it will actually settle at, in ticks. Only meaningful because
-            # this is a simulation -- and it is the whole reason the market can
+            # What it will actually be worth, **as a price**. Only meaningful
+            # because this is a simulation, and the whole reason the market can
             # be scored rather than merely watched.
-            payload["settles_at"] = settle.get(symbol)
+            #
+            # In ticks until now, while every price on the page beside it was
+            # in contract units. So the one number whose entire job is to be
+            # compared against the market was in a different unit from the
+            # market: SPIKE_WR_FUT marked at 4,663 and revealed a "settlement"
+            # of 18,677, and the chart drew that as a target line four times
+            # off the top of the series. It looked like a number rather than
+            # like a bug, which is why it survived.
+            ticks = settle.get(symbol)
+            payload["settles_at"] = (
+                None if ticks is None else float(instrument.from_ticks(round(ticks)))
+            )
             out.append(payload)
         return out
 

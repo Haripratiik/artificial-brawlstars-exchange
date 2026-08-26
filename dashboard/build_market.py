@@ -25,7 +25,12 @@ from arena.agents.fundamental import FundamentalTrader
 from arena.agents.market_maker import MarketMaker
 from arena.agents.noise import NoiseTrader
 from arena.contracts.payoff import Binary, Call, Linear, Put
-from arena.contracts.spec import ContractSpec, DataPolicy, ObservationWindow
+from arena.contracts.spec import (
+    ContractSpec,
+    DataPolicy,
+    DistributionSchedule,
+    ObservationWindow,
+)
 from arena.contracts.underlying import Basket, Difference, Single
 from arena.exchange.types import AgentId
 from arena.market.instrument import Instrument
@@ -33,7 +38,7 @@ from arena.market.live import HUMAN_ID, VENUE_ID, HumanAgent, LiveMarket
 from arena.market.fees import FREE, FeeSchedule
 from arena.market.venue import Venue
 from arena.market.venue_agent import VenueAgent
-from arena.settlement.engine import settle
+from arena.settlement.engine import distributions, settle
 from arena.sim.kernel import Kernel
 from arena.sim.latency import PairwiseLatency
 from arena.sim.time import micros, millis
@@ -69,6 +74,7 @@ def _spec(
     payoff,
     tick: str = "0.25",
     window: ObservationWindow | None = None,
+    distribution: DistributionSchedule | None = None,
 ) -> ContractSpec:
     """A contract on the default window unless one is given.
 
@@ -88,6 +94,7 @@ def _spec(
         reference_id=REFERENCE_ID,
         published_at=measured.start - timedelta(days=1),
         tick_size=tick,
+        distribution=distribution,
     )
 
 
@@ -186,6 +193,47 @@ def instruments() -> list[Instrument]:
             )
             for strike in (4_700, 4_750)
         ],
+        # ── shares ───────────────────────────────────────────────────────
+        #
+        # A claim on a Brawler's performance that pays as it goes: 1,000 a week
+        # times its adjusted win rate that week, four weeks, then nothing left.
+        # The stream is what makes it a share rather than a future, and the
+        # weekly measurement is what makes the stream interesting -- a bad week
+        # is a smaller payment, not a smaller number at the end.
+        #
+        # This is not a perpetual and does not pretend to be. Every contract
+        # here settles inside a known interval, which is what makes collateral
+        # arithmetic rather than an estimate; a claim with no last payment has
+        # no such interval, and the funding-rate machinery that lets real
+        # perpetuals live without one is a different risk model. What is here
+        # is the honest finite version, and docs/GAPS.md says so.
+        #
+        # It also carries a relation worth watching. Four weekly payments at
+        # 1,000 add to 4,000 times the same rate the four-week future pays
+        # 10,000 times, so SPIKE_EQ should be worth 0.4 x SPIKE_WR_FUT if the
+        # only thing that mattered were the level. The one thing that should
+        # separate them is that a share hands collateral back as it pays, and
+        # capital is the binding constraint in this market -- so the share
+        # ought to trade at a premium to the future. Nothing has been done to
+        # make that happen; it is a prediction, and the two are listed side by
+        # side so it can be checked.
+        *[
+            Instrument(
+                f"{subject}_EQ",
+                _spec(
+                    f"{subject}_EQ",
+                    _wr(subject),
+                    # Nothing is left at the end: it has all been paid out.
+                    Linear(0.0),
+                    tick="0.25",
+                    distribution=DistributionSchedule(
+                        windows=tuple(DELIVERY_WEEKS),
+                        payoff=Linear(1_000.0),
+                    ),
+                ),
+            )
+            for subject in ("SPIKE", "CROW")
+        ],
         # ── commodities ────────────────────────────────────────────────
         #
         # A claim on an amount delivered, not on a proportion. Battles played,
@@ -262,16 +310,22 @@ def true_levels(listed: list[Instrument]) -> dict[str, float]:
 
 
 def true_values(listed: list[Instrument]) -> dict[str, float]:
-    """What each contract will actually settle at, in ticks. For reporting."""
+    """What each contract is actually worth over its life, in ticks.
+
+    Settlement plus every payment it makes on the way, which for everything
+    that pays once is just the settlement. A share settles at nothing, so
+    reporting only the settlement would say a share is worth nothing -- and it
+    would be right about the last instant and wrong about every other one.
+    """
     _dataset, _reference, oracle = _world()
 
     values: dict[str, float] = {}
     for instrument in listed:
         result = settle(instrument.spec, oracle)
-        if result.settled and result.settlement_value is not None:
-            values[instrument.symbol] = float(
-                instrument.to_ticks(result.settlement_value)
-            )
+        if not (result.settled and result.settlement_value is not None):
+            continue
+        total = result.settlement_value + sum(distributions(instrument.spec, oracle))
+        values[instrument.symbol] = float(instrument.to_ticks(total))
     return values
 
 

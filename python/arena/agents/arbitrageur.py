@@ -82,6 +82,13 @@ def derive_relations(instruments: dict[str, Instrument]) -> list[Relation]:
     futures: dict[str, tuple[str, float]] = {}
     for symbol, instrument in sorted(instruments.items()):
         payoff = instrument.spec.payoff
+        # A contract that pays as it goes is not a price reference for one
+        # that does not, however linear its settlement looks: two claims on the
+        # same underlying that pay at different times are different things, and
+        # the relation between them is a real one this agent does not yet know
+        # how to trade.
+        if instrument.spec.distribution is not None:
+            continue
         if isinstance(payoff, Linear) and payoff.offset == 0.0:
             futures[_underlying_key(instrument)] = (symbol, payoff.scale)
 
@@ -90,6 +97,8 @@ def derive_relations(instruments: dict[str, Instrument]) -> list[Relation]:
     # -- spreads and indices: linearity of the underlying algebra ------------
     for symbol, instrument in sorted(instruments.items()):
         payoff = instrument.spec.payoff
+        if instrument.spec.distribution is not None:
+            continue
         if not (isinstance(payoff, Linear) and payoff.offset == 0.0):
             continue
         shape = instrument.spec.underlying.to_dict()

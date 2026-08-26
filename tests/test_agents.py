@@ -252,18 +252,24 @@ def test_a_large_order_moves_the_price():
     # And the market does *not* repair itself, which is a defect this test
     # pins rather than a property it wants.
     #
-    # One maker supplies essentially the whole other side: measured here it
-    # absorbs 98% of the sweep and is left short more than two thousand lots,
-    # which is far past the point where its collateral lets it quote again. So
-    # the offer it was run over at never comes back, the spread stays ten times
-    # wider than it started, and a minute later the maker has worked none of it
-    # off. A real book repairs in milliseconds because the maker that got run
-    # over is one of many. Asserted as it is so that the day replenishment
-    # arrives, this test fails and says so.
+    # One maker supplies essentially the whole other side: measured at the time
+    # of writing it absorbs ~89% of the sweep and is left short about two
+    # thousand lots, which is far past the point where its collateral lets it
+    # quote again. So the offer it was run over at never comes back, the spread
+    # stays ten times wider than it started, and a minute later the maker has
+    # worked none of it off. A real book repairs in milliseconds because the
+    # maker that got run over is one of many. Asserted as it is so that the day
+    # replenishment arrives, this test fails and says so.
+    #
+    # The bound is well below the measured figure on purpose. The claim is "one
+    # maker is the whole other side", not "89%" -- and the exact fraction moves
+    # whenever an unrelated contract is listed, because the seeded market takes
+    # a different path. Pinning it tight made this fail twice for reasons that
+    # had nothing to do with what it is testing.
     maker = m.venue.account("mm-1").positions[SYMBOL]
     assert int(maker.quantity) < 0
     absorbed = -int(maker.quantity) / int(position.quantity)
-    assert absorbed > 0.9, f"the maker took only {absorbed:.0%} of the sweep"
+    assert absorbed > 0.75, f"the maker took only {absorbed:.0%} of the sweep"
 
     before_spread = float(instrument.from_ticks(book.best_ask)) - float(
         instrument.from_ticks(book.best_bid)

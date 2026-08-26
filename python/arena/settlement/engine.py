@@ -20,12 +20,15 @@ the exchange cannot represent.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from arena.contracts.spec import ContractSpec
 from arena.determinism import quantize_to_tick
 from arena.settlement.oracle import MetricResolution, MetricUnavailable, Oracle
 from arena.settlement.result import SettlementResult, SettlementStatus
 
 __all__ = [
+    "distributions",
     "settle",
     "ReferenceMismatch",
     "ReferenceLookahead",
@@ -56,6 +59,37 @@ class ReferenceLookahead(Exception):
     and the settlement it produces will be *better* than an honest one, which
     is precisely why nothing about the result would invite suspicion.
     """
+
+
+def distributions(spec: ContractSpec, oracle: Oracle) -> tuple[Decimal, ...]:
+    """What this contract pays at each of its distribution dates, in order.
+
+    Each window is resolved on its own evidence, which is the entire point: a
+    share is worth the stream, and the stream is only interesting because its
+    periods differ. Resolving the whole life once and dividing would produce a
+    flat series that no amount of news could move.
+
+    Empty for a contract that pays once at the end, which is every contract
+    that is not a share.
+
+    Raises rather than voiding when a period cannot be measured. A settlement
+    can void because the world failed to produce evidence and everyone walks
+    away whole; a payment cannot, because by the time it is due, earlier
+    payments have already moved cash between accounts and there is no longer a
+    state to walk back to. Deciding what a missing period should pay is a
+    contract-terms question, and it is left open rather than guessed.
+    """
+    if spec.distribution is None:
+        return ()
+
+    paid: list[Decimal] = []
+    for window in spec.distribution.windows:
+        values = {ref: oracle.resolve(ref, window).value for ref in spec.atoms()}
+        level = spec.underlying.evaluate(values)
+        paid.append(
+            quantize_to_tick(spec.distribution.payoff.apply(level), spec.tick_size)
+        )
+    return tuple(paid)
 
 
 def settle(spec: ContractSpec, oracle: Oracle) -> SettlementResult:

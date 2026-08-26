@@ -33,8 +33,12 @@ from arena.exchange.types import (
     TimeInForce,
 )
 from arena.market.instrument import Instrument, InstrumentClass
-from arena.market.venue import Venue
+from arena.market.live import HUMAN_ID
+from arena.market.venue import SymbolCommand, Venue
 from arena.settlement.result import SettlementResult, SettlementStatus
+from arena.sim.time import seconds
+
+from dashboard.build_market import build
 
 UTC = timezone.utc
 WINDOW = ObservationWindow(
@@ -475,3 +479,200 @@ def test_volume_is_not_standardized_and_says_so():
     assert METRIC_KINDS["battle_volume"] == "quantity"
     assert "battle_volume" in METRICS
     assert METRICS["battle_volume"].__doc__ is not None
+
+
+# --------------------------------------------------------------------------
+# Shares: a claim that pays before it settles
+# --------------------------------------------------------------------------
+
+
+def test_a_schedule_of_payments_makes_a_share_not_a_future():
+    """Paying as it goes is the whole difference, so it decides the class."""
+    from dashboard.build_market import instruments
+
+    listed = {i.symbol: i for i in instruments()}
+    assert listed["SPIKE_EQ"].instrument_class == "equity"
+    assert listed["SPIKE_WR_FUT"].instrument_class == "future"
+    # Written on the same metric, so nothing but the stream separates them.
+    assert (
+        listed["SPIKE_EQ"].spec.underlying.to_dict()
+        == listed["SPIKE_WR_FUT"].spec.underlying.to_dict()
+    )
+
+
+def test_a_share_settles_at_nothing_and_is_worth_something_anyway():
+    """The value is the stream, which is exactly what makes it a share.
+
+    A contract valued only at its settlement would price this at zero, and be
+    right about the last instant and wrong about every other one.
+    """
+    from dashboard.build_market import instruments, true_values
+
+    listed = {i.symbol: i for i in instruments()}
+    share = listed["SPIKE_EQ"]
+    low, high = share.settlement_bounds
+    assert low == high == 0
+
+    values = true_values(list(listed.values()))
+    assert values["SPIKE_EQ"] > 0
+    # And its range covers the payments, or a short could owe more than it
+    # posted.
+    low, high = share.value_bounds
+    assert float(share.from_ticks(int(values["SPIKE_EQ"]))) <= float(high)
+
+
+def test_a_share_is_a_scaled_claim_on_the_same_thing_as_its_future():
+    """Four weekly payments of 1,000 against one payment of 10,000.
+
+    If the level were flat the share would be worth exactly 0.4 of the future,
+    which is what makes the pair worth listing: any gap between them is either
+    a mispricing or the price of getting collateral back early, and both are
+    findings.
+    """
+    from dashboard.build_market import instruments, true_values
+
+    values = true_values(instruments())
+    ratio = values["SPIKE_EQ"] / values["SPIKE_WR_FUT"]
+    # Not exactly 0.4: each week is measured on its own evidence, so the four
+    # weekly rates do not average to the four-week rate once each is rounded to
+    # the tick grid. Within a tenth of a percent, which is the rounding.
+    assert abs(ratio - 0.4) < 0.001, ratio
+
+
+def test_paying_a_distribution_moves_cash_and_conserves_it():
+    """Longs receive, shorts pay, and nothing is created."""
+    from arena.portfolio.money import Money
+
+    market = build(seed=7, human_cash=4_000_000)
+    market.kernel.start()
+    market.kernel.advance(until=seconds(30))
+    market.human.enqueue(
+        SymbolCommand(
+            "SPIKE_EQ",
+            Submit(HUMAN_ID, Side.BUY, Quantity(40), None, OrderType.MARKET, TimeInForce.IOC),
+        )
+    )
+    market.kernel.advance(until=seconds(31))
+
+    venue = market.venue
+    position = venue.account(HUMAN_ID).positions["SPIKE_EQ"]
+    assert position.quantity > 0
+
+    before = int(venue.account(HUMAN_ID).cash)
+    assert int(venue.conservation_check()) == 0
+    moved = int(venue.distribute("SPIKE_EQ", Money(467 * 1_000_000)))
+    assert moved > 0
+    # The human was paid its share of the stream, to the unit.
+    after = int(venue.account(HUMAN_ID).cash)
+    assert after - before == position.quantity * 467 * 1_000_000
+    # And it came from somewhere: value moved, none appeared.
+    assert int(venue.conservation_check()) == 0
+
+
+def test_a_distribution_leaves_no_account_short_of_collateral():
+    """Paying what you owe cannot be what makes you insolvent.
+
+    A short pays cash out, and the claim it is short is worth exactly that much
+    less afterwards, so its requirement has to fall in the same instant. If the
+    range it collateralises against did not narrow, meeting an obligation it
+    always had would look like a margin breach.
+    """
+    market = build(seed=7)
+    market.kernel.start()
+    market.kernel.advance(until=seconds(40))
+
+    venue = market.venue
+    holders = [
+        agent
+        for agent, account in venue.accounts.items()
+        if account.positions.get("SPIKE_EQ") and account.positions["SPIKE_EQ"].quantity
+    ]
+    assert holders, "nobody is holding the share; the test proves nothing"
+
+    from arena.portfolio.money import Money
+
+    venue.distribute("SPIKE_EQ", Money(467 * 1_000_000))
+    for agent in holders:
+        account = venue.accounts[agent]
+        assert int(account.free_cash) >= 0, f"{agent} was made insolvent by a payment"
+
+
+def test_a_share_cannot_pay_more_than_it_promised():
+    """Past the last scheduled payment there is nothing left to pay from."""
+    from arena.portfolio.money import Money
+
+    market = build(seed=7)
+    venue = market.venue
+    for _ in range(4):
+        venue.distribute("SPIKE_EQ", Money(100 * 1_000_000))
+    with pytest.raises(ValueError, match="already paid all 4"):
+        venue.distribute("SPIKE_EQ", Money(100 * 1_000_000))
+
+
+def test_only_a_share_can_pay_a_distribution():
+    """A payment nobody collateralised is a payment nobody can make."""
+    from arena.portfolio.money import Money
+
+    market = build(seed=7)
+    with pytest.raises(ValueError, match="declares no distribution schedule"):
+        market.venue.distribute("SPIKE_WR_FUT", Money(1_000_000))
+
+
+def test_the_payments_differ_from_week_to_week():
+    """A flat stream would prove the windows were never measured separately."""
+    from dashboard.build_market import _world, instruments
+    from arena.settlement.engine import distributions
+
+    _dataset, _reference, oracle = _world()
+    share = {i.symbol: i for i in instruments()}["SPIKE_EQ"]
+    paid = distributions(share.spec, oracle)
+    assert len(paid) == 4
+    assert len(set(paid)) > 1, f"every week paid the same: {paid}"
+
+
+def test_distribution_windows_must_lie_inside_the_contract_window():
+    """A payment measured outside the window is measured on other evidence."""
+    from datetime import UTC, datetime, timedelta
+
+    from arena.contracts.payoff import Linear
+    from arena.contracts.spec import (
+        ContractSpec,
+        DataPolicy,
+        DistributionSchedule,
+        ObservationWindow,
+    )
+    from arena.worlds.brawl.metrics import metric_ref
+    from arena.contracts.underlying import Single
+
+    window = ObservationWindow(
+        datetime(2026, 8, 31, tzinfo=UTC), datetime(2026, 9, 7, tzinfo=UTC)
+    )
+    outside = ObservationWindow(window.start, window.end + timedelta(days=7))
+    with pytest.raises(ValueError, match="outside the observation window"):
+        ContractSpec(
+            contract_id="BAD",
+            underlying=Single(metric_ref("adjusted_win_rate", "SPIKE")),
+            payoff=Linear(0.0),
+            window=window,
+            policy=DataPolicy(min_sample_size=1),
+            reference_id="ref",
+            published_at=window.start - timedelta(days=1),
+            distribution=DistributionSchedule(windows=(outside,), payoff=Linear(1.0)),
+        )
+
+
+def test_overlapping_payment_windows_are_refused():
+    """Overlapping periods would pay for the same battles twice."""
+    from datetime import UTC, datetime
+
+    from arena.contracts.payoff import Linear
+    from arena.contracts.spec import DistributionSchedule, ObservationWindow
+
+    first = ObservationWindow(
+        datetime(2026, 8, 31, tzinfo=UTC), datetime(2026, 9, 10, tzinfo=UTC)
+    )
+    second = ObservationWindow(
+        datetime(2026, 9, 7, tzinfo=UTC), datetime(2026, 9, 14, tzinfo=UTC)
+    )
+    with pytest.raises(ValueError, match="overlap"):
+        DistributionSchedule(windows=(first, second), payoff=Linear(1.0))

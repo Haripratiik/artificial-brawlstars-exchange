@@ -407,3 +407,29 @@ def test_the_controller_loads_and_throttles_its_rendering(client, tmp_path):
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_the_revealed_value_is_a_price_not_a_tick_count(client):
+    """The one number whose job is to be compared against the market.
+
+    It was reported in ticks while the mark beside it was in contract units,
+    so a future marking at 4,663 revealed a settlement of 18,677 and the chart
+    drew a target line four times off the top of its own series. Nothing looked
+    broken; it just looked like a number.
+    """
+    listed = client.get("/api/instruments").json()["instruments"]
+    snapshot = runner.market.snapshot()
+
+    checked = 0
+    for entry in listed:
+        settles = entry.get("settles_at")
+        if settles in (None, 0):
+            continue
+        low, high = (float(b) for b in snapshot["books"][entry["symbol"]]["bounds"])
+        assert low <= settles <= high, (
+            f"{entry['symbol']} reveals {settles}, outside the range {low}..{high} "
+            "the same page prints -- which is what a tick count looks like when "
+            "it is read as a price"
+        )
+        checked += 1
+    assert checked > 5, "too few contracts had a value to check"
