@@ -422,6 +422,118 @@ def adjusted_win_rate_lift(
     )
 
 
+def stratum_dispersion(
+    rows: Sequence[AggregateRow],
+    reference: ReferenceSnapshot,
+    *,
+    min_stratum_battles: int = 0,
+    min_coverage: float = 0.0,
+    missing_strata: str = MissingStrata.IMPUTE_FROM_PRIOR,
+) -> MetricOutcome:
+    """How unevenly a Brawler performs across the strata it plays in.
+
+    The weight-weighted standard deviation of the per-stratum shrunk rates
+    around the standardized mean -- which is to say the *second* moment of
+    exactly the quantity :func:`adjusted_win_rate` reports the first moment of.
+    Same walk, same shrinkage, same coverage gate; the only difference is which
+    moment comes out at the end.
+
+    That makes it a different kind of claim rather than a different number. A
+    future on a win rate pays for being right about how good something is. This
+    pays for being right about how *consistent* it is: a Brawler that wins
+    everywhere at 0.52 and one that wins at 0.70 on half the maps and 0.34 on
+    the other half have the same adjusted win rate and are not remotely the
+    same thing to own. Dispersion is what separates them, and until now nothing
+    here could be written on it.
+
+    It is bounded, which is what lets it join this exchange at all. A rate
+    lives in [0, 1], so the standard deviation of a set of rates cannot exceed
+    0.5 -- reached only by a subject that wins every battle in half its strata
+    and loses every battle in the other half. Collateral therefore stays
+    arithmetic rather than becoming a variance estimate, which is the invariant
+    every contract here is built on.
+
+    **Imputed strata deliberately count.** A cell with no evidence contributes
+    its prior, and a prior sits near the middle, so imputing pulls dispersion
+    *down*. That is the honest direction: unmeasured strata are not evidence of
+    variability, and a metric that let them widen the spread would pay out for
+    thin data.
+    """
+    if missing_strata not in MissingStrata.ALL:
+        raise ValueError(f"missing_strata must be one of {MissingStrata.ALL}")
+
+    observed = _collapse(rows)
+    if not observed:
+        raise InsufficientEvidence("no rows in window")
+
+    contributing: list[tuple[str, float, float]] = []
+    covered_weight = 0.0
+    battles_used = 0
+    evidenced = 0
+    imputed = 0
+
+    for stratum in reference.strata:
+        weight = reference.weight_for(stratum)
+        if weight <= 0.0:
+            continue
+        cell = observed.get(stratum)
+        prior = reference.prior_for(stratum)
+        strength = reference.prior_strength
+
+        if cell is not None and cell.battles >= min_stratum_battles and cell.battles > 0:
+            value = (cell.scored_wins + strength * prior) / (cell.battles + strength)
+            covered_weight += weight
+            battles_used += cell.battles
+            evidenced += 1
+        elif missing_strata == MissingStrata.IMPUTE_FROM_PRIOR:
+            value = prior
+            imputed += 1
+        else:
+            continue
+
+        contributing.append((stratum.key, weight, value))
+
+    if not contributing:
+        raise InsufficientEvidence(
+            "no stratum could be evaluated",
+            f"{len(observed)} strata observed, none carrying reference weight",
+        )
+
+    coverage = covered_weight / reference.total_weight
+    if coverage < min_coverage:
+        raise InsufficientEvidence(
+            "insufficient strata coverage",
+            f"{coverage:.4f} of reference weight backed by evidence, "
+            f"{min_coverage:.4f} required",
+        )
+
+    ordered = sorted(contributing)
+    denominator = stable_sum(weight for _key, weight, _value in ordered)
+    mean = stable_sum(weight * value for _key, weight, value in ordered) / denominator
+    variance = (
+        stable_sum(weight * (value - mean) ** 2 for _key, weight, value in ordered)
+        / denominator
+    )
+
+    return MetricOutcome(
+        value=variance**0.5,
+        sample_size=battles_used,
+        diagnostics=(
+            ("metric", "stratum_dispersion"),
+            ("reference_id", reference.reference_id),
+            ("missing_strata_policy", missing_strata),
+            ("strata_evidenced", evidenced),
+            ("strata_imputed", imputed),
+            ("coverage", coverage),
+            ("battles_used", battles_used),
+            ("standardized_mean", mean),
+            ("variance", variance),
+            ("prior_strength", reference.prior_strength),
+            ("standardized", True),
+        ),
+    )
+
+
 def battle_volume(
     rows: Sequence[AggregateRow],
     reference: ReferenceSnapshot,
@@ -494,6 +606,7 @@ METRICS = {
     "adjusted_win_rate_lift": adjusted_win_rate_lift,
     "use_rate": use_rate,
     "battle_volume": battle_volume,
+    "stratum_dispersion": stratum_dispersion,
 }
 
 # The range each metric can take. A contract declares its own bounds -- the
@@ -515,6 +628,10 @@ METRIC_BOUNDS: dict[str, tuple[float, float]] = {
     # contract whose declared range does not contain what the oracle returned,
     # so an underestimate fails loudly rather than mispricing collateral.
     "battle_volume": (0.0, 500.0),
+    # A rate lives in [0, 1], so the standard deviation of a set of rates
+    # cannot exceed 0.5 -- reached only by winning everything in half the
+    # strata and nothing in the other half.
+    "stratum_dispersion": (0.0, 0.5),
 }
 
 # Whether each metric measures a proportion or an amount delivered. A contract
@@ -526,6 +643,10 @@ METRIC_KINDS: dict[str, str] = {
     "adjusted_win_rate_lift": "rate",
     "use_rate": "rate",
     "battle_volume": "quantity",
+    # Neither a rate nor an amount: a spread. A contract on one pays for being
+    # right about how *consistent* something is rather than how good it is, and
+    # those are different bets on the same subject.
+    "stratum_dispersion": "dispersion",
 }
 
 

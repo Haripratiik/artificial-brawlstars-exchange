@@ -196,6 +196,23 @@ class ContractSpec:
     reference_id: str
     published_at: datetime
     tick_size: str = "0.01"
+    # Coarser increments that apply above given prices, as ``(from, step)``
+    # pairs in ascending order. Empty means one increment everywhere.
+    #
+    # Real venues do this because a tick has two jobs that pull against each
+    # other. Too fine and the queue means nothing: anyone can step in front of
+    # a resting order for a hundredth of a penny, so priority is worthless and
+    # nobody posts size. Too coarse and the spread cannot narrow to what the
+    # market actually knows. The resolution that gets that balance right at 4
+    # is the wrong one at 4,000, so the increment scales with the price.
+    #
+    # ``tick_size`` remains the finest increment and the unit everything is
+    # represented in -- the engine matches on integer ticks and a variable unit
+    # would make a tick index mean different prices at different levels. The
+    # table is a rule about which prices may be *quoted*, enforced by the
+    # venue, and every increment in it has to be a whole multiple of the base
+    # or the rule would forbid prices the representation can express.
+    tick_table: tuple[tuple[str, str], ...] = field(default=())
     lot_size: int = 1
     metadata: tuple[tuple[str, str], ...] = field(default=())
     # Interim payments, if this contract makes any. Unset for everything
@@ -217,6 +234,25 @@ class ContractSpec:
             raise ValueError("reference_id is required; standardization must be pinned")
         if float(self.tick_size) <= 0:
             raise ValueError("tick_size must be positive")
+
+        base = Decimal(self.tick_size)
+        previous: Decimal | None = None
+        for threshold, increment in self.tick_table:
+            at = Decimal(threshold)
+            step = Decimal(increment)
+            if step <= 0:
+                raise ValueError(f"tick increment {increment} must be positive")
+            if step % base != 0:
+                raise ValueError(
+                    f"tick increment {increment} is not a multiple of the base tick "
+                    f"{self.tick_size}; the table would forbid prices the engine can "
+                    "represent, which is a rule nobody could follow"
+                )
+            if previous is not None and at <= previous:
+                raise ValueError(
+                    f"tick table thresholds must ascend; {threshold} follows {previous}"
+                )
+            previous = at
         if self.lot_size <= 0:
             raise ValueError("lot_size must be positive")
         if self.distribution is not None:
@@ -310,6 +346,7 @@ class ContractSpec:
             "reference_id": self.reference_id,
             "published_at": _iso(self.published_at),
             "tick_size": self.tick_size,
+            "tick_table": [list(row) for row in self.tick_table],
             "lot_size": self.lot_size,
             "metadata": [list(pair) for pair in self.metadata],
             "distribution": (

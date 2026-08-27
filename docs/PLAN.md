@@ -274,8 +274,33 @@ says where the market must go to set off a cascade -- and a cascade is measured 
 prevented, with a bound only so that a chain cannot run forever. Icebergs refresh to the
 back of their level, which is the priority they pay for hiding.
 
-Still open in this phase: pegged and minimum-quantity orders, tiered tick tables, message
-throttling and a kill switch, and clearing through a CCP.
+Nine instrument classes now. The newest, `volatility`, is the first claim here on a
+*second* moment: how unevenly a Brawler performs across the maps it plays rather than how
+well. SPIKE and CROW settle within 1.2% of each other on level and 68% apart on dispersion,
+which is a difference no other contract on the exchange could express -- and it is bounded,
+so collateral stays arithmetic.
+
+Tiered tick tables, message throttling and a kill switch are in. Writing the tests for the
+last two found that the throttle disabled the kill switch: a runaway is at its message cap
+by definition at the moment someone reaches for the switch.
+
+Pegged and minimum-quantity orders are in, and so is the half of a clearing house that
+matters here: collateral nets across contracts on one underlying, exactly. A conversion and
+a strip are riskless by identity and are now charged nothing for it. Novation is already
+true by construction -- collateral is exact, so nobody can default and there is nothing to
+be protected from.
+
+Phase 7 is done. What remains of it is deliberate: margin and liquidation stay out, because
+leverage is the decision to hold less collateral than the worst case, which replaces an
+exact subtraction with an estimate; and simultaneous venues with order routing, which is a
+different experiment rather than a missing feature.
+
+The next thing worth building is not on the exchange at all. Options here carry little time
+value because the underlying barely moves once its evidence has arrived, and the market's
+whole information budget is spent in the first minutes of a session. Experiment 3 --
+wealth dynamics, carrying P&L across trials to see whether the market migrates from a
+simple mean toward precision-weighting as capital tracks skill -- is the question the
+apparatus was built to answer.
 
 ### Phase 8 — Real historical replay
 Only now, once Track A has accrued enough. Same harness, `BrawlReplayWorld`, one real patch as

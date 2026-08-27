@@ -61,7 +61,7 @@ from arena.exchange.session import AuctionResult, SessionState, indicative_aucti
 from arena.market.fees import FREE, FeeSchedule
 from arena.market.instrument import Instrument
 from arena.portfolio.account import Account
-from arena.portfolio.money import Money, from_money, to_money
+from arena.portfolio.money import Money, from_money, to_money, MONEY_SCALE
 from arena.settlement.result import SettlementResult, SettlementStatus
 
 __all__ = ["Venue", "SymbolCommand", "InstrumentRegistry"]
@@ -122,6 +122,23 @@ class InstrumentRegistry:
 FEE_ACCOUNT_ID = AgentId("venue-treasury")
 
 
+def _underlying_of(instrument) -> str:
+    """What a contract is written on, as a key positions can be grouped by.
+
+    The window is deliberately *not* part of it. Two contracts on the same
+    Brawler over different weeks settle on different numbers, so strictly they
+    do not net -- but `claim_value` prices every one of them off a single level,
+    which is the same assumption an agent with one view of a Brawler makes, and
+    it is the assumption under which the strip identity holds exactly. Grouping
+    them together is therefore consistent with how everything else here values
+    them; grouping them apart would charge collateral against a package the
+    exchange itself treats as riskless.
+    """
+    from arena.determinism import canonical_json
+
+    return canonical_json(instrument.spec.underlying.to_dict())
+
+
 class Venue:
     """Books, accounts, and settlement across many instruments."""
 
@@ -137,6 +154,8 @@ class Venue:
         pause_ns: int = 300_000_000_000,
         reference_window_ns: int = 300_000_000_000,
         min_reference_prints: int = 20,
+        message_rate: int | None = None,
+        netting: bool = False,
         balances: dict[AgentId, Decimal | int] | None = None,
     ) -> None:
         self.name = name
@@ -233,6 +252,37 @@ class Venue:
         # should be making -- and paused 24 of 26 symbols inside a minute.
         self.reference_window_ns = reference_window_ns
         self.min_reference_prints = min_reference_prints
+        # Most commands the venue will take from one participant per second, or
+        # ``None`` for no limit.
+        #
+        # Not politeness. An algorithm that malfunctions emits orders faster
+        # than anything downstream can process them, and a venue with no limit
+        # is the one that goes down with it. It is also the only defence
+        # against a participant that discovers it can profit by simply sending
+        # more messages than everyone else.
+        self.message_rate = message_rate
+        # Command timestamps per participant, inside the last second.
+        self._messages: dict[AgentId, deque[int]] = {}
+        # Participants that have been stopped, and why.
+        #
+        # A kill switch is the control an exchange reaches for when a
+        # participant is doing something nobody wants to reason about at the
+        # time. It pulls everything they have working and refuses everything
+        # new, and it is deliberately blunt: the point of a kill switch is that
+        # it is the one control that always works.
+        self.halted_participants: dict[AgentId, str] = {}
+        # True while the venue is acting on its own behalf rather than relaying
+        # a participant's command, so its own housekeeping is not charged to
+        # the participant's message allowance.
+        self._internal = False
+        # Whether collateral may be netted across contracts on one underlying.
+        #
+        # Off by default so every published measurement keeps meaning what it
+        # meant. It is not a softening: the netted figure is the exact worst
+        # case of the portfolio over the whole range the metric can take, and a
+        # portfolio's worst case is never larger than the sum of its parts.
+        # What it stops is charging an account twice for a risk it holds once.
+        self.netting = netting
         # When each paused symbol may reopen.
         self._reopen_at: dict[str, int] = {}
         # Every breach, for the record: a halt that leaves no trace is
@@ -377,6 +427,53 @@ class Venue:
             return [
                 Rejected(SequenceNumber(0), agent_id, RejectReason.UNKNOWN_ORDER)
             ]
+
+        # A stopped participant may still cancel. Refusing that too would trap
+        # it in the orders it already has, which is the opposite of what
+        # stopping it is for.
+        if agent_id in self.halted_participants and isinstance(
+            command, (Submit, Replace)
+        ):
+            return [
+                Rejected(
+                    SequenceNumber(0),
+                    agent_id,
+                    RejectReason.PARTICIPANT_HALTED,
+                    getattr(command, "order_id", None),
+                )
+            ]
+        # Priced off the grid its band requires. Checked here rather than in
+        # the engine because it is a listing rule -- a fact about this contract
+        # on this venue -- and not a property of matching.
+        # Replace as well as Submit. Guarding only new orders leaves a hole
+        # wide enough to drive through -- the same argument the collateral
+        # check twenty lines below already makes, and for the same reason: a
+        # modification is a request for a price exactly as an order is. An
+        # accepted bid could be replaced onto a price its band forbids and rest
+        # there with nothing rejected.
+        priced = getattr(command, "price", None)
+        if isinstance(command, Replace):
+            priced = command.new_price
+        if isinstance(command, (Submit, Replace)) and priced is not None:
+            if not instrument.on_grid(instrument.from_ticks(priced)):
+                return [
+                    Rejected(
+                        SequenceNumber(0),
+                        agent_id,
+                        RejectReason.INVALID_PRICE,
+                        getattr(command, "order_id", None),
+                    )
+                ]
+
+        if self._rate_limited(agent_id):
+            return [
+                Rejected(
+                    SequenceNumber(0),
+                    agent_id,
+                    RejectReason.RATE_LIMITED,
+                    getattr(command, "order_id", None),
+                )
+            ]
         # A contract's own terms say when it stops trading, and until now
         # nothing enforced them: the expiry sat on the instrument as
         # documentation while the book carried on past it. Once the observation
@@ -514,7 +611,59 @@ class Venue:
             int(account.collateral_required(current - sells, worst_sell, bounds)),
         )
         released = int(account.collateral.get(symbol, Money(0)))
-        return int(account.free_cash) + released >= required
+        if int(account.free_cash) + released >= required:
+            return True
+        if not self.netting:
+            return False
+
+        # The per-contract figure says no. Ask the portfolio.
+        #
+        # Charging each contract its own worst case assumes the world can be
+        # simultaneously terrible for all of them, and for contracts on the
+        # same underlying it cannot: they are functions of the same number. The
+        # arbitrageur pays this most, because its whole business is holding
+        # packages that offset -- a conversion posts collateral on all three
+        # legs and can lose nothing at any level.
+        #
+        # This is exact rather than a model. See `arena/portfolio/netting.py`.
+        return self._portfolio_affords(agent_id, instrument, side, quantity, price)
+
+    def _portfolio_affords(
+        self,
+        agent_id: AgentId,
+        instrument: Instrument,
+        side: Side,
+        quantity: int,
+        price: Money,
+    ) -> bool:
+        """Whether the account covers its worst case with this order added.
+
+        Grouped by underlying, because only positions on the same underlying
+        are functions of the same number. Two Brawlers are two numbers, and
+        netting across them would need a correlation -- which would be an
+        estimate, and would give away the one thing this collateral model has.
+        """
+        from arena.portfolio.netting import worst_case
+
+        account = self.account(agent_id)
+        signed = quantity if side is Side.BUY else -quantity
+
+        groups: dict[str, list[tuple[Any, int, Decimal]]] = {}
+        for symbol, position in account.positions.items():
+            listed = self.registry.get(symbol)
+            if listed is None or position.quantity == 0:
+                continue
+            average = Decimal(int(position.cost_basis) // position.quantity) / MONEY_SCALE
+            groups.setdefault(_underlying_of(listed), []).append(
+                (listed.spec, int(position.quantity), average)
+            )
+
+        groups.setdefault(_underlying_of(instrument), []).append(
+            (instrument.spec, signed, Decimal(int(price)) / MONEY_SCALE)
+        )
+
+        needed = sum(worst_case(holdings) for holdings in groups.values())
+        return Decimal(int(account.cash)) / MONEY_SCALE >= needed
 
     def _market_exposure(
         self, symbol: str, instrument: Instrument, side: Side, quantity: int
@@ -570,13 +719,36 @@ class Venue:
                 # not queue priority survived, so the entry is updated in place.
                 # Leaving the old size and price here would reserve collateral
                 # against an order that no longer exists.
+                #
+                # The side comes from the event when there is no entry to read
+                # it from. Defaulting to BUY was a guess that is wrong half the
+                # time, and it had a real path to it: a pegged order with no
+                # reference acknowledges no price, so nothing is tracked, and
+                # its first reprice then booked a sell as a buy -- reserving
+                # against the wrong end of the range entirely.
                 book[event.order_id] = (
-                    book.get(event.order_id, (Side.BUY, 0, 0))[0],
+                    self._side_of(symbol, event.order_id, book),
                     int(event.quantity),
                     int(self.registry.require(symbol).price_in_minor(event.price)),
                 )
             elif isinstance(event, (Cancelled, Rejected)):
                 book.pop(getattr(event, "order_id", None), None)
+
+    def _side_of(self, symbol: str, order_id: OrderId, book: dict) -> Side:
+        """Which side a replaced order is on, asked of whoever still knows.
+
+        The venue's own record first, then the engine's book. Defaulting to
+        BUY was a guess that is wrong half the time, and there is a real path
+        to it: a pegged order with no reference acknowledges no price, so the
+        venue tracks nothing, and its first reprice then booked a sell as a buy
+        -- reserving against the wrong end of the settlement range entirely.
+        """
+        existing = book.get(order_id)
+        if existing is not None:
+            return existing[0]
+        engine = self._engines.get(symbol)
+        order = engine.book.get(order_id) if engine is not None else None
+        return order.side if order is not None else Side.BUY
 
     def _book_fills(
         self,
@@ -923,6 +1095,57 @@ class Venue:
             }
         )
         self._set_phase(symbol, SessionState.AUCTION)
+
+    def kill(self, agent_id: AgentId, reason: str = "operator") -> list[str]:
+        """Stop a participant: pull its working orders and refuse it more.
+
+        Returns the symbols it had orders in, so an operator can see what was
+        pulled rather than being told "done".
+        """
+        self.halted_participants[agent_id] = reason
+        touched: list[str] = []
+        # The venue's own cancels do not count against the participant's
+        # message allowance, and that is the whole point of the exception.
+        #
+        # A runaway algorithm is by definition at its cap at the moment someone
+        # reaches for the kill switch, so routing these through the ordinary
+        # path meant every one of them came back RATE_LIMITED -- the one
+        # control that is meant to always work was the one the limiter
+        # disabled, and `kill` reported the symbols as pulled while both orders
+        # were still standing in the book.
+        self._internal = True
+        try:
+            for (owner, symbol), working in list(self._working.items()):
+                if owner != agent_id or not working:
+                    continue
+                touched.append(symbol)
+                for order_id in list(working):
+                    self.submit(agent_id, symbol, Cancel(agent_id, order_id))
+        finally:
+            self._internal = False
+        return sorted(set(touched))
+
+    def revive(self, agent_id: AgentId) -> None:
+        """Let a stopped participant back in. It starts with nothing working."""
+        self.halted_participants.pop(agent_id, None)
+
+    def _rate_limited(self, agent_id: AgentId) -> bool:
+        """Whether this participant has already used its second's allowance.
+
+        A rolling second rather than a fixed one, so a burst cannot be split
+        across a boundary and counted as two quiet windows.
+        """
+        if self.message_rate is None or self._internal:
+            return False
+        now = self._now()
+        window = self._messages.setdefault(agent_id, deque())
+        cutoff = now - 1_000_000_000
+        while window and window[0] < cutoff:
+            window.popleft()
+        if len(window) >= self.message_rate:
+            return True
+        window.append(now)
+        return False
 
     def _apply_band(self, symbol: str) -> None:
         """Tell the engine where trades may print, before it matches anything.

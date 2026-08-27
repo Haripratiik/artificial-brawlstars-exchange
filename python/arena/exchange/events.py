@@ -26,6 +26,7 @@ from arena.exchange.types import (
     AgentId,
     OrderId,
     OrderType,
+    PegReference,
     Price,
     Quantity,
     RejectReason,
@@ -83,6 +84,29 @@ class Submit(Command):
     # The price that brings a stop order to life. Required for a stop, refused
     # for anything else.
     stop_price: Price | None = None
+    # What a pegged order tracks. Required for a peg, refused for anything else.
+    # A peg carries no ``price`` of its own: its price is the reference plus
+    # ``peg_offset``, recomputed whenever the reference moves.
+    #
+    # A separate field rather than a reuse of ``price``, and the reason is not
+    # tidiness. Everything above the engine reads ``price`` as a price -- the
+    # venue reserves collateral from it, and an offset of one tick sitting in
+    # that field would have it reserve one tick's worth of cash for an order
+    # that will rest at four thousand.
+    peg_to: PegReference | None = None
+    # Ticks away from the reference, signed toward worse prices for the side
+    # that is quoting: a buy with offset -1 bids one tick behind the reference,
+    # a sell with +1 offers one tick behind it. Zero means at the reference.
+    peg_offset: int = 0
+    # Refuse to execute for less than this in any one execution. Zero means no
+    # minimum.
+    #
+    # Not fill-or-kill, which is a statement about the whole order: an MPL order
+    # is content to fill in pieces, and only insists that no piece be tiny. The
+    # motive is cost rather than impatience -- a thousand-lot order picked off
+    # one lot at a time pays the spread a thousand times and tells the market
+    # what it is doing while it does so.
+    min_quantity: int = 0
 
 
 @dataclass(frozen=True, slots=True)

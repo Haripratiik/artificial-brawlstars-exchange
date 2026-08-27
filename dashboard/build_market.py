@@ -79,6 +79,7 @@ def _spec(
     tick: str = "0.25",
     window: ObservationWindow | None = None,
     distribution: DistributionSchedule | None = None,
+    tick_table: tuple[tuple[str, str], ...] = (),
 ) -> ContractSpec:
     """A contract on the default window unless one is given.
 
@@ -98,6 +99,7 @@ def _spec(
         reference_id=REFERENCE_ID,
         published_at=measured.start - timedelta(days=1),
         tick_size=tick,
+        tick_table=tick_table,
         distribution=distribution,
     )
 
@@ -166,8 +168,19 @@ def instruments() -> list[Instrument]:
         # since a basket priced against two of its three components is a bet on
         # the third -- so ASSASSIN_IDX floated free of the things it is defined
         # as. One contract closes that.
+        # The one contract with a tiered tick, so the rule is exercised rather
+        # than merely available. A quarter of a point up to 4,000 and a whole
+        # point above it: fine enough at the bottom of the range for a spread
+        # to narrow to what the market knows, coarse enough at the top that a
+        # resting order cannot be stepped in front of for a rounding error.
         Instrument(
-            "PIPER_WR_FUT", _spec("PIPER_WR_FUT", _wr("PIPER"), Linear(10_000.0))
+            "PIPER_WR_FUT",
+            _spec(
+                "PIPER_WR_FUT",
+                _wr("PIPER"),
+                Linear(10_000.0),
+                tick_table=(("4000.00", "1.00"),),
+            ),
         ),
         Instrument(
             "SPIKE_CROW",
@@ -204,6 +217,30 @@ def instruments() -> list[Instrument]:
                 ),
             )
             for strike in (4_700, 4_750)
+        ],
+        # ── volatility ───────────────────────────────────────────────────
+        #
+        # A claim on how unevenly a Brawler performs across the maps and modes
+        # it plays, rather than on how well. Two Brawlers with the same
+        # adjusted win rate and different spreads are not the same thing to
+        # own: one wins everywhere, the other wins on half the maps and loses
+        # on the rest, and only this contract can tell you which you are
+        # holding.
+        #
+        # It is the first claim here on a *second* moment, and it joins the
+        # exchange on the same terms as everything else: the standard deviation
+        # of a set of rates cannot exceed 0.5, so collateral stays arithmetic.
+        *[
+            Instrument(
+                f"{subject}_DISP",
+                _spec(
+                    f"{subject}_DISP",
+                    Single(metric_ref("stratum_dispersion", subject)),
+                    Linear(10_000.0),
+                    tick="0.25",
+                ),
+            )
+            for subject in ("SPIKE", "CROW")
         ],
         # ── the weekly legs a share is made of ───────────────────────────
         #

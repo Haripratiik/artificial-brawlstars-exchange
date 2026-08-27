@@ -64,24 +64,41 @@ by opening the page and reading it rather than by any test.
 
 Checked for, and not present:
 
+This table was written when almost all of it was true. Most of it no longer is,
+and it is kept in place -- struck through rather than deleted -- because the
+list of what an exchange has is more useful when you can see what it took to
+get there.
+
 | | |
 |---|---|
-| Opening / closing auctions | absent. Real markets open with a call auction, not continuous trading, and the opening print is a distinct mechanism |
-| Circuit breakers, price bands | absent. Nothing stops a runaway or a fat finger |
-| Trading halts and session states | absent. The market is always open, forever |
-| Stop and stop-limit orders | **present**, with cascades measured rather than prevented |
-| Iceberg / reserve orders | **present**, refreshing to the back of the queue |
-| Pegged, MPL orders | absent. Post-only is present |
-| Maker/taker fee schedule | absent. A `fee` parameter exists on the ledger and is never populated |
-| Tiered tick tables | absent. One tick size per instrument |
-| Clearing, novation, a CCP | absent. Settlement is direct between counterparties |
-| Margin, leverage, liquidation | absent by design; a later phase |
-| Message throttling, kill switch | absent |
-| Multiple venues, order routing | absent |
+| ~~Opening / closing auctions~~ | present. The market opens with a call, and a paused symbol reopens through one |
+| ~~Circuit breakers, price bands~~ | present, and they *prevent* trades outside the band as well as pausing after one |
+| ~~Trading halts and session states~~ | present: pre-open, continuous, auction, closed |
+| ~~Stop and stop-limit orders~~ | present, with cascades measured rather than prevented |
+| ~~Iceberg / reserve orders~~ | present, refreshing to the back of the queue |
+| ~~Maker/taker fee schedule~~ | present, with a separate auction rate, because a venue that rebates both sides of its own cross pays to open |
+| ~~Post-only~~ | present |
+| ~~Tiered tick tables~~ | present on one contract, so the rule is exercised rather than merely available |
+| ~~Message throttling, kill switch~~ | present. The kill switch bypasses the throttle, because a runaway is at its cap by definition |
+| ~~Pegged, MPL orders~~ | present |
+| ~~Clearing, novation, a CCP~~ | the part of it that matters here is present: collateral nets across one underlying, exactly. See below |
+| Margin, leverage, liquidation | absent **by design**, and it should stay that way while collateral is exact. See below |
+| Multiple venues, order routing | absent. The scoring-rule venue is selectable but not simultaneous |
 
 Order types implemented: **limit, market, stop and stop-limit**, with GTC,
 IOC, FOK and post-only, and an iceberg display size on anything that rests. A
 production venue offers twenty or more.
+
+### Why margin stays absent
+
+Not an omission. Every contract here settles inside a known interval, which is
+what makes collateral exact arithmetic rather than a value-at-risk estimate --
+a short at 5,100 on a contract bounded by 10,000 can lose at most 4,900 per lot,
+and nothing needs to model volatility to know it. Leverage is precisely the
+decision to hold *less* than that, which replaces the subtraction with an
+estimate and brings with it a liquidation engine, a margin model, and every way
+of being wrong about both. It is a different exchange, and worth building
+deliberately rather than by degrees.
 
 ## What is genuinely present, and correct
 
@@ -246,6 +263,114 @@ each item. Struck items link to what actually happened.
    windows under the same evidential bar. Settlement confirms it to the tick:
    1,874 + 1,859 + 1,875 + 1,869 = 7,477. `CROW_EQ` deliberately has no legs,
    so one share is arbitrage-linked and one is not.
+
+## Netting, which is the part of a clearing house that matters here
+
+A CCP does two things. It novates -- becoming buyer to every seller so nobody
+is exposed to anyone's default -- and it nets. The first is **already true and
+by construction**: collateral here is exact, so no participant can ever owe
+more than it posted, and there is no default to be protected from. Building
+novation would be ceremony.
+
+The second was missing and mattered. Collateral was charged per contract, so an
+account holding a long future, a long put and a short call at one strike posted
+against all three worst cases at once -- for a package that put-call parity says
+cannot lose anything at any level. The arbitrageur felt it hardest, since
+holding offsetting packages is its entire business.
+
+The usual objection to portfolio margining is that it means a risk *model*, a
+model is an estimate, and an estimate is exactly what this collateral is not.
+That objection does not apply, for the same reason single-contract collateral
+is exact: every instrument settles as a known function of a bounded scalar, so
+the worst case of a portfolio is
+
+    min over level in [0, 1] of  sum_i quantity_i * payoff_i(level)
+
+the minimum of a piecewise-linear function of one bounded variable. It is
+attained at an endpoint or a kink, every kink is known in advance -- a strike, a
+threshold -- and there are a handful. Evaluating each is not an approximation of
+the answer; it is the answer.
+
+| portfolio | gross | net | released |
+|---|---|---|---|
+| a lone future | 46,700 | 46,700 | 0% |
+| future against the same call | 100,000 | 46,000 | 54% |
+| a conversion: future, long put, short call | 100,000 | **0** | 100% |
+| a vertical spread | 54,000 | 500 | 99% |
+| a share against its four weekly legs | 39,990 | **0** | 100% |
+
+The zeros are the point: a conversion and a strip are riskless by identity, and
+an exchange that charges for them is charging for arithmetic it can do itself.
+The vertical's residual 500 is exactly the fifty-point gap between its strikes
+on ten lots.
+
+**Only same-underlying positions net.** A future on SPIKE and a future on CROW
+are functions of different numbers, and netting them would need a correlation --
+which would be an estimate, and the whole guarantee would be gone. That is not
+a limitation to be lifted later; it is the line between arithmetic and
+modelling.
+
+Off by default so every published measurement keeps meaning what it meant. With
+it on, over five minutes on seed 41, the arbitrageur attempted 1,094 trades
+against 944 and was starved of capital on 281 occasions against 374.
+
+## A ninth asset class: a claim on the second moment
+
+`SPIKE_DISP` and `CROW_DISP` settle on how *unevenly* a Brawler performs across
+the maps and modes it plays, not on how well. The metric walks exactly the same
+strata as `adjusted_win_rate`, with the same shrinkage and the same coverage
+gate; the only difference is which moment comes out at the end.
+
+That makes it a different kind of claim rather than a different number. A
+Brawler winning everywhere at 0.52 and one winning at 0.70 on half the maps and
+0.34 on the other half have the same adjusted win rate and are not remotely the
+same thing to own. Measured on the fixture, SPIKE and CROW settle within 1.2% of
+each other on level and **68% apart** on dispersion -- 0.0535 against 0.0318.
+Nothing else on the exchange could express that.
+
+It joins on the same terms as everything else: a rate lives in [0, 1], so the
+standard deviation of a set of rates cannot exceed 0.5, and collateral stays
+arithmetic. Imputed strata count toward it and pull it *down*, which is the
+honest direction -- an unmeasured cell is not evidence of variability, and a
+metric that let thin data widen the spread would pay out for having none.
+
+## Risk controls, and one that disabled the other
+
+**Message throttling.** A cap on commands per participant per second, on a
+rolling window so a burst cannot be split across a boundary and counted as two
+quiet ones. Not politeness: an algorithm that malfunctions emits orders faster
+than anything downstream can process, and the venue with no limit is the one
+that goes down with it.
+
+**A kill switch.** Pulls everything a participant has working and refuses it
+more. Deliberately blunt, because the point of a kill switch is that it is the
+one control that always works. A stopped participant may still *cancel* --
+refusing that too would trap it in the orders it already has, which is the
+opposite of what stopping it is for.
+
+The first version had the throttle applied to the kill switch's own cancels. A
+runaway is at its message cap by definition at the moment someone reaches for
+the switch, so every cancel came back `RATE_LIMITED` while `kill` reported the
+symbols as pulled and both orders stood in the book. Venue-originated commands
+now bypass the participant's allowance. It was found by writing the tests, not
+by running the market.
+
+## Tiered tick tables
+
+A tick has two jobs that pull against each other. Too fine and queue priority
+is worthless -- anyone can step in front of a resting order for a hundredth of a
+penny, so nobody posts size. Too coarse and the spread cannot narrow to what
+the market knows. The resolution that is right at a price of 4 is wrong at
+4,000.
+
+`PIPER_WR_FUT` carries the one tiered table -- a quarter point below 4,000, a
+whole point above -- so the rule is exercised rather than merely available. The
+base tick stays the unit everything is represented in, because the engine
+matches on integer ticks and a variable unit would make a tick index mean
+different prices at different levels. The table is a rule about which prices
+may be *quoted*, enforced by the venue, and agents snap their quotes onto it
+conservatively: a bid rounds down and an offer rounds up, so obeying the grid
+never makes a quote more aggressive than its author intended.
 
 ## Orders that hide, and orders that wait
 

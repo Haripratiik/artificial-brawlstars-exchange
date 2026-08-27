@@ -55,6 +55,10 @@ class InstrumentClass:
     # than paying once. What a share is, minus the perpetuity that this
     # venue's collateral model cannot express.
     EQUITY = "equity"
+    # A claim on how far apart something's outcomes are, rather than on where
+    # they sit. Two subjects with the same average and different spreads are
+    # not the same thing to own, and this is the contract that says so.
+    VOLATILITY = "volatility"
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +99,24 @@ class Instrument:
 
     def from_ticks(self, ticks: Price | int) -> Decimal:
         return Decimal(int(ticks)) * self.tick_size
+
+    def increment_at(self, price: Decimal) -> Decimal:
+        """The smallest step a quote at this price may move in.
+
+        The base tick below the table's first threshold, and the coarsest row
+        whose threshold the price has reached above it. A contract with no
+        table has one increment everywhere, which is what every contract here
+        had until there was a reason not to.
+        """
+        step = self.tick_size
+        for threshold, increment in self.spec.tick_table:
+            if abs(price) >= Decimal(threshold):
+                step = Decimal(increment)
+        return step
+
+    def on_grid(self, price: Decimal) -> bool:
+        """Whether a quote at this price sits on the increment it must."""
+        return price % self.increment_at(price) == 0
 
     # -- bounds and collateral ---------------------------------------------
 
@@ -176,8 +198,11 @@ class Instrument:
         # metric declares which it is, so this layer never has to know what the
         # subject means.
         reference = getattr(self.spec.underlying, "ref", None)
-        if reference is not None and getattr(reference, "kind", "rate") == "quantity":
+        kind = "rate" if reference is None else getattr(reference, "kind", "rate")
+        if kind == "quantity":
             return InstrumentClass.COMMODITY
+        if kind == "dispersion":
+            return InstrumentClass.VOLATILITY
         return InstrumentClass.FUTURE
 
     def to_dict(self) -> dict[str, Any]:

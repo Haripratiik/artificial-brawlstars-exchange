@@ -70,10 +70,11 @@ class MetricRef:
             raise ValueError("subject is required")
         if self.bounds[0] > self.bounds[1]:
             raise ValueError(f"bounds are inverted: {self.bounds}")
-        if self.kind not in ("rate", "quantity"):
+        if self.kind not in ("rate", "quantity", "dispersion"):
             raise ValueError(
-                f"metric kind {self.kind!r} must be 'rate' or 'quantity'; the "
-                "distinction decides how the instrument is classified"
+                f"metric kind {self.kind!r} must be 'rate', 'quantity' or "
+                "'dispersion'; the distinction decides how the instrument is "
+                "classified"
             )
         for field_name in ("modes", "maps", "trophy_buckets"):
             values = getattr(self, field_name)

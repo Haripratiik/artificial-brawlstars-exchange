@@ -70,7 +70,7 @@ from arena.determinism import canonical_json
 from arena.exchange.types import AgentId
 from arena.market.instrument import Instrument
 from arena.sim.kernel import SimulationContext
-from arena.sim.time import Duration, millis
+from arena.sim.time import Duration, millis, seconds
 
 __all__ = ["SurfaceMarketMaker", "ChainMember", "derive_chains", "option_value", "call_delta"]
 
@@ -195,6 +195,7 @@ class SurfaceMarketMaker(MarketMaker):
         instruments: dict[str, Instrument],
         wake_interval: Duration = millis(300),
         vol_weight: float = 0.02,
+        vol_halflife: Duration = seconds(60),
         min_prints: int = 25,
         skew_sigmas: float = 1.0,
         delta_limit: float | None = None,
@@ -206,6 +207,19 @@ class SurfaceMarketMaker(MarketMaker):
         # own weight on purpose: a mean can be tracked from a dozen prints, a
         # variance cannot, and a jumpy width would move every strike at once.
         self.vol_weight = vol_weight
+        # How long it takes a realised-variance estimate to lose half its
+        # weight when nothing is printing.
+        #
+        # Without it the estimate only moved on prints, so a quiet market kept
+        # whatever width it last had -- forever. Measured: with the future
+        # pinned at 4,800 for six straight minutes the makers were still
+        # quoting `SPIKE_C4700` at 153 against an intrinsic value of 100, the
+        # informed agents sold it to them all session, all three reached their
+        # position limits and stopped bidding, and the strike had no bid at 17
+        # of 19 sampled moments. Volatility is a statement about now; an
+        # estimate of it has to forget at the rate time passes, not at the rate
+        # trades happen.
+        self.vol_halflife = vol_halflife
         # Below this many prints the estimate is noise, and the chain is left
         # to the plain maker rather than quoted off a number that is not one.
         self.min_prints = min_prints
@@ -225,6 +239,7 @@ class SurfaceMarketMaker(MarketMaker):
         self.delta_limit = float(delta_limit or self.position_limit)
         self._variance: dict[str, float] = {}
         self._prints: dict[str, int] = {}
+        self._variance_at: dict[str, int] = {}
 
     # -- what the tape says the width is -----------------------------------
 
@@ -243,11 +258,18 @@ class SurfaceMarketMaker(MarketMaker):
             self._variance[print_.symbol] = current + self.vol_weight * (
                 deviation * deviation - current
             )
+            self._variance_at[print_.symbol] = int(ctx.now)
             self._prints[print_.symbol] = self._prints.get(print_.symbol, 0) + 1
         super().on_print(ctx, print_)
 
-    def dispersion_for(self, symbol: str) -> float | None:
+    def dispersion_for(self, symbol: str, now: int = 0) -> float | None:
         """Realised standard deviation of prints in ``symbol``, in price units.
+
+        Decayed by how long it has been since the last print, because
+        volatility is a statement about the present. An estimate that only
+        moved when a trade happened would keep a quiet market's last width
+        indefinitely, and a maker quoting yesterday's volatility into today's
+        silence is selling insurance against a risk that has gone away.
 
         ``None`` until there is enough tape to say anything, which is the
         honest answer at the open.
@@ -257,11 +279,18 @@ class SurfaceMarketMaker(MarketMaker):
         variance = self._variance.get(symbol)
         if not variance or variance <= 0.0:
             return None
+        elapsed = max(0, int(now) - self._variance_at.get(symbol, int(now)))
+        if elapsed and self.vol_halflife:
+            variance *= 0.5 ** (elapsed / float(int(self.vol_halflife)))
+        if variance <= 0.0:
+            return None
         return variance**0.5 * float(self.instruments[symbol].tick_size)
 
-    def concentration_for(self, symbol: str, forward: float, scale: float) -> float | None:
+    def concentration_for(
+        self, symbol: str, forward: float, scale: float, now: int = 0
+    ) -> float | None:
         """Beta concentration implied by that dispersion."""
-        sigma = self.dispersion_for(symbol)
+        sigma = self.dispersion_for(symbol, now)
         if sigma is None:
             return None
         level = forward / scale
@@ -305,7 +334,7 @@ class SurfaceMarketMaker(MarketMaker):
             return None
         return float(ticks) * float(self.instruments[symbol].tick_size)
 
-    def _net_delta(self, underlying_symbol: str, forward: float) -> float:
+    def _net_delta(self, underlying_symbol: str, forward: float, now: int = 0) -> float:
         """Delta of everything held on this underlying, in future-equivalents."""
         total = float(self.position.get(underlying_symbol, 0))
         for symbol, member in self.chain.items():
@@ -315,7 +344,7 @@ class SurfaceMarketMaker(MarketMaker):
             if not held:
                 continue
             concentration = self.concentration_for(
-                underlying_symbol, forward, member.scale
+                underlying_symbol, forward, member.scale, now
             )
             if concentration is None:
                 continue
@@ -334,17 +363,20 @@ class SurfaceMarketMaker(MarketMaker):
             super()._requote(ctx, symbol)
             return
         concentration = self.concentration_for(
-            member.underlying_symbol, forward, member.scale
+            member.underlying_symbol, forward, member.scale, int(ctx.now)
         )
 
         # Inventory moves the underlying, and the whole ladder follows. Skewing
         # each strike on its own would be the defect this class exists to fix,
         # only arriving through a different door.
-        sigma = self.dispersion_for(member.underlying_symbol)
+        sigma = self.dispersion_for(member.underlying_symbol, int(ctx.now))
         if sigma is None:
             shifted = forward
         else:
-            pull = self._net_delta(member.underlying_symbol, forward) / self.delta_limit
+            pull = (
+                self._net_delta(member.underlying_symbol, forward, int(ctx.now))
+                / self.delta_limit
+            )
             shifted = forward - max(-1.0, min(1.0, pull)) * self.skew_sigmas * sigma
 
         instrument = self.instruments[symbol]
@@ -381,12 +413,39 @@ class SurfaceMarketMaker(MarketMaker):
         pressure = abs(inventory) / max(1, self.position_limit)
         half = self.half_spread * (1.0 + 2.0 * pressure)
 
-        # Clamped into the contract's own range. A quote outside it is one the
-        # venue would refuse to collateralise, and an option's fair value can
-        # sit within a hair of zero.
-        centre = min(max(fair_ticks, float(int(low)) + half), float(int(high)) - half)
-        bid = Price(int(centre - half))
-        ask = Price(int(centre + half) + 1)
+        # Clamped into the contract's own range, one side at a time. A quote
+        # outside it is one the venue would refuse to collateralise, and an
+        # option's fair value can sit within a hair of zero.
+        #
+        # Clamping the *centre* instead was a defect worth naming, because it
+        # was invisible on any single book. Pushing the centre up to
+        # ``floor + half`` keeps the bid legal, but it also makes the mid a
+        # function of the half-spread, and the half-spread here widens with
+        # inventory. Two worthless calls then price differently for no reason
+        # other than how much of each the maker happens to hold: with the
+        # future at 3,784 both `SPIKE_C4600` and `SPIKE_C4650` were worth
+        # nothing, and they marked at 1.63 and 68.38 respectively, purely
+        # because one book carried a heavier position than the other. That is
+        # an inverted chain -- buy the 4,600, sell the 4,650, collect 133 that
+        # settlement cannot take back -- manufactured by the quoting rule
+        # rather than by any view.
+        #
+        # Clamping each side independently keeps the same guarantee (no quote
+        # leaves the settlement range) without letting spread width leak into
+        # price. A call worth nothing bids at the floor and offers just above
+        # it, however much of it the maker is holding.
+        centre = min(max(fair_ticks, float(int(low))), float(int(high)))
+        bid = Price(max(int(low), int(centre - half)))
+        ask = Price(min(int(high), int(centre + half) + 1))
+        if ask <= bid:
+            # The range is too narrow to hold a two-sided quote at this width.
+            # Give up a side rather than cross itself.
+            if bid > int(low):
+                bid = Price(int(bid) - 1)
+            elif ask < int(high):
+                ask = Price(int(ask) + 1)
+            else:
+                return
 
         if inventory < self.position_limit:
             self.post(ctx, symbol, Side.BUY, bid,

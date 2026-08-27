@@ -63,10 +63,20 @@ class Order:
     # The slice currently on the book. The rest of ``remaining`` is reserve, and
     # nobody outside this order can see it.
     shown: Quantity = Quantity(0)
+    # Refuse any single execution smaller than this. Zero means no minimum.
+    #
+    # It buys protection from being picked off in dribs and pays for it in
+    # certainty, and the currency is the same one an iceberg spends: an order
+    # an aggressor cannot satisfy is passed over, and the order behind it in the
+    # queue gets the fill instead. Attaching a minimum is therefore giving up
+    # unconditional time priority, not adding a guarantee on top of it.
+    min_quantity: int = 0
 
     def __post_init__(self) -> None:
         if self.display_size < 0:
             raise ValueError("display size cannot be negative")
+        if self.min_quantity < 0:
+            raise ValueError("minimum quantity cannot be negative")
         if not self.shown:
             self.shown = self.visible_slice()
 
@@ -253,6 +263,50 @@ class OrderBook:
         price = self.best_price(side)
         return None if price is None else self._levels[side][price]
 
+    def live_levels(self, side: Side) -> list[PriceLevel]:
+        """Every level with something live on it, best first.
+
+        The whole ladder rather than the top of it, for the two questions that
+        cannot be answered from the touch alone: how much an incoming order
+        could really trade, and which level it moves to when the one in front of
+        it holds nothing it is allowed to take. Built from the level map rather
+        than the price heap, because the heap carries stale prices and draining
+        them here would mutate the book on a read.
+        """
+        levels = self._levels[side]
+        out: list[PriceLevel] = []
+        for price in sorted(levels, reverse=side is Side.BUY):
+            level = levels[price]
+            level.prune()
+            if not level.empty:
+                out.append(level)
+        return out
+
+    def best_priced(self, side: Side, ignore: OrderId | None = None) -> Price | None:
+        """The best price on one side, with two things left out of it.
+
+        Market-on-open interest, which rests at a sentinel so it crosses every
+        candidate in an auction and is therefore the top of the book by a margin
+        of 2^61 while naming no price at all. And, optionally, one order of the
+        caller's choosing -- which is what a pegged order needs, because a peg
+        that counts its own quantity in the reference it tracks is pegged to
+        itself and can never step back down.
+
+        Reads the queue rather than the level total, since the total cannot say
+        which orders make it up and ``ignore`` is a question about one order.
+        """
+        levels = self._levels[side]
+        for price in sorted(levels, reverse=side is Side.BUY):
+            if abs(int(price)) >= _SENTINEL:
+                continue
+            for order in levels[price].orders:
+                if order.status.terminal or order.remaining <= 0:
+                    continue
+                if ignore is not None and order.order_id == ignore:
+                    continue
+                return price
+        return None
+
     def depth_at(self, side: Side, price: Price) -> Quantity:
         """Live resting quantity at a price.
 
@@ -352,9 +406,14 @@ class OrderBook:
     def consume(self, order: Order, quantity: Quantity) -> None:
         """Remove ``quantity`` from a resting order and its level's total.
 
-        An iceberg whose visible slice is exhausted is taken out of the queue
-        and put back at the end with a fresh slice, which is what costs it its
-        priority.
+        An iceberg whose visible slice is spent is taken out of the queue and
+        put back at the end with a fresh slice, which is what costs it its
+        priority. *Spent* is not always *empty*: a slice smaller than the
+        order's own minimum quantity is finished too, because there is nobody
+        left who is allowed to take it. Without that, an iceberg showing three
+        with a minimum of five sat on the book forever -- never refreshing,
+        because its slice was not empty, and never trading, because every
+        execution it could offer was one it would refuse.
         """
         order.remaining = Quantity(order.remaining - quantity)
         order.shown = Quantity(max(0, int(order.shown) - int(quantity)))
@@ -365,8 +424,24 @@ class OrderBook:
             order.status = OrderStatus.FILLED
             return
         order.status = OrderStatus.PARTIALLY_FILLED
-        if level is not None and order.is_iceberg and int(order.shown) <= 0:
-            level.popleft()
+        spent = int(order.shown) <= 0 or (
+            0 < int(order.shown) < order.min_quantity
+        )
+        if level is not None and order.is_iceberg and spent:
+            # By name rather than by position. This is the front of the queue
+            # unless a minimum-quantity order ahead of it was passed over, and
+            # popping blindly in that case deleted *that* order from its level
+            # -- leaving it live and countable everywhere else, so the depth
+            # over-reported it while the matcher could no longer reach it, and
+            # the iceberg appeared in the queue twice.
+            if level.orders and level.orders[0] is order:
+                level.popleft()
+            else:
+                level.orders.remove(order)
+            # Whatever is left of the spent slice goes back into the reserve, so
+            # `refresh` adding a whole new slice does not count it twice. A no-op
+            # on the ordinary path, where the slice is empty by definition.
+            level.reduce(order.shown)
             level.refresh(order)
 
     def remove(self, order: Order) -> None:

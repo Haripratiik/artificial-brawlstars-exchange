@@ -32,6 +32,7 @@ __all__ = [
     "AgentId",
     "Side",
     "OrderType",
+    "PegReference",
     "TimeInForce",
     "SelfTradePrevention",
     "OrderStatus",
@@ -82,6 +83,37 @@ class OrderType(Enum):
     # the cost of possibly not filling at all -- which is the trade every stop
     # user actually faces.
     STOP_LIMIT = "stop_limit"
+    # Rests at a price it does not choose: a reference in the book, plus a
+    # fixed offset in ticks. It exists because quoting a *number* and quoting a
+    # *position* are different intentions, and only the second survives the
+    # market moving. A maker that wants to be at the touch and expresses it as
+    # "bid 4,700" is wrong the moment the touch is 4,703, and must cancel and
+    # replace to fix it; a peg says "at the touch" and is never wrong.
+    #
+    # The cost is queue priority. Repricing is a new price and therefore a new
+    # place in the queue, exactly as it would be for a replace, so a peg that
+    # tracks a jumpy touch is perpetually at the back of it.
+    PEGGED = "pegged"
+
+
+class PegReference(Enum):
+    """What a pegged order tracks.
+
+    The order's own resting quantity is excluded from the reference it reads.
+    Without that exclusion a bid-peg that becomes the best bid is pegged to
+    itself: it can follow the market up and can never follow it back down,
+    because every step down is blocked by the price it is already quoting.
+    """
+
+    # The best bid. A buy pegged here joins the touch; a sell pegged here with a
+    # zero offset is quoting at the bid and will cross it.
+    BID = "bid"
+    # The best offer. The mirror image, and the usual way to write an order that
+    # is willing to take rather than to wait.
+    ASK = "ask"
+    # Halfway between the two. Needs both sides to exist, and needs rounding,
+    # because a one-tick spread has no integer midpoint.
+    MID = "mid"
 
 
 class TimeInForce(Enum):
@@ -166,3 +198,18 @@ class RejectReason(Enum):
     # A stop with no trigger, a trigger on an order that has none, or a trigger
     # already reached: all of them are an instruction that cannot be followed.
     INVALID_STOP_PRICE = "invalid_stop_price"
+    # A peg with nothing to track, a peg reference on an order that does not
+    # peg, or a peg told not to rest. Note what is *not* here: a peg submitted
+    # to a book with no reference price is accepted and waits, because "there is
+    # no best bid yet" is a fact about the market and not an error in the order.
+    INVALID_PEG = "invalid_peg"
+    # More messages than the venue will take from one participant in a second.
+    # Every real exchange has this, and the reason is not politeness: a
+    # malfunctioning algorithm can emit orders faster than anything downstream
+    # can process them, and the venue that has no limit is the one that goes
+    # down with it.
+    RATE_LIMITED = "rate_limited"
+    # The participant has been stopped -- by an operator, or by itself. Its
+    # working orders are pulled and it may not place more until it is let back
+    # in.
+    PARTICIPANT_HALTED = "participant_halted"

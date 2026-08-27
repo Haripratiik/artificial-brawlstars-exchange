@@ -44,13 +44,14 @@ const CLASS_GROUPS = [
   ['call', 'Options', 'The right to what lies past a strike.'],
   ['put', 'Options', 'The right to what lies past a strike.'],
   ['equity', 'Shares', 'Pays out every week it is alive, then expires. Worth the payments that are left.'],
+  ['volatility', 'Volatility', 'How unevenly a Brawler performs across maps and modes, not how well.'],
   ['commodity', 'Commodities', 'An amount delivered in one week, not a rate. Each week trades separately.'],
   ['spread', 'Spreads', 'One Brawler priced against another.'],
   ['index', 'Indices', 'A weighted basket of several Brawlers.'],
 ];
 
 const GROUP_ORDER = ['Prediction Markets', 'Futures', 'Shares', 'Commodities',
-                     'Options', 'Spreads', 'Indices', 'Other'];
+                     'Options', 'Volatility', 'Spreads', 'Indices', 'Other'];
 
 export function groupOf(assetClass) {
   return CLASS_GROUPS.find(([key]) => key === assetClass)?.[1] ?? 'Other';
@@ -202,6 +203,11 @@ export function question(contract) {
   const stream = contract?.distribution;
   if (stream) {
     return `A share of ${what}, paid out over ${count(stream.periods)} weeks`;
+  }
+  // A volatility contract is written on a spread, so saying "where the rate
+  // settles" would name the wrong moment entirely.
+  if (contract?.underlying?.ref?.kind === 'dispersion') {
+    return `How unevenly ${subject} performs across maps and modes`;
   }
   if (contract?.underlying?.ref?.kind === 'quantity') {
     return `How many thousand battles ${subject} plays, delivered ${esc(week(contract))}`;
@@ -506,6 +512,23 @@ function ticket(symbol, book, session) {
         <input id="t-px" type="text" inputmode="decimal" placeholder="4660.25&hellip;"
                autocomplete="off" spellcheck="false">
       </div>
+      <div class="row2">
+        <div class="field">
+          <label for="t-stop">Stop trigger &mdash; blank for none</label>
+          <input id="t-stop" type="text" inputmode="decimal" placeholder="4600.00&hellip;"
+                 autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="t-show">Show at a time &mdash; blank shows all</label>
+          <input id="t-show" type="number" min="0" step="1" placeholder="10"
+                 inputmode="numeric" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+      <p class="note">A <b>stop</b> waits off the book until the market trades at
+        or through your trigger, then goes to market &mdash; or to your limit
+        price, if you gave one. Nobody can see it while it waits. An
+        <b>iceberg</b> shows part of your size at a time and refreshes the rest
+        behind whoever queued up meanwhile, which is what hiding costs.</p>
       <div class="field">
         <label for="t-tif">Time in force</label>
         <select id="t-tif">
@@ -715,6 +738,9 @@ export function research(store) {
       <td>${count(a.fills)}</td>
       <td class="${a.rejects ? 'down' : 'faint'}">${count(a.rejects)}</td>
       <td>${a.equity == null ? '—' : money(a.equity)}</td>
+      <td><button type="button" class="minor ${a.halted ? '' : 'danger'}"
+              data-act="${a.halted ? 'revive' : 'kill'}" data-agent="${esc(a.id)}">
+            ${a.halted ? 'Let back in' : 'Stop'}</button></td>
     </tr>`)
     .join('');
 

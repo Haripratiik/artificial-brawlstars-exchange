@@ -68,6 +68,40 @@ class LocalBook:
         return int(self.ask) - int(self.bid)
 
 
+def _on_grid(instrument, side: Side, price: Price) -> Price:
+    """Move a price onto the increment its band requires, conservatively.
+
+    A bid rounds down and an offer rounds up, so snapping to the grid never
+    makes a quote more aggressive than the agent intended -- it gives up a
+    fraction of a tick rather than crossing something the agent had not meant
+    to cross.
+
+    Contracts with one increment everywhere -- which is all but one of them --
+    return unchanged after a single comparison.
+    """
+    ticks = int(price)
+    # Repeated, because a single pass can round *into* a coarser band and land
+    # off its grid. Reading the increment at the original price and rounding
+    # once is the obvious implementation and is wrong for any table with two
+    # tiers: with steps of 1.00 from 100 and 5.00 from 203, an offer at 202.75
+    # snaps up to 203.00, which is in the five-point band and not a multiple of
+    # five -- so the agent's own snapped quote comes back INVALID_PRICE.
+    #
+    # Each pass moves in one direction only and lands on a multiple of a
+    # strictly coarser increment, so this cannot cycle. Bounded anyway, because
+    # a loop in an order path is not a thing to leave unbounded.
+    for _ in range(8):
+        step = instrument.increment_at(instrument.from_ticks(Price(ticks)))
+        if step == instrument.tick_size:
+            return Price(ticks)
+        per_step = int(step / instrument.tick_size)
+        remainder = ticks % per_step
+        if not remainder:
+            return Price(ticks)
+        ticks = ticks - remainder if side is Side.BUY else ticks + per_step - remainder
+    return Price(ticks)
+
+
 class TradingAgent:
     """Base for agents that trade on a venue through the kernel."""
 
@@ -273,6 +307,7 @@ class TradingAgent:
         instrument = self.instruments[symbol]
         low, high = instrument.tick_bounds
         bounded = Price(max(int(low), min(int(high), int(price))))
+        bounded = _on_grid(instrument, side, bounded)
         ctx.send(
             self.venue_id,
             SymbolCommand(

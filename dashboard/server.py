@@ -271,6 +271,17 @@ async def api_halt(symbol: str) -> dict[str, Any]:
     return runner.halt(symbol)
 
 
+@app.post("/api/participant/{agent_id}/kill")
+async def api_kill(agent_id: str) -> dict[str, Any]:
+    """Stop a participant: pull everything it has working, refuse it more."""
+    return runner.kill(agent_id)
+
+
+@app.post("/api/participant/{agent_id}/revive")
+async def api_revive(agent_id: str) -> dict[str, Any]:
+    return runner.revive(agent_id)
+
+
 @app.post("/api/session/{symbol}/uncross")
 async def api_uncross(symbol: str) -> dict[str, Any]:
     return runner.uncross(symbol)

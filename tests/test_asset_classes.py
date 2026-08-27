@@ -36,7 +36,7 @@ from arena.market.instrument import Instrument, InstrumentClass
 from arena.market.live import HUMAN_ID
 from arena.market.venue import SymbolCommand, Venue
 from arena.settlement.result import SettlementResult, SettlementStatus
-from arena.sim.time import seconds
+from arena.sim.time import Timestamp, seconds
 
 from dashboard.build_market import build
 
@@ -462,7 +462,7 @@ def test_a_metric_must_declare_whether_it_is_a_rate_or_a_quantity():
     """The distinction decides the asset class, so a typo must not pass."""
     from arena.contracts.underlying import MetricRef
 
-    with pytest.raises(ValueError, match="must be 'rate' or 'quantity'"):
+    with pytest.raises(ValueError, match="must be 'rate', 'quantity' or"):
         MetricRef(metric="battle_volume", subject="SPIKE", kind="amount")
 
 
@@ -543,20 +543,34 @@ def test_paying_a_distribution_moves_cash_and_conserves_it():
     """Longs receive, shorts pay, and nothing is created."""
     from arena.portfolio.money import Money
 
+    from arena.exchange.session import SessionState
+
     market = build(seed=7, human_cash=4_000_000)
     market.kernel.start()
-    market.kernel.advance(until=seconds(30))
+
+    # Bought when the share is actually trading. At a fixed moment it may be
+    # mid-auction -- either the opening call or a breaker pause -- and an order
+    # into a halted book rests until the uncross rather than filling.
+    symbol = "SPIKE_EQ"
+    for moment in range(20, 300, 5):
+        market.kernel.advance(until=seconds(moment))
+        book = market.venue.engine(symbol).book.snapshot()
+        if (
+            market.venue.session(symbol) is SessionState.CONTINUOUS
+            and book.best_ask is not None
+        ):
+            break
     market.human.enqueue(
         SymbolCommand(
-            "SPIKE_EQ",
+            symbol,
             Submit(HUMAN_ID, Side.BUY, Quantity(40), None, OrderType.MARKET, TimeInForce.IOC),
         )
     )
-    market.kernel.advance(until=seconds(31))
+    market.kernel.advance(until=Timestamp(int(market.kernel.now) + int(seconds(2))))
 
     venue = market.venue
-    position = venue.account(HUMAN_ID).positions["SPIKE_EQ"]
-    assert position.quantity > 0
+    position = venue.account(HUMAN_ID).positions.get(symbol)
+    assert position is not None and position.quantity > 0
 
     before = int(venue.account(HUMAN_ID).cash)
     assert int(venue.conservation_check()) == 0
@@ -685,3 +699,82 @@ def test_overlapping_payment_windows_are_refused():
     )
     with pytest.raises(ValueError, match="overlap"):
         DistributionSchedule(windows=(first, second), payoff=Linear(1.0))
+
+
+# --------------------------------------------------------------------------
+# Volatility: a claim on the second moment
+# --------------------------------------------------------------------------
+
+
+def test_a_dispersion_metric_makes_a_volatility_contract():
+    """The class comes from which moment the metric reports."""
+    from dashboard.build_market import instruments
+
+    listed = {i.symbol: i for i in instruments()}
+    assert listed["SPIKE_DISP"].instrument_class == "volatility"
+    assert listed["SPIKE_WR_FUT"].instrument_class == "future"
+
+
+def test_dispersion_and_level_are_different_questions_about_the_same_subject():
+    """Two Brawlers can share an average and not share a spread.
+
+    That is the whole reason the contract exists, and it is measurable here:
+    SPIKE and CROW settle within two percent of each other on win rate and
+    differ by nearly seventy percent on how evenly they earn it.
+    """
+    from dashboard.build_market import instruments, true_values
+
+    values = true_values(instruments())
+    level_gap = abs(values["SPIKE_WR_FUT"] - values["CROW_WR_FUT"]) / values["CROW_WR_FUT"]
+    spread_gap = abs(values["SPIKE_DISP"] - values["CROW_DISP"]) / values["CROW_DISP"]
+    assert level_gap < 0.05, f"the two levels are not close: {level_gap:.2%}"
+    assert spread_gap > 0.3, f"the two dispersions are not far apart: {spread_gap:.2%}"
+
+
+def test_dispersion_is_bounded_so_collateral_stays_arithmetic():
+    """A rate lives in [0, 1], so a set of rates cannot spread further than 0.5.
+
+    That bound is not decoration. It is what lets a second-moment claim join an
+    exchange whose whole collateral model is "every contract settles inside a
+    known interval" -- without it, a short would need a variance estimate
+    rather than a subtraction.
+    """
+    from arena.worlds.brawl.metrics import METRIC_BOUNDS
+
+    assert METRIC_BOUNDS["stratum_dispersion"] == (0.0, 0.5)
+
+    from dashboard.build_market import instruments, true_values
+
+    catalogue = instruments()
+    listed = {i.symbol: i for i in catalogue}
+    values = true_values(catalogue)
+    for symbol in ("SPIKE_DISP", "CROW_DISP"):
+        low, high = listed[symbol].tick_bounds
+        assert int(low) <= values[symbol] <= int(high)
+
+
+def test_dispersion_measures_the_same_walk_as_the_level():
+    """Same strata, same shrinkage, same coverage gate -- a different moment.
+
+    If it walked different cells it would be a different measurement wearing
+    the same contract's name, and the two would not be comparable.
+    """
+    from arena.worlds.brawl.metrics import METRICS
+    from dashboard.build_market import PRIOR_WINDOW, _world
+    from arena.worlds.brawl.metrics import metric_ref
+
+    _dataset, _reference, oracle = _world()
+    level = oracle.resolve(metric_ref("adjusted_win_rate", "SPIKE"), PRIOR_WINDOW)
+    spread = oracle.resolve(metric_ref("stratum_dispersion", "SPIKE"), PRIOR_WINDOW)
+    assert "stratum_dispersion" in METRICS
+    assert level.sample_size == spread.sample_size
+    diagnostics = dict(spread.diagnostics)
+    assert diagnostics["standardized_mean"] == pytest.approx(level.value)
+
+
+def test_an_unknown_metric_kind_is_refused():
+    from arena.contracts.underlying import MetricRef
+
+    with pytest.raises(ValueError, match="must be 'rate', 'quantity' or 'dispersion'"):
+        MetricRef(metric="stratum_dispersion", subject="SPIKE", kind="moment")
+

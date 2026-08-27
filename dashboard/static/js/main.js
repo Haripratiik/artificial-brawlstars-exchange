@@ -413,7 +413,7 @@ function bind() {
 
   // The preview has to follow keystrokes, not renders: the ticket is
   // deliberately not re-rendered while someone is typing into it.
-  ['t-qty', 't-px', 't-tif'].forEach((id) => {
+  ['t-qty', 't-px', 't-tif', 't-stop', 't-show'].forEach((id) => {
     const field = document.getElementById(id);
     if (field && !field.dataset.wired) {
       field.dataset.wired = '1';
@@ -482,6 +482,22 @@ function updatePreview() {
   const buying = store.side === 'buy';
   const raw = document.getElementById('t-px')?.value.trim() ?? '';
   const limit = raw === '' ? null : Number(raw);
+  const stop = document.getElementById('t-stop')?.value.trim() ?? '';
+  if (stop !== '') {
+    // A stop does not trade now, so a cost taken off today's book would be a
+    // guess dressed as a quotation. What it *is* is the size of the
+    // commitment -- which is what the venue reserves against, and the only
+    // honest thing to show before it triggers.
+    panel.innerHTML = `<dl>
+      <div><dt>Waits until</dt><dd class="mono">${price(stop)}</dd></div>
+      <div><dt>Then</dt><dd class="mono">${limit === null
+        ? 'goes to market' : `works a limit at ${price(limit)}`}</dd></div>
+      <div><dt>Reserved now</dt><dd class="mono">${money(Number(stop) * quantity)}</dd></div>
+    </dl>
+    <p class="note">Nobody can see a stop while it waits, and it is
+      collateralised from the moment you place it.</p>`;
+    return;
+  }
 
   // Marketable orders walk the opposite side; a resting limit fills at its own
   // price or better, so its own price is the honest estimate.
@@ -552,6 +568,23 @@ async function act(action, data) {
     return send({ action: 'cancel', order_id: Number(data.order), symbol: data.symbol });
   }
   if (action === 'cancel_all') return send({ action: 'cancel_all' });
+  // The bluntest control an exchange has, and the one that has to keep
+  // working when everything else is going wrong. What comes back is the list
+  // of books it pulled orders from, because "done" is not an answer an
+  // operator can act on.
+  if (action === 'kill' || action === 'revive') {
+    try {
+      const result = await json(`/api/participant/${encodeURIComponent(data.agent)}/${action}`,
+                                { method: 'POST' });
+      toast(action === 'kill'
+        ? `Stopped ${result.agent_id} — pulled ${(result.symbols ?? []).length} book(s)`
+        : `${result.agent_id} let back in`);
+      refreshSlow();
+    } catch (failure) {
+      toast(String(failure), true);
+    }
+    return;
+  }
   if (action === 'flatten') {
     // Destructive and irreversible: it sells every position at market, and
     // there is no undo once the prints land.

@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 
 from arena.exchange.session import SessionState
+from arena.exchange.types import AgentId
 from arena.market.fees import FREE, MAKER_TAKER, FeeSchedule
 from arena.market.live import HUMAN_ID, LiveMarket
 from arena.research.stylized import analyse
@@ -271,6 +272,8 @@ class MarketRunner:
                     "id": str(agent.agent_id),
                     "kind": type(agent).__name__,
                     "role": _role(agent),
+                    "halted": agent.agent_id
+                    in self.market.venue.halted_participants,
                     "fills": getattr(agent, "fills", 0),
                     "rejects": getattr(agent, "rejects", 0),
                     "positions": {
@@ -343,6 +346,24 @@ class MarketRunner:
             return {"ok": False, "error": f"unknown symbol {symbol}"}
         venue.halt(symbol, reason="manual")
         return {"ok": True, "session": venue.session(symbol).value}
+
+    def kill(self, agent_id: str) -> dict[str, Any]:
+        """Stop a participant. The bluntest control an exchange has.
+
+        Reported back with the symbols it pulled orders in, rather than a bare
+        acknowledgement: an operator reaching for this needs to know what
+        actually came out of the book, and "done" is not that.
+        """
+        venue = self.market.venue
+        if agent_id not in venue.accounts:
+            return {"ok": False, "error": f"unknown participant {agent_id}"}
+        touched = venue.kill(AgentId(agent_id))
+        return {"ok": True, "agent_id": agent_id, "symbols": touched}
+
+    def revive(self, agent_id: str) -> dict[str, Any]:
+        venue = self.market.venue
+        venue.revive(AgentId(agent_id))
+        return {"ok": True, "agent_id": agent_id}
 
     def uncross(self, symbol: str) -> dict[str, Any]:
         venue = self.market.venue

@@ -15,6 +15,20 @@ Matching rules, in the order they are applied:
      terms; the aggressor accepted them. This is what makes price improvement
      accrue to the taker and what makes effective spread measurable.
   4. **Partial fills are normal.** An order walks as many levels as it needs.
+
+Two order types bend the second rule, and both bend it by consent rather than
+by exception. An **iceberg** goes to the back of its level each time it
+refreshes. A **minimum-quantity** order is passed over by any aggressor too
+small to satisfy it, and the fill goes to whoever is behind it. Neither is
+losing something it was promised: each is spending queue position on something
+it wanted more.
+
+A **pegged** order does not bend it at all, and that is worth saying because it
+looks like it should. Its price is a reference plus an offset rather than a
+number it chose, and every time the reference moves it is taken off the book and
+put back at the new price with a new arrival number -- exactly as a replace
+would be, and for exactly the same reason. A new price is a new claim on a queue
+other orders were already waiting in.
 """
 
 from __future__ import annotations
@@ -22,7 +36,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from arena.exchange.book import Order, OrderBook
+from arena.exchange.book import Order, OrderBook, PriceLevel
 from arena.exchange.session import SENTINEL, SessionState, indicative_auction
 from arena.exchange.events import (
     Acknowledged,
@@ -42,6 +56,7 @@ from arena.exchange.types import (
     OrderId,
     OrderStatus,
     OrderType,
+    PegReference,
     Price,
     Quantity,
     RejectReason,
@@ -71,6 +86,7 @@ class _PendingStop:
     limit_price: Price | None
     time_in_force: TimeInForce
     display_size: int
+    min_quantity: int
     arrival: int
 
     def as_submit(self) -> Submit:
@@ -91,6 +107,7 @@ class _PendingStop:
                 None,
                 OrderType.MARKET,
                 TimeInForce.IOC,
+                min_quantity=self.min_quantity,
             )
         return Submit(
             self.agent_id,
@@ -100,7 +117,33 @@ class _PendingStop:
             OrderType.LIMIT,
             self.time_in_force,
             self.display_size,
+            min_quantity=self.min_quantity,
         )
+
+
+@dataclass(slots=True)
+class _Peg:
+    """A pegged order and whatever order it currently is.
+
+    Two pieces of state that cannot be collapsed into one. ``order`` is the only
+    record of quantity, remaining and status, so there is no second copy to fall
+    out of step. ``on_book`` is separate because a peg is not always on the book:
+    with nothing to track it has no price, and an order with no price cannot sit
+    in a price-ordered book. ``order.price`` means nothing while ``on_book`` is
+    false.
+
+    The order is replaced outright every time the peg moves, rather than being
+    edited in place. It has to be: ``OrderBook.remove`` tombstones rather than
+    splicing, so an order whose price were mutated would sit live in the old
+    level's queue at a price that level is not, and the matcher would happily
+    trade it there.
+    """
+
+    reference: PegReference
+    offset: int
+    time_in_force: TimeInForce
+    order: Order
+    on_book: bool = False
 
 
 class MatchingEngine:
@@ -131,6 +174,14 @@ class MatchingEngine:
         self.execution_band: tuple[int, int] | None = None
         # Stop orders waiting for their trigger. Off the book on purpose.
         self._stops: list[_PendingStop] = []
+        # Live pegged orders, whether or not they currently have a price.
+        self._pegs: list[_Peg] = []
+        # How many times a single command may set the pegs moving. A peg that
+        # reprices changes the touch, which can move another peg, which can move
+        # the first one back -- two orders pegged to each other's side of the
+        # book have no fixed point and would otherwise chase each other forever.
+        # The bound is what makes that a bad idea rather than a hang.
+        self._max_peg_passes = 8
         # How many rounds each cascade of stops ran for, oldest first. A
         # measurement rather than a control: a stop that fills moves the price,
         # which triggers more stops, and how often that chains is exactly the
@@ -170,12 +221,25 @@ class MatchingEngine:
     def apply(self, command: Command) -> list[Event]:
         """Process one command, returning the events it caused."""
         if isinstance(command, Submit):
-            return self._submit(command)
-        if isinstance(command, Cancel):
-            return self._cancel(command)
-        if isinstance(command, Replace):
-            return self._replace(command)
-        raise TypeError(f"unknown command type {type(command).__name__}")
+            events = self._submit(command)
+        elif isinstance(command, Cancel):
+            events = self._cancel(command)
+        elif isinstance(command, Replace):
+            events = self._replace(command)
+        else:
+            raise TypeError(f"unknown command type {type(command).__name__}")
+
+        # Any command can move the touch, and a peg tracks the touch, so the
+        # pegs are settled here rather than in each handler. Guarded on there
+        # being any: an engine nobody has pegged an order on must run exactly
+        # the code it always ran, down to the sequence numbers it hands out,
+        # which is what the differential harness checks.
+        #
+        # Here rather than inside `_submit`, so a stop cascade repricing pegs
+        # between its own half-finished orders is not a thing that can happen.
+        if self._pegs:
+            events.extend(self._reprice_pegs())
+        return events
 
     def apply_all(self, commands: Iterable[Command]) -> list[Event]:
         events: list[Event] = []
@@ -204,6 +268,7 @@ class MatchingEngine:
             remaining=command.quantity,
             priority=self._arrival,
             display_size=command.display_size,
+            min_quantity=command.min_quantity,
         )
 
         # A stop acknowledges at the price it is contingent on: its limit if it
@@ -214,6 +279,18 @@ class MatchingEngine:
         acknowledged_at = command.price
         if command.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
             acknowledged_at = command.price or command.stop_price
+        peg: _Peg | None = None
+        if command.order_type is OrderType.PEGGED:
+            # A peg acknowledges at the price it will actually rest at, which is
+            # the only price it has. `None` when there is nothing to track: the
+            # order is real and accepted, and it genuinely has no price yet.
+            peg = _Peg(
+                reference=command.peg_to,
+                offset=command.peg_offset,
+                time_in_force=command.time_in_force,
+                order=order,
+            )
+            acknowledged_at = self._peg_target(peg)
 
         events: list[Event] = [
             Acknowledged(
@@ -228,6 +305,24 @@ class MatchingEngine:
 
         if command.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
             return events + self._park_stop(command, order_id)
+
+        if peg is not None:
+            # Before the call-phase branch, and deliberately. `_accumulate`
+            # rests an order at `limit`, which for a peg is the sentinel a
+            # priceless order gets -- so an auction would have counted it as
+            # crossing every candidate at 2^62 and cleared the book against it.
+            self._pegs.append(peg)
+            if acknowledged_at is None:
+                return events
+            placed = self._place_peg(peg, acknowledged_at)
+            events.extend(placed)
+            # A peg tracking the far side of the book takes, and a print is a
+            # print whoever made it. Without this a stop could be set off by a
+            # peg that repriced into a trade but not by one that arrived already
+            # crossing, which is a distinction the tape cannot see and nobody
+            # could have justified.
+            events.extend(self._release_after(placed))
+            return events
 
         if not self.phase.matches_continuously:
             return events + self._accumulate(command, order)
@@ -272,15 +367,7 @@ class MatchingEngine:
                 else None,
             )
         )
-        # A print can bring stop orders to life, and one of those can print
-        # again. Released after this order has finished matching rather than
-        # inside the loop, so a cascade is a sequence of complete orders rather
-        # than an interleaving of half-filled ones.
-        last = next(
-            (e.price for e in reversed(events) if isinstance(e, Traded)), None
-        )
-        if last is not None and self._stops and not self._releasing:
-            events.extend(self._release_stops(last))
+        events.extend(self._release_after(events))
 
         if order.remaining > 0:
             if command.time_in_force in (TimeInForce.GTC, TimeInForce.POST_ONLY):
@@ -484,7 +571,10 @@ class MatchingEngine:
 
         Removing the resting order also pops it off the level, so the matching
         loop advances rather than meeting the same order forever -- which would
-        be an infinite loop rather than a wrong price.
+        be an infinite loop rather than a wrong price. Popped only when it is
+        the front of the queue, which it is unless a minimum-quantity order
+        ahead of it was passed over; anywhere else the terminal status is what
+        makes the loop skip it, and popping would remove somebody else's order.
         """
         events: list[Event] = []
         policy = self.self_trade_prevention
@@ -493,7 +583,8 @@ class MatchingEngine:
             remaining = resting.remaining
             self.book.remove(resting)
             resting.status = OrderStatus.CANCELLED
-            level.popleft()
+            if level.orders and level.orders[0] is resting:
+                level.popleft()
             events.append(
                 Cancelled(self._seq(), resting.agent_id, resting.order_id, remaining)
             )
@@ -537,10 +628,26 @@ class MatchingEngine:
                 limit_price=command.price,
                 time_in_force=command.time_in_force,
                 display_size=command.display_size,
+                min_quantity=command.min_quantity,
                 arrival=self._arrival,
             )
         )
         return []
+
+    def _release_after(self, events: list[Event]) -> list[Event]:
+        """Fire whatever stops the prints in ``events`` triggered.
+
+        A print can bring stop orders to life, and one of those can print again.
+        Released after the order that caused them has finished matching rather
+        than inside the loop, so a cascade is a sequence of complete orders
+        rather than an interleaving of half-filled ones.
+        """
+        last = next(
+            (e.price for e in reversed(events) if isinstance(e, Traded)), None
+        )
+        if last is None or not self._stops or self._releasing:
+            return []
+        return self._release_stops(last)
 
     def _triggered_by(self, price: Price) -> list["_PendingStop"]:
         """Stops this print sets off, in a deterministic order.
@@ -603,6 +710,211 @@ class MatchingEngine:
             pending = following
         return depth
 
+    # -- pegs ---------------------------------------------------------------
+
+    def _peg_target(self, peg: _Peg) -> Price | None:
+        """Where this peg may rest right now, or ``None`` if nowhere.
+
+        Three reasons a peg has no price. There is no reference -- an empty
+        book, or a mid peg with only one side quoted. The session is not trading
+        continuously, where the only touch on offer is the sentinel a
+        market-on-open order rests at, which is not a price. Or the peg is
+        post-only and the reference has moved somewhere it would cross.
+
+        None of those is an error, and none of them cancels the order. A peg
+        with no price waits, which is the honest reading of "quote at the touch"
+        when there is no touch.
+        """
+        if not self.phase.matches_continuously:
+            return None
+
+        order = peg.order
+        # The peg's own resting quantity is excluded from what it reads. A peg
+        # that counted itself would be pegged to itself the moment it became the
+        # touch: it could follow the market up, because a better price is
+        # somebody else's, and could never follow it back down, because every
+        # step down is blocked by the price it is already quoting.
+        ignore = order.order_id
+        if peg.reference is PegReference.BID:
+            base = self.book.best_priced(Side.BUY, ignore)
+        elif peg.reference is PegReference.ASK:
+            base = self.book.best_priced(Side.SELL, ignore)
+        else:
+            bid = self.book.best_priced(Side.BUY, ignore)
+            ask = self.book.best_priced(Side.SELL, ignore)
+            if bid is None or ask is None:
+                return None
+            # Prices are integer ticks and a one-tick spread has no midpoint, so
+            # the half tick has to go somewhere. It goes to the passive side: a
+            # buy rounds down, a sell rounds up. Rounding the other way would
+            # make a mid peg cross the spread on every odd-width market, which
+            # is the one thing a midpoint order is not for.
+            total = int(bid) + int(ask)
+            base = Price(total // 2 if order.side is Side.BUY else -((-total) // 2))
+        if base is None:
+            return None
+
+        target = Price(int(base) + peg.offset)
+        if peg.time_in_force is TimeInForce.POST_ONLY and self._crossable_levels(
+            order.side, target
+        ):
+            # Post-only promises the order never takes. A peg does not choose
+            # its own price, so the promise is kept by declining to follow the
+            # reference rather than by rejecting the order -- there is nothing
+            # left to reject, the order was accepted before the touch moved.
+            return None
+        return target
+
+    def _place_peg(self, peg: _Peg, target: Price) -> list[Event]:
+        """Rest a peg at ``target``, matching first if it crosses.
+
+        The order must be off the book when this is called, because it sets the
+        price directly. A peg tracking the opposite side of the book is an
+        aggressive order and is meant to trade -- "pay the offer, whatever the
+        offer is" is a real instruction, and it is the one a market peg writes.
+        """
+        order = peg.order
+        order.price = target
+        events = self._match(order)
+        if order.remaining > 0:
+            order.status = (
+                OrderStatus.PARTIALLY_FILLED
+                if order.remaining < order.quantity
+                else OrderStatus.NEW
+            )
+            self.book.add(order)
+            peg.on_book = True
+        else:
+            order.status = OrderStatus.FILLED
+            self.book.track(order)
+            peg.on_book = False
+        return events
+
+    def _lift_peg(self, peg: _Peg) -> Order:
+        """Take a peg off the book and give it a fresh order to become.
+
+        The old order is tombstoned rather than spliced out, which is how every
+        removal works here, so it must be marked terminal or the matcher will
+        still fill it on the way past. The replacement carries the same id --
+        an agent's handle on its order does not change because the touch moved
+        -- and a new arrival number, which is the whole cost of repricing.
+
+        The book is touched only if the order was in it. ``OrderBook.remove``
+        finds its level by the order's price, and a peg that is off the book
+        still carries the last price it held, so removing one twice would
+        subtract its quantity from whatever level some other order has since
+        opened there.
+        """
+        old = peg.order
+        if peg.on_book:
+            self.book.remove(old)
+            old.status = OrderStatus.CANCELLED
+        peg.on_book = False
+
+        # Repricing loses queue priority, and that is the honest behaviour
+        # rather than an implementation limitation. A new price is a new claim
+        # on a queue that other orders were already waiting in, and letting a
+        # peg keep its position through a reprice would hand it a standing
+        # advantage no other order can buy -- it could sit at the front of one
+        # level, follow the touch to another, and still be at the front there.
+        self._arrival += 1
+        fresh = Order(
+            order_id=old.order_id,
+            agent_id=old.agent_id,
+            side=old.side,
+            price=old.price,
+            quantity=old.quantity,
+            remaining=old.remaining,
+            priority=self._arrival,
+            display_size=old.display_size,
+            min_quantity=old.min_quantity,
+        )
+        peg.order = fresh
+        return fresh
+
+    def _reprice_pegs(self) -> list[Event]:
+        """Move every peg to where its reference now says it belongs.
+
+        Iterative and bounded for the same reason a stop cascade is: a peg that
+        moves changes the book, which can move another peg. Unlike a cascade
+        this one usually settles in a single pass, because a peg that is already
+        at its target is left alone and most commands move at most one touch.
+        """
+        events: list[Event] = []
+        for _ in range(self._max_peg_passes):
+            moved: list[Event] = []
+            if not self._move_pegs(moved):
+                break
+            events.extend(moved)
+            # A peg can print, and a print can set off a stop. Released between
+            # passes rather than inside one, so the pegs a stop's fills move are
+            # moved by the pass after it rather than mid-flight.
+            events.extend(self._release_after(moved))
+        return events
+
+    def _move_pegs(self, events: list[Event]) -> bool:
+        """One pass over the pegs. True if any of them moved."""
+        moved = False
+        for peg in list(self._pegs):
+            order = peg.order
+            if order.status.terminal or order.remaining <= 0:
+                # Filled, cancelled, or replaced into a plain limit order by an
+                # agent that named a price. Whatever it is now, it is not a peg.
+                self._pegs.remove(peg)
+                continue
+
+            target = self._peg_target(peg)
+            if target is None:
+                if peg.on_book:
+                    # Its reference has gone, so it has no price. Leaving it at
+                    # the last price it happened to track would turn it into a
+                    # stale limit order at exactly the moment the market it was
+                    # following stopped existing.
+                    #
+                    # No event: the order is not cancelled, it is waiting, and
+                    # there is nothing in this vocabulary that says so. The
+                    # silence errs toward a venue holding collateral for an
+                    # order that is still live, which is the safe direction.
+                    self._lift_peg(peg)
+                    moved = True
+                continue
+
+            if peg.on_book and int(order.price) == int(target):
+                continue
+
+            moved = True
+            fresh = self._lift_peg(peg)
+            events.append(
+                Replaced(
+                    self._seq(),
+                    fresh.agent_id,
+                    fresh.order_id,
+                    fresh.remaining,
+                    target,
+                    kept_priority=False,
+                )
+            )
+            events.extend(self._place_peg(peg, target))
+        return moved
+
+    def _inert_peg(self, order_id: OrderId) -> _Peg | None:
+        """A live peg that currently has no price, and so is not in the book.
+
+        The book cannot answer for these: an order with no price is in no level,
+        and ``OrderBook.remove`` would reduce whatever level happened to exist at
+        the last price it held. So cancellation asks here first.
+        """
+        return next(
+            (
+                peg
+                for peg in self._pegs
+                if not peg.on_book
+                and peg.order.order_id == order_id
+                and not peg.order.status.terminal
+            ),
+            None,
+        )
+
     def _match(
         self, incoming: Order, collar: tuple[int, int] | None = None
     ) -> list[Event]:
@@ -622,8 +934,25 @@ class MatchingEngine:
         """
         events: list[Event] = []
 
+        # A minimum quantity is checked once, against everything this pass could
+        # reach, and not against each print. That is what makes it different
+        # from fill-or-kill: fill-or-kill asks whether the *whole* order can be
+        # done, MPL asks only whether it is worth starting. An order for a
+        # thousand with a minimum of a hundred will happily take two hundred and
+        # rest the remaining eight; what it will not do is take three.
+        if incoming.min_quantity > 0 and (
+            self._executable(incoming, collar) < incoming.min_quantity
+        ):
+            return events
+
+        # Prices this pass has exhausted of liquidity it is allowed to take.
+        # Only ever non-empty when a resting order refuses executions this
+        # small, so an order using none of this costs one `not blocked` test per
+        # level and takes exactly the path it always took.
+        blocked: set[int] = set()
+
         while incoming.remaining > 0:
-            level = self.book.best_level(incoming.side.opposite)
+            level = self._next_level(incoming.side.opposite, blocked)
             if level is None:
                 break
             resting_price = level.price
@@ -642,7 +971,19 @@ class MatchingEngine:
                 # Level emptied by pruning; loop and let best_level move on.
                 continue
 
-            resting = level.peek()
+            resting = self._first_tradeable(level, incoming)
+            if resting is None:
+                # Everything at this price refuses an execution this small. The
+                # order moves on rather than waiting, and the next price it
+                # reaches may be a worse one. That is not a trade-through of a
+                # protected quote: an order carrying a minimum is offering
+                # conditional liquidity, and the condition is not met. The
+                # alternative -- stopping here -- would let one order with a
+                # large minimum make its whole price level untradeable by
+                # everyone smaller than it, which is a far worse market than a
+                # slightly worse fill.
+                blocked.add(int(resting_price))
+                continue
 
             if (
                 resting.agent_id == incoming.agent_id
@@ -661,7 +1002,14 @@ class MatchingEngine:
             available = resting.shown if resting.is_iceberg else resting.remaining
             traded = Quantity(min(int(incoming.remaining), int(available)))
             if traded <= 0:
+                # Defensive; `consume` refreshes an exhausted iceberg, so an
+                # order showing nothing while holding something should not
+                # exist. Pruning alone would only clear it from the front of the
+                # queue, and this order need not be at the front, so the price
+                # is set aside as well rather than risking a loop that cannot
+                # make progress.
                 level.prune()
+                blocked.add(int(resting_price))
                 continue
 
             self.book.consume(resting, traded)
@@ -709,14 +1057,144 @@ class MatchingEngine:
             events.append(trade)
             self._tape.append(trade)
 
-            if resting.remaining <= 0:
+            if resting.remaining <= 0 and level.orders and level.orders[0] is resting:
                 level.popleft()
 
         return events
 
+    def _next_level(self, side: Side, blocked: set[int]) -> PriceLevel | None:
+        """The best level on ``side`` that this pass has not already set aside."""
+        if not blocked:
+            return self.book.best_level(side)
+        for level in self.book.live_levels(side):
+            if int(level.price) not in blocked:
+                return level
+        return None
+
+    def _first_tradeable(self, level: PriceLevel, incoming: Order) -> Order | None:
+        """The first order at this price the incoming order may trade with.
+
+        Almost always the front of the queue, which is what time priority means.
+        It is not the front only when the order there insists on a minimum this
+        order is too small to meet, and then the fill goes to whoever is behind
+        it at the same price. Nobody loses anything they were promised: the
+        order with the minimum chose conditional execution over an unconditional
+        place in the queue, which is the same bargain an iceberg strikes when it
+        trades queue position for concealment.
+        """
+        for resting in level.orders:
+            if resting.status.terminal or resting.remaining <= 0:
+                continue
+            if resting.min_quantity <= 0:
+                return resting
+            available = int(resting.shown) if resting.is_iceberg else int(resting.remaining)
+            if min(int(incoming.remaining), available) >= resting.min_quantity:
+                return resting
+        return None
+
+    def _executable(
+        self, incoming: Order, collar: tuple[int, int] | None
+    ) -> int:
+        """How much of ``incoming`` could really trade against the book now.
+
+        Counts what the walk would actually take rather than aggregate depth,
+        because the two differ: a resting order with a minimum of its own may be
+        passed over, and an order that would only meet itself contributes
+        nothing. Used for the minimum-quantity test, where an over-count is the
+        one error that matters -- it would admit an order and then fill it for
+        less than its minimum, which is the outcome the field exists to prevent.
+
+        An iceberg counts for its whole remaining quantity rather than its
+        visible slice. Within a single walk the reserve is genuinely reachable:
+        an exhausted slice refreshes to the back of its level and the walk
+        arrives there again once everything ahead of it is gone.
+        """
+        wanted = int(incoming.remaining)
+        policy = self.self_trade_prevention
+        total = 0
+        for level in self.book.live_levels(incoming.side.opposite):
+            if not incoming.side.crosses(level.price, incoming.price):
+                break
+            if collar is not None:
+                low, high = collar
+                if not low <= int(level.price) <= high:
+                    break
+            for resting in level.orders:
+                if resting.status.terminal or resting.remaining <= 0:
+                    continue
+                if (
+                    resting.agent_id == incoming.agent_id
+                    and policy is not SelfTradePrevention.ALLOW
+                ):
+                    if policy is SelfTradePrevention.CANCEL_OLDEST:
+                        # The resting order is removed and the walk carries on.
+                        continue
+                    # The incoming order's remainder is cancelled where it
+                    # stands, so nothing past this point is reachable.
+                    return total
+                take = min(wanted - total, int(resting.remaining))
+                if take < resting.min_quantity:
+                    continue
+                total += take
+                if total >= wanted:
+                    return total
+        return total
+
     # -- cancel ------------------------------------------------------------
 
     def _cancel(self, command: Cancel) -> list[Event]:
+        parked = next(
+            (stop for stop in self._stops if stop.order_id == command.order_id), None
+        )
+        if parked is not None:
+            # A parked stop is off the book on purpose, so the book cannot
+            # answer for it and `UNKNOWN_ORDER` was the answer it gave. That was
+            # not merely unhelpful. The venue drops its working-order entry on a
+            # rejection, so a cancel an agent believed had failed released the
+            # collateral reserved against the stop while leaving the stop parked
+            # and able to trigger -- measured as one stop still parked with the
+            # reservation gone. It also meant the kill switch could report a
+            # participant as flat while its stops were still armed.
+            if parked.agent_id != command.agent_id:
+                return [
+                    Rejected(
+                        self._seq(),
+                        command.agent_id,
+                        RejectReason.NOT_ORDER_OWNER,
+                        command.order_id,
+                    )
+                ]
+            self._stops.remove(parked)
+            # Its full quantity: a stop is not an order yet, so none of it can
+            # have traded.
+            return [
+                Cancelled(
+                    self._seq(), command.agent_id, command.order_id, parked.quantity
+                )
+            ]
+
+        inert = self._inert_peg(command.order_id) if self._pegs else None
+        if inert is not None:
+            # Asked before the book, because a peg with no price is in no level
+            # and the id may still resolve to the tombstone of the last order it
+            # was. Answering from the book would report a live order as already
+            # terminal, and leave an order nobody can withdraw.
+            if inert.order.agent_id != command.agent_id:
+                return [
+                    Rejected(
+                        self._seq(),
+                        command.agent_id,
+                        RejectReason.NOT_ORDER_OWNER,
+                        command.order_id,
+                    )
+                ]
+            remaining = inert.order.remaining
+            inert.order.status = OrderStatus.CANCELLED
+            self._pegs.remove(inert)
+            return [
+                Cancelled(self._seq(), command.agent_id, command.order_id, remaining)
+            ]
+
         order = self.book.get(command.order_id)
         if order is None:
             return [
@@ -758,6 +1236,20 @@ class MatchingEngine:
     # -- replace -----------------------------------------------------------
 
     def _replace(self, command: Replace) -> list[Event]:
+        if self._pegs and self._inert_peg(command.order_id) is not None:
+            # A peg that currently has no price cannot be repriced. Reported as
+            # a peg problem rather than as an unknown or terminal order, both of
+            # which would be untrue and would send whoever is debugging it
+            # looking for an order that is sitting right there.
+            return [
+                Rejected(
+                    self._seq(),
+                    command.agent_id,
+                    RejectReason.INVALID_PEG,
+                    command.order_id,
+                )
+            ]
+
         order = self.book.get(command.order_id)
         if order is None:
             return [
@@ -836,6 +1328,12 @@ class MatchingEngine:
             quantity=command.new_quantity,
             remaining=command.new_quantity,
             priority=self._arrival,
+            min_quantity=order.min_quantity,
+            # Carried, or a replace quietly strips an iceberg of the only
+            # property that made it one: the order comes back fully displayed
+            # and publishes the size its owner was working in slices precisely
+            # so that nobody could see it.
+            display_size=order.display_size,
         )
         events: list[Event] = [
             Replaced(
@@ -866,6 +1364,34 @@ def _validate(command: Submit) -> RejectReason | None:
         return RejectReason.INVALID_QUANTITY
     if command.display_size < 0:
         return RejectReason.INVALID_QUANTITY
+    if command.min_quantity < 0:
+        return RejectReason.INVALID_QUANTITY
+    if command.min_quantity > command.quantity:
+        # An order refusing to trade for less than more than all of itself. It
+        # is not a strict order, it is an order that can never execute, and the
+        # difference matters because the first one rests quietly forever and
+        # looks like bad luck.
+        return RejectReason.INVALID_QUANTITY
+    if command.display_size and command.min_quantity > command.display_size:
+        # Shows ten at a time and refuses to trade fewer than fifty. Every
+        # execution it could offer is one it would then decline, so the two
+        # instructions cancel out to "never trade".
+        return RejectReason.INVALID_QUANTITY
+
+    pegging = command.order_type is OrderType.PEGGED
+    if pegging and command.peg_to is None:
+        return RejectReason.INVALID_PEG
+    if not pegging and (command.peg_to is not None or command.peg_offset):
+        return RejectReason.INVALID_PEG
+    if pegging and command.price is not None:
+        # Its price is the reference plus its offset. A named price as well
+        # would be two prices for one order and no rule saying which wins.
+        return RejectReason.INVALID_PRICE
+    if pegging and command.time_in_force in (TimeInForce.IOC, TimeInForce.FOK):
+        # A peg is an instruction to keep tracking, and both of these are
+        # instructions not to rest. Only one of them can be obeyed.
+        return RejectReason.INVALID_PEG
+
     stopping = command.order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
     if stopping and command.stop_price is None:
         return RejectReason.INVALID_STOP_PRICE
@@ -885,10 +1411,17 @@ def _validate(command: Submit) -> RejectReason | None:
     if command.display_size and command.order_type not in (
         OrderType.LIMIT,
         OrderType.STOP_LIMIT,
+        OrderType.PEGGED,
     ):
         # An order with no price cannot hide anything: it never rests, so
-        # there is no queue for a reserve to wait in.
+        # there is no queue for a reserve to wait in. A peg is on the list
+        # because it does rest -- it has no price of its own, which is a
+        # different thing from having no price.
         return RejectReason.INVALID_QUANTITY
+    if pegging:
+        # Everything below concerns an order that names a price. A peg does not,
+        # and its own rules were checked above.
+        return None
     if command.order_type is OrderType.MARKET:
         if command.price is not None:
             return RejectReason.INVALID_PRICE
