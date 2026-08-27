@@ -69,9 +69,9 @@ Checked for, and not present:
 | Opening / closing auctions | absent. Real markets open with a call auction, not continuous trading, and the opening print is a distinct mechanism |
 | Circuit breakers, price bands | absent. Nothing stops a runaway or a fat finger |
 | Trading halts and session states | absent. The market is always open, forever |
-| Stop and stop-limit orders | absent |
-| Iceberg / reserve orders | absent, and they change queue dynamics materially |
-| Post-only, pegged, MPL orders | absent |
+| Stop and stop-limit orders | **present**, with cascades measured rather than prevented |
+| Iceberg / reserve orders | **present**, refreshing to the back of the queue |
+| Pegged, MPL orders | absent. Post-only is present |
 | Maker/taker fee schedule | absent. A `fee` parameter exists on the ledger and is never populated |
 | Tiered tick tables | absent. One tick size per instrument |
 | Clearing, novation, a CCP | absent. Settlement is direct between counterparties |
@@ -79,7 +79,8 @@ Checked for, and not present:
 | Message throttling, kill switch | absent |
 | Multiple venues, order routing | absent |
 
-Order types implemented: **limit and market**, with GTC, IOC and FOK. A
+Order types implemented: **limit, market, stop and stop-limit**, with GTC,
+IOC, FOK and post-only, and an iceberg display size on anything that rests. A
 production venue offers twenty or more.
 
 ## What is genuinely present, and correct
@@ -245,6 +246,53 @@ each item. Struck items link to what actually happened.
    windows under the same evidential bar. Settlement confirms it to the tick:
    1,874 + 1,859 + 1,875 + 1,869 = 7,477. `CROW_EQ` deliberately has no legs,
    so one share is arbitrage-linked and one is not.
+
+## Orders that hide, and orders that wait
+
+**Iceberg orders** trade visibility for queue priority. Size is information: an
+order for ten thousand lots announces what you are doing before you have done
+any of it, so it is worked in slices, and each refreshed slice goes to the back
+of its level behind everything that arrived while the last one was working.
+That cost is what makes an iceberg a trade-off rather than simply a better
+order -- a venue that refreshed in place would let one participant hold the
+front of a queue indefinitely while showing a single lot.
+
+The depth publishes the slice and the resting quantity counts the whole thing,
+and both are true: one is what the market can see, the other is what is there.
+
+**Stop orders** wait for a price before they exist, and are held off the book
+while they wait. Publishing one would say exactly where the market has to go to
+set off a cascade, which is the single fact its owner most wants kept quiet.
+
+A triggered stop prints, which can trigger more stops. Nothing here prevents
+that -- being able to *measure* a cascade is most of the reason to model stops
+at all -- and `MatchingEngine.cascade_depth` records how many rounds each one
+ran for. What is prevented is a cascade that never ends, which would be a bug
+in the model rather than an event in a market.
+
+Two things had to be got right for a stop to be a stop rather than a leak:
+
+- **A triggered plain stop becomes a market order, which is immediate-or-cancel
+  by construction here.** Carrying the stop's own time-in-force through handed
+  the engine a GTC market order, which it refuses -- so the stop vanished on
+  being triggered, with nothing in the tape to say so.
+- **Collateral is reserved from the moment a stop is parked.** The engine
+  releases a triggered stop inside its own matching, which never passes back
+  through the venue's affordability check, so an unreserved stop would create a
+  position the account had never been asked to cover. It acknowledges at its
+  limit if it has one and its trigger otherwise, and the venue reserves against
+  that. A plain stop can still fill through its trigger in a fast market --
+  which is the risk its owner takes in reality -- and the collar on unpriced
+  orders bounds how far through.
+
+**The differential harness caught the bug in this.** A visible slice was
+computed once when an order was constructed rather than when it joined a level,
+so an order that partially filled on the way in and then rested published its
+*original* size as depth. The reference matcher's book was one lot shallower
+than the engine's, and that one lot was the whole of it. Icebergs themselves
+are outside the harness -- the deliberately naive reference does not model them
+-- so the guarantee it still gives is the one that matters for the C++ port:
+ordinary matching is unchanged.
 
 ## A flow of information, and the two bugs it uncovered
 

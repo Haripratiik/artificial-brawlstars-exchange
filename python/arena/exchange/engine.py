@@ -20,6 +20,7 @@ Matching rules, in the order they are applied:
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 from arena.exchange.book import Order, OrderBook
 from arena.exchange.session import SENTINEL, SessionState, indicative_auction
@@ -37,6 +38,7 @@ from arena.exchange.events import (
     Traded,
 )
 from arena.exchange.types import (
+    AgentId,
     OrderId,
     OrderStatus,
     OrderType,
@@ -50,6 +52,55 @@ from arena.exchange.types import (
 )
 
 __all__ = ["MatchingEngine"]
+
+
+@dataclass(slots=True)
+class _PendingStop:
+    """A stop order waiting for its trigger.
+
+    Not an :class:`Order`, because it is not one yet: it has no place in a
+    queue, no price priority, and nothing anyone can trade against. It becomes
+    an order when the market reaches it.
+    """
+
+    order_id: OrderId
+    agent_id: AgentId
+    side: Side
+    quantity: Quantity
+    stop_price: Price
+    limit_price: Price | None
+    time_in_force: TimeInForce
+    display_size: int
+    arrival: int
+
+    def as_submit(self) -> Submit:
+        """The order this becomes once it is triggered.
+
+        A plain stop becomes a *market* order, and a market order is
+        immediate-or-cancel by construction here -- an unpriced order that
+        rested would match anything forever. Carrying the stop's own
+        time-in-force through would hand the engine a GTC market order, which
+        it refuses, and the stop would vanish on being triggered: parked,
+        released, rejected, gone, with nothing in the tape to say so.
+        """
+        if self.limit_price is None:
+            return Submit(
+                self.agent_id,
+                self.side,
+                self.quantity,
+                None,
+                OrderType.MARKET,
+                TimeInForce.IOC,
+            )
+        return Submit(
+            self.agent_id,
+            self.side,
+            self.quantity,
+            self.limit_price,
+            OrderType.LIMIT,
+            self.time_in_force,
+            self.display_size,
+        )
 
 
 class MatchingEngine:
@@ -78,6 +129,22 @@ class MatchingEngine:
         # Set by the venue before each command, because the band moves with the
         # reference price and only the venue tracks that.
         self.execution_band: tuple[int, int] | None = None
+        # Stop orders waiting for their trigger. Off the book on purpose.
+        self._stops: list[_PendingStop] = []
+        # How many rounds each cascade of stops ran for, oldest first. A
+        # measurement rather than a control: a stop that fills moves the price,
+        # which triggers more stops, and how often that chains is exactly the
+        # thing worth knowing.
+        self.cascade_depth: list[int] = []
+        # A cascade that never ends is a bug in the model, not an event in the
+        # market. High enough that a real chain is never cut short.
+        self._max_cascade = 24
+        # True while a cascade is being worked through, so a triggered stop's
+        # own trades do not start a nested release inside the loop that is
+        # already handling them. Without it the chain recurses instead of
+        # iterating: each level records a depth of one, the measurement says
+        # nothing, and the bound above guards a loop the cascade is not using.
+        self._releasing = False
         self._sequence = 0
         self._next_order_id = 0
         self._arrival = 0
@@ -136,7 +203,17 @@ class MatchingEngine:
             quantity=command.quantity,
             remaining=command.quantity,
             priority=self._arrival,
+            display_size=command.display_size,
         )
+
+        # A stop acknowledges at the price it is contingent on: its limit if it
+        # has one, otherwise its trigger. The venue reserves collateral from
+        # this, and a stop that acknowledged no price at all would be reserved
+        # against by nothing -- an agent could park a hundred of them, each
+        # individually affordable and collectively not.
+        acknowledged_at = command.price
+        if command.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
+            acknowledged_at = command.price or command.stop_price
 
         events: list[Event] = [
             Acknowledged(
@@ -145,9 +222,12 @@ class MatchingEngine:
                 order_id,
                 command.side,
                 command.quantity,
-                command.price,
+                acknowledged_at,
             )
         ]
+
+        if command.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
+            return events + self._park_stop(command, order_id)
 
         if not self.phase.matches_continuously:
             return events + self._accumulate(command, order)
@@ -192,6 +272,15 @@ class MatchingEngine:
                 else None,
             )
         )
+        # A print can bring stop orders to life, and one of those can print
+        # again. Released after this order has finished matching rather than
+        # inside the loop, so a cascade is a sequence of complete orders rather
+        # than an interleaving of half-filled ones.
+        last = next(
+            (e.price for e in reversed(events) if isinstance(e, Traded)), None
+        )
+        if last is not None and self._stops and not self._releasing:
+            events.extend(self._release_stops(last))
 
         if order.remaining > 0:
             if command.time_in_force in (TimeInForce.GTC, TimeInForce.POST_ONLY):
@@ -427,6 +516,93 @@ class MatchingEngine:
         low, high = self.execution_band
         return low <= int(price) <= high
 
+
+    # -- stops -------------------------------------------------------------
+
+    def _park_stop(self, command: Submit, order_id: OrderId) -> list[Event]:
+        """Hold a stop off the book until its trigger is reached.
+
+        Off the book, not on it: a resting stop is not liquidity and must not
+        appear as any. Publishing one would tell everybody exactly where the
+        market has to go to set off a cascade, which is the single piece of
+        information a stop order's owner most wants kept quiet.
+        """
+        self._stops.append(
+            _PendingStop(
+                order_id=order_id,
+                agent_id=command.agent_id,
+                side=command.side,
+                quantity=command.quantity,
+                stop_price=command.stop_price,
+                limit_price=command.price,
+                time_in_force=command.time_in_force,
+                display_size=command.display_size,
+                arrival=self._arrival,
+            )
+        )
+        return []
+
+    def _triggered_by(self, price: Price) -> list["_PendingStop"]:
+        """Stops this print sets off, in a deterministic order.
+
+        A buy stop triggers when the market trades at or above its price, a
+        sell stop at or below. Ordered by how far through the trigger the print
+        went and then by arrival, so a single print that sets off several stops
+        releases them in the order the market reached them rather than in the
+        order they happened to be entered.
+        """
+        hit = [
+            stop
+            for stop in self._stops
+            if (stop.side is Side.BUY and int(price) >= int(stop.stop_price))
+            or (stop.side is Side.SELL and int(price) <= int(stop.stop_price))
+        ]
+        if not hit:
+            return []
+        self._stops = [stop for stop in self._stops if stop not in hit]
+        hit.sort(
+            key=lambda s: (
+                -int(s.stop_price) if s.side is Side.BUY else int(s.stop_price),
+                s.arrival,
+            )
+        )
+        return hit
+
+    def _release_stops(self, price: Price) -> list[Event]:
+        """Fire everything this print triggered, and everything that triggers.
+
+        Iterative rather than recursive, and bounded. A stop that fills moves
+        the price, which can trigger more stops -- that is a cascade, it is
+        real, and this does not prevent it. What it does prevent is a cascade
+        that never terminates, which would be a bug in the model rather than an
+        event in the market. `cascade_depth` records how far each one went.
+        """
+        events: list[Event] = []
+        pending = self._triggered_by(price)
+        depth = 0
+        self._releasing = True
+        try:
+            depth = self._work_cascade(pending, events)
+        finally:
+            self._releasing = False
+        if depth:
+            self.cascade_depth.append(depth)
+        return events
+
+    def _work_cascade(self, pending: list["_PendingStop"], events: list[Event]) -> int:
+        depth = 0
+        while pending and depth < self._max_cascade:
+            depth += 1
+            following: list[_PendingStop] = []
+            for stop in pending:
+                released = self._submit(stop.as_submit())
+                events.extend(released)
+                for event in released:
+                    if isinstance(event, Traded):
+                        following.extend(self._triggered_by(event.price))
+            pending = following
+        return depth
+
     def _match(
         self, incoming: Order, collar: tuple[int, int] | None = None
     ) -> list[Event]:
@@ -477,7 +653,16 @@ class MatchingEngine:
                     break
                 continue
 
-            traded = Quantity(min(incoming.remaining, resting.remaining))
+            # At most the slice an iceberg is showing. Taking its reserve
+            # in one go would make the reserve pointless: the aggressor would
+            # get the whole order at one price and nobody else at that level
+            # would ever get a turn, which is precisely what a hidden order is
+            # not entitled to.
+            available = resting.shown if resting.is_iceberg else resting.remaining
+            traded = Quantity(min(int(incoming.remaining), int(available)))
+            if traded <= 0:
+                level.prune()
+                continue
 
             self.book.consume(resting, traded)
             incoming.remaining = Quantity(incoming.remaining - traded)
@@ -678,6 +863,31 @@ class MatchingEngine:
 
 def _validate(command: Submit) -> RejectReason | None:
     if command.quantity <= 0:
+        return RejectReason.INVALID_QUANTITY
+    if command.display_size < 0:
+        return RejectReason.INVALID_QUANTITY
+    stopping = command.order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
+    if stopping and command.stop_price is None:
+        return RejectReason.INVALID_STOP_PRICE
+    if not stopping and command.stop_price is not None:
+        return RejectReason.INVALID_STOP_PRICE
+    if command.order_type is OrderType.STOP and command.price is not None:
+        return RejectReason.INVALID_PRICE
+    if command.order_type is OrderType.STOP_LIMIT and command.price is None:
+        return RejectReason.LIMIT_ORDER_REQUIRES_PRICE
+    if stopping and command.time_in_force in (TimeInForce.IOC, TimeInForce.FOK):
+        # "Do this now" and "do this later" are contradictory instructions.
+        return RejectReason.MARKET_ORDER_MUST_BE_IOC
+    if stopping:
+        # Everything below is about an order that exists now. A stop does not:
+        # its price rules were checked above, against what it will become.
+        return None
+    if command.display_size and command.order_type not in (
+        OrderType.LIMIT,
+        OrderType.STOP_LIMIT,
+    ):
+        # An order with no price cannot hide anything: it never rests, so
+        # there is no queue for a reserve to wait in.
         return RejectReason.INVALID_QUANTITY
     if command.order_type is OrderType.MARKET:
         if command.price is not None:

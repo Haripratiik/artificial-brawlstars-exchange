@@ -457,6 +457,19 @@ class Venue:
                 if command.new_price is not None
                 else Money(existing[2])
             )
+        elif getattr(command, "stop_price", None) is not None:
+            # A stop is reserved for at its trigger, from the moment it is
+            # parked. It has to be: the engine releases a triggered stop
+            # inside its own matching, which never passes back through this
+            # check, so an unreserved stop would create a position the account
+            # had never been asked to cover.
+            #
+            # A plain stop can still fill through its trigger in a fast market
+            # -- that is the risk its owner takes in reality too -- but the
+            # collar on unpriced orders bounds how far through.
+            side = command.side
+            price = instrument.price_in_minor(command.stop_price)
+            quantity = int(command.quantity)
         elif command.price is not None:
             side = command.side
             price = instrument.price_in_minor(command.price)

@@ -269,8 +269,13 @@ level, so the underlying genuinely diffuses -- late-session dispersion of the fu
 from 11 to 279 across six paired seeds -- at an accuracy cost of +2.20% of range, 95%
 interval [-0.21%, +4.61%].
 
-Still open in this phase: stop and stop-limit orders, iceberg and pegged orders, tiered
-tick tables, message throttling and a kill switch, and clearing through a CCP.
+Stop, stop-limit and iceberg orders are in. Stops are held off the book -- publishing one
+says where the market must go to set off a cascade -- and a cascade is measured rather than
+prevented, with a bound only so that a chain cannot run forever. Icebergs refresh to the
+back of their level, which is the priority they pay for hiding.
+
+Still open in this phase: pegged and minimum-quantity orders, tiered tick tables, message
+throttling and a kill switch, and clearing through a CCP.
 
 ### Phase 8 — Real historical replay
 Only now, once Track A has accrued enough. Same harness, `BrawlReplayWorld`, one real patch as

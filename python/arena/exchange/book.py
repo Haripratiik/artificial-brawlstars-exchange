@@ -51,6 +51,38 @@ class Order:
     # Arrival rank, assigned by the engine. Defines time priority within a level.
     priority: int
     status: OrderStatus = OrderStatus.NEW
+    # How much of the order is shown at a time. Zero means all of it.
+    #
+    # An iceberg exists because size is information: an order for ten thousand
+    # lots tells everyone what you are doing before you have done any of it, so
+    # it is worked in slices. The cost is queue priority -- each refreshed slice
+    # goes to the back of its level, behind everything that arrived while the
+    # last one was working -- and that trade, visibility against position, is
+    # the whole design.
+    display_size: int = 0
+    # The slice currently on the book. The rest of ``remaining`` is reserve, and
+    # nobody outside this order can see it.
+    shown: Quantity = Quantity(0)
+
+    def __post_init__(self) -> None:
+        if self.display_size < 0:
+            raise ValueError("display size cannot be negative")
+        if not self.shown:
+            self.shown = self.visible_slice()
+
+    def visible_slice(self) -> Quantity:
+        """What the next slice on the book should be."""
+        if self.display_size <= 0:
+            return self.remaining
+        return Quantity(min(int(self.remaining), self.display_size))
+
+    @property
+    def hidden(self) -> Quantity:
+        return Quantity(max(0, int(self.remaining) - int(self.shown)))
+
+    @property
+    def is_iceberg(self) -> bool:
+        return self.display_size > 0
 
     @property
     def filled(self) -> Quantity:
@@ -76,7 +108,10 @@ class PriceLevel:
 
     def append(self, order: Order) -> None:
         self.orders.append(order)
-        self.total = Quantity(self.total + order.remaining)
+        # Only the visible slice counts toward depth, because only the visible
+        # slice is what anyone can see. Adding the reserve here would publish
+        # the very thing an iceberg exists not to publish.
+        self.total = Quantity(self.total + order.shown)
 
     def reduce(self, amount: Quantity) -> None:
         self.total = Quantity(self.total - amount)
@@ -90,6 +125,18 @@ class PriceLevel:
     @property
     def empty(self) -> bool:
         return not self.orders
+
+    def refresh(self, order: Order) -> None:
+        """Put an exhausted iceberg's next slice at the back of the queue.
+
+        Behind everything that arrived while the last slice was working, which
+        is the price an iceberg pays and the reason it is not simply a better
+        order. A venue that refreshed in place would let one participant hold
+        the front of a queue indefinitely while showing a single lot.
+        """
+        order.shown = order.visible_slice()
+        self.total = Quantity(self.total + order.shown)
+        self.orders.append(order)
 
     def prune(self) -> None:
         """Drop terminal or exhausted orders from the front of the queue.
@@ -270,7 +317,17 @@ class OrderBook:
     # -- mutation ----------------------------------------------------------
 
     def add(self, order: Order) -> None:
-        """Rest an order at its price, behind everything already there."""
+        """Rest an order at its price, behind everything already there.
+
+        The visible slice is computed *here*, as the order joins a level, and
+        not once at construction. An order that partially filled on the way in
+        and then rested still carried the slice it was born with, so the depth
+        published its original size rather than what was left of it -- caught by
+        the differential harness as a book one lot deeper than the reference
+        matcher's, which is exactly the kind of quiet arithmetic error that
+        harness exists for.
+        """
+        order.shown = order.visible_slice()
         levels = self._levels[order.side]
         level = levels.get(order.price)
         if level is None:
@@ -293,15 +350,24 @@ class OrderBook:
         self._orders[order.order_id] = order
 
     def consume(self, order: Order, quantity: Quantity) -> None:
-        """Remove ``quantity`` from a resting order and its level's total."""
+        """Remove ``quantity`` from a resting order and its level's total.
+
+        An iceberg whose visible slice is exhausted is taken out of the queue
+        and put back at the end with a fresh slice, which is what costs it its
+        priority.
+        """
         order.remaining = Quantity(order.remaining - quantity)
+        order.shown = Quantity(max(0, int(order.shown) - int(quantity)))
         level = self._levels[order.side].get(order.price)
         if level is not None:
             level.reduce(quantity)
         if order.remaining <= 0:
             order.status = OrderStatus.FILLED
-        else:
-            order.status = OrderStatus.PARTIALLY_FILLED
+            return
+        order.status = OrderStatus.PARTIALLY_FILLED
+        if level is not None and order.is_iceberg and int(order.shown) <= 0:
+            level.popleft()
+            level.refresh(order)
 
     def remove(self, order: Order) -> None:
         """Tombstone an order. The level skips it on the way past.
@@ -311,5 +377,8 @@ class OrderBook:
         the common case the expensive one.
         """
         level = self._levels[order.side].get(order.price)
-        if level is not None and order.remaining > 0:
-            level.reduce(order.remaining)
+        if level is not None and order.shown > 0:
+            # By what it was showing, because that is what was added. Reducing
+            # by the whole remaining would take an iceberg's hidden reserve out
+            # of a total it was never in.
+            level.reduce(order.shown)

@@ -71,6 +71,17 @@ class OrderType(Enum):
     # and is always immediate-or-cancel: resting an unpriced order would leave
     # the book with a level that matches anything.
     MARKET = "market"
+    # Dormant until the market trades at or through a trigger, then a market
+    # order. The classic risk tool and the classic accelerant: a stop sells
+    # into a fall, which pushes the price further down, which triggers more
+    # stops. Nothing here prevents that cascade, and it should not -- being able
+    # to *measure* one is most of the reason to model stops at all.
+    STOP = "stop"
+    # The same trigger, becoming a limit order rather than a market one. It
+    # protects against the fill an unpriced stop can get in a fast market, at
+    # the cost of possibly not filling at all -- which is the trade every stop
+    # user actually faces.
+    STOP_LIMIT = "stop_limit"
 
 
 class TimeInForce(Enum):
@@ -152,3 +163,6 @@ class RejectReason(Enum):
     # a bid above the band and an ask below it, neither allowed to trade,
     # crossed and stuck until something halted.
     OUTSIDE_PRICE_BAND = "outside_price_band"
+    # A stop with no trigger, a trigger on an order that has none, or a trigger
+    # already reached: all of them are an instruction that cannot be followed.
+    INVALID_STOP_PRICE = "invalid_stop_price"

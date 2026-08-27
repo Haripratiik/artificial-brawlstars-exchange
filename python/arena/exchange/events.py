@@ -76,6 +76,13 @@ class Submit(Command):
     price: Price | None = None
     order_type: OrderType = OrderType.LIMIT
     time_in_force: TimeInForce = TimeInForce.GTC
+    # Show this much at a time; zero shows all of it. An iceberg trades
+    # visibility for queue priority: each refreshed slice goes to the back of
+    # its level, behind everything that arrived while the last one worked.
+    display_size: int = 0
+    # The price that brings a stop order to life. Required for a stop, refused
+    # for anything else.
+    stop_price: Price | None = None
 
 
 @dataclass(frozen=True, slots=True)

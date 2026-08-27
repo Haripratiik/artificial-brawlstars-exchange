@@ -332,6 +332,12 @@ async def _receive(socket: WebSocket, seat: AgentId | None = None) -> None:
                     price=None if price in (None, "", "market") else Decimal(str(price)),
                     tif=str(message.get("tif", "")),
                     trader=seat,
+                    stop=(
+                        None
+                        if message.get("stop") in (None, "", "none")
+                        else Decimal(str(message["stop"]))
+                    ),
+                    display=int(message.get("display") or 0),
                 )
             elif action == "cancel":
                 result = runner.market.cancel(

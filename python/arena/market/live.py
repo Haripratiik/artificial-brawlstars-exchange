@@ -242,6 +242,8 @@ class LiveMarket:
         price: Decimal | None,
         tif: str = "",
         trader: AgentId | None = None,
+        stop: Decimal | None = None,
+        display: int = 0,
     ) -> dict[str, Any]:
         instrument = self.venue.registry.get(symbol)
         if instrument is None:
@@ -254,10 +256,19 @@ class LiveMarket:
         except ValueError as bad_price:
             return {"ok": False, "error": str(bad_price)}
 
+        try:
+            stop_ticks = None if stop is None else instrument.to_ticks(stop)
+        except ValueError as bad_stop:
+            return {"ok": False, "error": str(bad_stop)}
+        if display < 0:
+            return {"ok": False, "error": "display size cannot be negative"}
+
         # A market order can only ever be immediate; a limit order defaults to
         # resting. Anything else the caller asks for is honoured, so the browser
         # can reach post-only and fill-or-kill rather than only the two defaults.
-        if ticks is None:
+        if stop_ticks is not None:
+            duration = TimeInForce.GTC
+        elif ticks is None:
             duration = TimeInForce.IOC
         else:
             try:
@@ -265,14 +276,23 @@ class LiveMarket:
             except ValueError:
                 return {"ok": False, "error": f"unknown time in force {tif!r}"}
 
+        if stop_ticks is not None:
+            kind = OrderType.STOP_LIMIT if ticks is not None else OrderType.STOP
+        elif ticks is not None:
+            kind = OrderType.LIMIT
+        else:
+            kind = OrderType.MARKET
+
         who = self.trader(trader)
         command = Submit(
             who.agent_id,
             Side.BUY if side.lower() == "buy" else Side.SELL,
             Quantity(quantity),
             ticks,
-            OrderType.LIMIT if ticks is not None else OrderType.MARKET,
+            kind,
             duration,
+            display,
+            stop_ticks,
         )
         who.enqueue(SymbolCommand(symbol, command))
         return {"ok": True}
