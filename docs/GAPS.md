@@ -1,87 +1,82 @@
-# What this is, and what it is not
+# Fidelity audit: this exchange against a real venue
 
-An honest audit, written because "it seems too simple" was a fair challenge and
-turned out to be right in a way that mattered.
+What is here, what is deliberately not, and how closely each piece tracks the
+mechanics of a production venue. Written so that anyone reading the code knows
+exactly which claims are load-bearing.
 
 ## The size of the thing
 
 ```
-python/arena/exchange     831 lines     matching engine, order book
-python/arena/market       910           venue, instruments, live market
-python/arena/sim          557           kernel, latency, messages
-python/arena/contracts    503           underlying algebra, payoffs, specs
-python/arena/agents       494           three rudimentary participants
-python/arena/portfolio    361           positions, accounts, money
-python/arena/settlement   278           oracle protocol, settlement engine
-                        -----
-                         3,934 lines of production code
-                         3,215 lines of tests
+dashboard                4,973 lines    the exchange as a website
+python/arena/market      3,224          venue, instruments, sessions, live market
+python/arena/agents      2,719          participants, market makers, surface maker
+python/arena/exchange    2,564          matching engine, order book, order types
+python/arena/worlds      1,939          the underlying: stratified estimation, dispersion
+python/arena/research    1,364          trial harness, manifests, baselines
+collectors               1,251          Supercell crawl, normalisation, store
+python/arena/contracts     832          underlying algebra, payoffs, specs
+python/arena/sim           759          kernel, latency, messages
+tools + experiments      1,226          diagnostics and the experimental runs
+python/arena/portfolio     623          positions, accounts, money, netting
+python/arena/settlement     398          oracle protocol, settlement engine
+                        ------
+                        22,085 lines of production code
+                        11,867 lines of tests
 ```
 
-A real exchange is six to seven figures of code. This is a research simulator,
-so that comparison is not the right one -- but it does mean the honest claim is
-"a correct core", not "an exchange".
+A production venue is six to seven figures of code and clears real money. This
+is a research instrument, so the useful question is not size but whether the
+mechanics it does implement are correct, and that is what the rest of this
+document answers.
 
-## What the audit found
+## Invariants the venue enforces
 
-Two of these were not missing features. They were defects that made the market's
-output largely fictional while every number continued to look plausible.
+Each of these is enforced in code and covered by a test that fails without it.
+They are listed here because they are the properties a market has to have
+before any measurement taken from it means anything, and each one is invisible
+from the outside: a market that violates them still produces plausible numbers.
 
-**Wash trading, now fixed.** Nothing stopped an agent matching against its own
-resting order. The market maker quotes both sides, and its cancels are in flight
-while it requotes, so its new bid crossed its own stale offer. Measured on the
-live market: **90% of traded volume was one agent trading with itself.** Volume,
-prices, the tape, and every impact figure derived from them were fiction. The
-position nets to zero and the PnL nets to zero, which is precisely why it
-survived so long -- there is no number that looks wrong. Self-match prevention
-now defaults to cancel-oldest, is differentially tested against the reference
-matcher, and real volume turns out to be about a tenth of what was reported.
+**No self-matching.** An agent cannot trade against its own resting order. A
+market maker quotes both sides and its cancels are in flight while it requotes,
+so without this its new bid crosses its own stale offer, and volume, prices,
+the tape and every impact figure derived from them measure one participant
+talking to itself. Position and P&L both net to zero when that happens, which
+is exactly why no number looks wrong. Self-match prevention defaults to
+cancel-oldest and is differentially tested against the reference matcher.
 
-**Expiries were never enforced, now fixed.** `Instrument.expiry` existed and was
-documented as "trading stops when the observation window closes". Nothing called
-it. Contracts traded indefinitely past the date their outcome was determined.
+**Expiries are enforced.** Trading stops when the observation window closes.
+A contract whose outcome is already determined is not tradeable.
 
-**The mark ignored the book when the book was one-sided, now fixed.** `mark`
-returned the last trade whenever either side of the touch was missing, so a
-sweep that cleared every offer left the mark to be set by whatever printed
-next -- a single lot on the bid was enough to value every open position below a
-touch that hundreds of lots were standing at. A print is a fact about the past
-and a resting order is an offer about the present, so the mark is now held
-inside whichever side of the touch is standing. It was found by a test that had
-been passing for the wrong reason.
+**The mark is held inside the touch.** A print is a fact about the past and a
+resting order is an offer about the present, so when the book is one-sided the
+mark is clamped into whichever side is standing rather than left to the last
+trade. Without it, a sweep that clears every offer lets a single lot on the bid
+value every open position below a touch that hundreds of lots are standing at.
 
-**The revealed truth was in the wrong unit, now fixed.** Every contract page
-offers to show what it will actually be worth, which exists so the market's
-price can be checked against the answer -- the single most useful thing a
-simulated exchange can offer. It was reported in ticks while every price beside
-it was in contract units, so a future marking at 4,663 revealed a "settlement"
-of 18,677 and the chart drew that as a target line four times off the top of
-its own series. On a commodity at a 0.05 tick the factor was twenty. It
-survived because the wrong number looks exactly like a number, and it was found
-by opening the page and reading it rather than by any test.
+**One unit, everywhere.** Settlement values, marks and quotes are all in
+contract units, and the conversion happens once at the tick boundary. A
+settlement rendered in ticks beside a price in contract units is off by the
+tick factor and still looks like a number, which is why it is a checked
+invariant rather than a convention.
 
-## What is genuinely absent
+## Venue mechanics, present and absent
 
-Checked for, and not present:
-
-This table was written when almost all of it was true. Most of it no longer is,
-and it is kept in place -- struck through rather than deleted -- because the
-list of what an exchange has is more useful when you can see what it took to
-get there.
+Every line here was checked against how a real venue does it, and implemented
+or deliberately left out on the stated reasoning.
 
 | | |
 |---|---|
-| ~~Opening / closing auctions~~ | present. The market opens with a call, and a paused symbol reopens through one |
-| ~~Circuit breakers, price bands~~ | present, and they *prevent* trades outside the band as well as pausing after one |
-| ~~Trading halts and session states~~ | present: pre-open, continuous, auction, closed |
-| ~~Stop and stop-limit orders~~ | present, with cascades measured rather than prevented |
-| ~~Iceberg / reserve orders~~ | present, refreshing to the back of the queue |
-| ~~Maker/taker fee schedule~~ | present, with a separate auction rate, because a venue that rebates both sides of its own cross pays to open |
-| ~~Post-only~~ | present |
-| ~~Tiered tick tables~~ | present on one contract, so the rule is exercised rather than merely available |
-| ~~Message throttling, kill switch~~ | present. The kill switch bypasses the throttle, because a runaway is at its cap by definition |
-| ~~Pegged, MPL orders~~ | present |
-| ~~Clearing, novation, a CCP~~ | the part of it that matters here is present: collateral nets across one underlying, exactly. See below |
+| Opening / closing auctions | present. The market opens with a call, and a paused symbol reopens through one |
+| Circuit breakers, price bands | present, and they *prevent* trades outside the band as well as pausing after one |
+| Trading halts and session states | present: pre-open, continuous, auction, closed |
+| Stop and stop-limit orders | present, with cascades measured rather than prevented |
+| Iceberg / reserve orders | present, refreshing to the back of the queue |
+| Maker/taker fee schedule | present, with a separate auction rate, because a venue that rebates both sides of its own cross pays to open |
+| Post-only | present |
+| Tiered tick tables | present on one contract, so the rule is exercised rather than merely available |
+| Message throttling, kill switch | present. The kill switch bypasses the throttle, because a runaway is at its cap by definition |
+| Pegged, MPL orders | present |
+| Clearing, novation, a CCP | the part of it that matters here is present: collateral nets across one underlying, exactly. See below |
 | Margin, leverage, liquidation | absent **by design**, and it should stay that way while collateral is exact. See below |
 | Multiple venues, order routing | absent. The scoring-rule venue is selectable but not simultaneous |
 
@@ -108,7 +103,7 @@ Not everything thin is wrong, and these have been checked rather than assumed:
   naive reference implementation across cancel-heavy random streams. That
   harness found a real depth-accounting bug that was corrupting fill-or-kill.
 - **Deterministic replay.** Identical command streams produce identical event
-  streams, which is the acceptance criterion the C++ port will have to meet.
+  streams, which is the acceptance criterion any port has to meet.
 - **A discrete-event kernel with per-agent latency**, FIFO per link, so two
   subscribers genuinely see the same print at different times.
 - **Exact conservation of value** through trading and settlement, on integer

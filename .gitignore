@@ -40,3 +40,8 @@ cpp/build/
 
 # Live-market UI scratch
 dashboard/static/**/*.map
+
+# Local agent tooling, not part of the project
+.claude/
+.agents/
+skills-lock.json
