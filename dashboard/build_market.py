@@ -15,6 +15,7 @@ simulator with a browser attached.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -44,7 +45,7 @@ from arena.market.venue_agent import VenueAgent
 from arena.settlement.engine import distributions, settle
 from arena.sim.kernel import Kernel
 from arena.sim.latency import PairwiseLatency
-from arena.sim.time import micros, millis
+from arena.sim.time import micros, millis, seconds
 from arena.worlds.brawl.dataset import CanonicalDataset
 from arena.worlds.brawl.metrics import metric_ref
 from arena.worlds.brawl.oracle import BrawlOracle
@@ -351,6 +352,65 @@ def true_levels(listed: list[Instrument]) -> dict[str, float]:
     return levels
 
 
+# The four weeks immediately before the contract window. Everything in it
+# exists on the day the contracts are published, so a belief anchored here is
+# lookahead-free by construction rather than by care.
+PRIOR_WINDOW = ObservationWindow(WINDOW.start - timedelta(weeks=4), WINDOW.start)
+
+
+def prior_levels(listed: list[Instrument]) -> dict[str, float]:
+    """Where each contract's underlying sat *before* its window opened.
+
+    This is what an informed participant knows on day one, and it is not the
+    answer. On this fixture the difference is the whole point: SPIKE ran at
+    0.4839 for the twelve weeks before the window and settles at 0.4669, so a
+    market that opens on history opens wrong and has something to discover.
+
+    Built by re-dating each contract onto the prior window rather than by a
+    separate calculation, so a listing that changes cannot leave this behind.
+    A contract whose prior window has too little evidence simply gets no prior,
+    and the agent falls back to the truth -- vaguely, since it will still be
+    swamped by its own uncertainty at the open.
+    """
+    _dataset, _reference, oracle = _world()
+
+    levels: dict[str, float] = {}
+    for instrument in listed:
+        # The distribution schedule goes with the window, because a payment
+        # measured outside the window a contract observes is measured on
+        # evidence that contract never claimed to be about -- the spec refuses
+        # it, correctly. Re-dated proportionally: the same number of periods,
+        # tiling the prior window.
+        schedule = instrument.spec.distribution
+        if schedule is not None:
+            periods = len(schedule.windows)
+            span = (PRIOR_WINDOW.end - PRIOR_WINDOW.start) / periods
+            schedule = DistributionSchedule(
+                windows=tuple(
+                    ObservationWindow(
+                        PRIOR_WINDOW.start + span * n,
+                        PRIOR_WINDOW.start + span * (n + 1),
+                    )
+                    for n in range(periods)
+                ),
+                payoff=schedule.payoff,
+            )
+        spec = replace(
+            instrument.spec,
+            window=PRIOR_WINDOW,
+            policy=policy_for(PRIOR_WINDOW),
+            published_at=PRIOR_WINDOW.start - timedelta(days=1),
+            distribution=schedule,
+        )
+        try:
+            result = settle(spec, oracle)
+        except Exception:  # noqa: BLE001 - a prior that cannot be measured is no prior
+            continue
+        if result.settled and result.underlying_level is not None:
+            levels[instrument.symbol] = float(result.underlying_level)
+    return levels
+
+
 def true_values(listed: list[Instrument]) -> dict[str, float]:
     """What each contract is actually worth over its life, in ticks.
 
@@ -385,6 +445,8 @@ def build(
     opening_auction: bool = True,
     session_seconds: float = 600.0,
     mechanism: str = "book",
+    information_flow: bool = True,
+    informed: int = 6,
 ) -> LiveMarket:
     # The scoring rule prices a binary and nothing else, so choosing it
     # narrows the exchange to its event contracts. That is not a limitation
@@ -447,7 +509,7 @@ def build(
     maker_id = maker_ids[0] if maker_ids else AgentId("mm-none")
     operator_id = AgentId("exchange")
     arb_id = AgentId("arb-1")
-    fund_ids = [AgentId("fund-sharp"), AgentId("fund-vague")]
+    fund_ids = [AgentId(f"fund-{n}") for n in range(informed)]
     noise_ids = [AgentId(f"noise-{i:02d}") for i in range(14)]
     flow_ids = [AgentId(f"flow-{i:02d}") for i in range(flow_traders)]
 
@@ -457,8 +519,9 @@ def build(
             **{a: micros(150 + 40 * n) for n, a in enumerate(maker_ids)},
             operator_id: micros(1),                      # the venue itself
             arb_id: millis(2),
-            fund_ids[0]: millis(3),
-            fund_ids[1]: millis(9),
+            # Sharper agents are also closer, which is what being a serious
+            # participant looks like: information and speed are bought together.
+            **{a: millis(3 + 2 * n) for n, a in enumerate(fund_ids)},
             HUMAN_ID: millis(20),                        # a person on a browser
             **{a: millis(45) for a in noise_ids},        # retail, far away
             **{a: millis(6) for a in flow_ids},          # brokers' algos
@@ -525,17 +588,48 @@ def build(
     # market and an empty book: every other agent here reacts to a price, so
     # with nobody posting first the auction cleared nothing and the exchange
     # stayed empty for the whole session.
+    # Their evidence arrives over the session rather than all at t=0.
+    #
+    # With everything known at the open the market has an information *stock*:
+    # it converges within seconds and then nothing can move it, because there
+    # is nothing left to arrive. Measured that way, the realised dispersion of
+    # `SPIKE_WR_FUT` over ten minutes was 14.6 on a price near 4,670 -- options
+    # were worth their intrinsic value and nothing more, and every binary was a
+    # foregone conclusion inside a minute. A market whose subject is
+    # disagreement needs something to keep disagreeing about.
+    #
+    # The experiment harnesses pass nothing here, so every published result was
+    # produced under the old model and stays reproducible.
+    reveal = seconds(int(session_seconds)) if information_flow else None
+    priors = prior_levels(listed) if information_flow else {}
+
+    # Six of them, log-spaced in precision, rather than two.
+    #
+    # Two informed traders is not a population, it is an anecdote -- and it had
+    # a measurable consequence rather than an aesthetic one. Both ran into their
+    # position limits about a minute in and the price simply stopped there:
+    # `fund-sharp` believed 4,687 against a true 4,669, was short its full 900
+    # lots, and could do nothing while the market printed 5,005. The makers had
+    # absorbed 1,560 lots between them and had capacity for 1,300 more. The
+    # price is where informed capital runs out, which is Experiment 1's finding
+    # -- but a market where informed capital is two agents is measuring the
+    # fixture rather than the mechanism.
+    #
+    # Log-spaced because that is how information is actually distributed: a few
+    # who know a great deal, more who know a little. Their limits are smaller
+    # than the two they replace, so no one of them can move the price alone.
     funds = [
         FundamentalTrader(
-            fund_ids[0], VENUE_ID, by_symbol, levels,
-            wake_interval=millis(600), precision=3.0, base_size=20,
-            max_position=900, open_interest=opening_auction,
-        ),
-        FundamentalTrader(
-            fund_ids[1], VENUE_ID, by_symbol, levels,
-            wake_interval=millis(1_100), precision=0.8, base_size=12,
-            max_position=600, open_interest=opening_auction,
-        ),
+            agent_id, VENUE_ID, by_symbol, levels,
+            wake_interval=millis(500 + 170 * n),
+            precision=0.6 * (1.45 ** n),
+            base_size=10 + 2 * n,
+            max_position=350 + 90 * n,
+            open_interest=opening_auction,
+            reveal_over=reveal,
+            prior_level=priors,
+        )
+        for n, agent_id in enumerate(fund_ids)
     ]
     noise = [
         NoiseTrader(a, VENUE_ID, by_symbol, wake_interval=millis(1_100))
@@ -553,7 +647,7 @@ def build(
     agents = [*makers_list, *funds, *noise, *flow]
     if opening_auction:
         # The market opens with a call rather than with whoever arrives first.
-        agents.append(SessionOperator(operator_id, venue))
+        agents.append(SessionOperator(operator_id, venue, venue_agent=venue_agent))
     if arbitrageur:
         # Off by default, on the evidence. It derives the right identities and
         # trades them, but measured across four paired seeds it improved spread

@@ -189,6 +189,40 @@ class BayesianFundamental(TradingAgent):
         self._value: dict[str, float] = {}
         self._dispersion: dict[str, float] = {}
 
+    def on_start(self, ctx: SimulationContext) -> None:
+        """Draw the evidence before the market opens, not when someone asks.
+
+        The posterior was drawn lazily, on first use. That is fine while an
+        agent always trades, and wrong the moment one does not: the draw then
+        happens whenever the harness reads the forecast instead, at a different
+        point in the agent's random stream. Two runs that differ only in the
+        venue -- which is exactly Experiment 2's control -- came back with
+        different *beliefs*, and the comparison stopped being a comparison.
+
+        Evidence is something an agent has, not something it produces on
+        demand.
+        """
+        super().on_start(ctx)
+        for symbol in sorted(self.instruments):
+            self.posterior(ctx, symbol)
+
+    def on_start(self, ctx: SimulationContext) -> None:
+        """Draw the evidence before the market opens, not when someone asks.
+
+        The posterior was drawn lazily, on first use. That is fine while an
+        agent always trades, and wrong the moment one does not: the draw then
+        happens whenever the harness reads the forecast instead, at a different
+        point in the agent's random stream. Two runs that differ only in the
+        venue -- which is exactly Experiment 2's control -- came back with
+        different *beliefs*, and the comparison stopped being a comparison.
+
+        Evidence is something an agent has, not something it produces on
+        demand.
+        """
+        super().on_start(ctx)
+        for symbol in sorted(self.instruments):
+            self.posterior(ctx, symbol)
+
     # -- belief ------------------------------------------------------------
 
     def posterior(self, ctx: SimulationContext, symbol: str) -> tuple[float, float] | None:

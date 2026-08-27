@@ -594,6 +594,7 @@ function orders(snapshot) {
       <td style="text-align:left">${esc(o.symbol)}</td>
       <td class="faint">#${o.order_id}</td>
       <td><button type="button" class="minor" data-act="cancel" data-order="${o.order_id}"
+              data-symbol="${esc(o.symbol)}"
             aria-label="Cancel order ${o.order_id} in ${esc(o.symbol)}">Cancel</button></td>
     </tr>`)
     .join('')}</tbody></table>`;

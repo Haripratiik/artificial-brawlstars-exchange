@@ -373,10 +373,9 @@ class SurfaceMarketMaker(MarketMaker):
         rule and the position-limit handling. What differs between them is only
         where the middle comes from.
         """
-        from arena.exchange.types import Price, Side, TimeInForce
+        from arena.exchange.types import Price, Side
 
         inventory = self.position.get(symbol, 0)
-        self.cancel_all(ctx, symbol)
 
         low, high = self.instruments[symbol].tick_bounds
         pressure = abs(inventory) / max(1, self.position_limit)
@@ -390,8 +389,12 @@ class SurfaceMarketMaker(MarketMaker):
         ask = Price(int(centre + half) + 1)
 
         if inventory < self.position_limit:
-            size = min(self.quote_size, self.position_limit - inventory)
-            self.quote(ctx, symbol, Side.BUY, bid, size, TimeInForce.GTC)
+            self.post(ctx, symbol, Side.BUY, bid,
+                       min(self.quote_size, self.position_limit - inventory))
+        else:
+            self.withdraw(ctx, symbol, Side.BUY)
         if -inventory < self.position_limit:
-            size = min(self.quote_size, self.position_limit + inventory)
-            self.quote(ctx, symbol, Side.SELL, ask, size, TimeInForce.GTC)
+            self.post(ctx, symbol, Side.SELL, ask,
+                       min(self.quote_size, self.position_limit + inventory))
+        else:
+            self.withdraw(ctx, symbol, Side.SELL)

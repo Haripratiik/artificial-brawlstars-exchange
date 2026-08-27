@@ -23,7 +23,7 @@ from arena.contracts.payoff import Linear
 from arena.contracts.spec import ContractSpec, DataPolicy, ObservationWindow
 from arena.contracts.underlying import Single
 from arena.exchange.engine import MatchingEngine
-from arena.exchange.events import Filled, Rejected, Submit, Traded
+from arena.exchange.events import Filled, Rejected, Submit, Traded, Cancel
 from arena.exchange.session import SessionState, indicative_auction
 from arena.exchange.types import (
     AgentId,
@@ -351,16 +351,61 @@ def test_a_halt_accumulates_orders_and_reopens_with_an_auction():
     assert venue.conservation_check() == 0
 
 
-def test_one_print_outside_the_band_is_a_limit_state_and_not_a_halt():
+def test_a_trade_cannot_print_outside_the_band():
+    """The half of the rule that protects anyone.
+
+    Limit up-limit down does not only pause a runaway after the fact: it
+    prevents trades outside its bands. Without that, a market order with no
+    price protection walks a thin book to the floor -- measured on the live
+    exchange, a resting bid at **0.25** was filled on a contract worth 4,700,
+    and the breaker then dutifully halted a symbol whose damage was done.
+    """
+    venue = _venue(price_band=0.02, min_reference_prints=1)
+    _send(venue, "c", S, 18_000, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    assert venue.engine("F").tape, "the reference print did not happen"
+
+    # Far outside the band, and a market order that would happily reach it.
+    _send(venue, "c", S, 30_000, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    assert all(int(t.price) < 30_000 for t in venue.engine("F").tape), (
+        "a trade printed beyond the band"
+    )
+
+
+def test_a_limit_order_names_its_price_and_keeps_it():
+    """The collar protects orders that named no price. That is all it does.
+
+    Collaring limit orders too was tried and was far worse than the disease.
+    They slid to the band's edge, the band later moved away from them, and the
+    book locked -- bid above offer, neither permitted to trade, and nothing in
+    continuous trading able to clear it. Measured on that version: 2,492 limit
+    states in five minutes and a future marking at 9,267 against a settlement
+    of 4,669.
+
+    A trader who says 30,000 has said 30,000.
+    """
+    venue = _venue(price_band=0.02, min_reference_prints=1)
+    _send(venue, "c", S, 18_000, 50)
+    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+
+    _send(venue, "d", B, 30_000, 10)
+    book = venue.engine("F").book.snapshot()
+    assert book.best_bid is not None and int(book.best_bid) == 30_000
+
+
+def test_a_quote_pressing_against_the_band_is_a_limit_state_and_not_a_halt():
     """Three states, and the middle one is what makes it the rule it models.
 
-    Limit up-limit down does not pause on a single print outside the band: the
-    symbol enters a limit state, and pauses only if it is still outside when
-    fifteen seconds have run. Halting on one print turns a fat finger into an
-    outage. The first version here halted immediately, which is the crude
-    version of the same idea.
+    A symbol is in a limit state when the best bid or offer is *at* a band --
+    interest that wants to be somewhere the venue will not let it go. One order
+    reaching the edge is one order, so it starts a clock; only staying there
+    stops the market. The clock has to advance for the pause to arrive, so this
+    drives it.
 
-    The clock has to advance for the pause to arrive, so this drives it.
+    Judged from the quote rather than from a print, and it has to be: prints
+    cannot leave the band any more, so a rule written in terms of them would
+    never fire at all.
     """
     clock = {"now": 0}
     venue = _venue(price_band=0.02, min_reference_prints=1)
@@ -368,64 +413,43 @@ def test_one_print_outside_the_band_is_a_limit_state_and_not_a_halt():
 
     _send(venue, "c", S, 18_000, 50)
     _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
-    assert venue.session("F") is SessionState.CONTINUOUS, "the first print sets the reference"
+    assert venue.session("F") is SessionState.CONTINUOUS
 
-    _send(venue, "c", S, 25_000, 50)
-    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
-    assert venue.session("F") is SessionState.CONTINUOUS, "one print is not a halt"
+    # A bid at the top of the band: allowed to rest, and pressing.
+    low, high = venue.registry.require("F").tick_bounds
+    edge = 18_000 + int(abs(int(high) - int(low)) * 0.02)
+    _send(venue, "d", B, edge, 10)
+    assert venue.session("F") is SessionState.CONTINUOUS, "one quote is not a halt"
     assert venue.halts[-1]["reason"] == "limit_state"
 
-    # Still outside once the limit state has run its course.
     clock["now"] = venue.limit_state_ns + 1
-    _send(venue, "c", S, 25_500, 50)
-    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    _send(venue, "d", B, edge, 10)
     assert venue.session("F") is SessionState.AUCTION
     assert venue.halts[-1]["reason"] == "price_band"
 
 
-def test_coming_back_inside_the_band_clears_the_limit_state():
-    """An excursion that corrects itself is not a halt, however far it went."""
+def test_a_quote_that_steps_back_clears_the_limit_state():
+    """Pressure that relieves itself is not a halt, however far it reached."""
     clock = {"now": 0}
     venue = _venue(price_band=0.02, min_reference_prints=1)
     venue.sim_clock = lambda: clock["now"]
 
     _send(venue, "c", S, 18_000, 50)
     _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
-    _send(venue, "c", S, 25_000, 50)
-    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    low, high = venue.registry.require("F").tick_bounds
+    edge = 18_000 + int(abs(int(high) - int(low)) * 0.02)
+
+    events = _send(venue, "d", B, edge, 10)
     assert venue.halts[-1]["reason"] == "limit_state"
+    order_id = next(e.order_id for e in events if hasattr(e, "order_id"))
 
     clock["now"] = venue.limit_state_ns // 2
-    _send(venue, "c", S, 18_100, 50)
-    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    venue.submit(AgentId("d"), "F", Cancel(AgentId("d"), order_id))
 
     clock["now"] = venue.limit_state_ns * 4
-    _send(venue, "c", S, 18_200, 50)
-    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
+    _send(venue, "e", B, 17_900, 5)
     assert venue.session("F") is SessionState.CONTINUOUS
     assert not [h for h in venue.halts if h["reason"] == "price_band"]
-
-
-def test_the_band_scales_with_what_a_contract_can_be_worth():
-    """A fraction of range, not of price.
-
-    A percentage of price gives a contract trading near zero a band of almost
-    nothing, which is why every event contract on the live exchange paused
-    repeatedly while the future -- whose 5% is sixteen standard deviations --
-    was never touched.
-    """
-    venue = _venue(price_band=0.02, min_reference_prints=1)
-    instrument = venue.registry.require("F")
-    low, high = instrument.tick_bounds
-    span = int(high) - int(low)
-
-    _send(venue, "c", S, 100, 50)
-    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
-    # A move of half the band away from a very low price: enormous in
-    # percentage terms, and correctly ignored.
-    _send(venue, "c", S, 100 + span // 100, 50)
-    _send(venue, "t", B, None, 50, tif=TimeInForce.IOC)
-    assert venue.halts == []
 
 
 def test_the_breaker_stays_quiet_inside_the_band():

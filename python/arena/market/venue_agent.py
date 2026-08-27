@@ -48,7 +48,7 @@ from arena.sim.messages import (
     TradePrint,
     Unsubscribe,
 )
-from arena.sim.time import Timestamp
+from arena.sim.time import Duration, Timestamp
 
 __all__ = ["VenueAgent"]
 
@@ -59,6 +59,9 @@ class _Subscription:
     symbol: str | None
     throttle: int
     last_sent: int = -1
+    # The symbol whose update is being held back, if any. One slot, because
+    # conflation keeps the *latest* state rather than a queue of stale ones.
+    held: str | None = None
 
     def covers(self, symbol: str) -> bool:
         return self.symbol is None or self.symbol == symbol
@@ -78,6 +81,7 @@ class VenueAgent:
         # Agents never read this -- they only see what reaches their mailbox.
         self.public_log: list[tuple[Timestamp, Any]] = []
         self.max_log = 5_000
+        self._wakeup_pending = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -88,7 +92,37 @@ class VenueAgent:
         pass
 
     def on_wakeup(self, ctx: SimulationContext) -> None:
-        """The venue does not act on its own schedule."""
+        """Flush conflated feeds whose quiet period has elapsed.
+
+        The only thing this agent does on its own schedule, and it has to: a
+        conflated subscriber that has an update held back is owed it, and if
+        the book never changes again nothing else will ever deliver it.
+        """
+        self._wakeup_pending = False
+        due = int(ctx.now)
+        soonest: int | None = None
+        for recipient in sorted(self._subscriptions):
+            for subscription in self._subscriptions[recipient]:
+                if subscription.held is None:
+                    continue
+                ready = subscription.last_sent + subscription.throttle
+                if ready <= due:
+                    self._send_snapshot(
+                        ctx, recipient, subscription.feed, subscription.held
+                    )
+                    subscription.last_sent = due
+                    subscription.held = None
+                elif soonest is None or ready < soonest:
+                    soonest = ready
+        if soonest is not None:
+            self._schedule_flush(ctx, soonest - due)
+
+    def _schedule_flush(self, ctx: SimulationContext, delay: int) -> None:
+        """One outstanding wakeup at a time, however many feeds are waiting."""
+        if self._wakeup_pending:
+            return
+        self._wakeup_pending = True
+        ctx.request_wakeup(Duration(max(1, int(delay))))
 
     # -- mailbox -----------------------------------------------------------
 
@@ -142,7 +176,22 @@ class VenueAgent:
             return
 
         events = self.venue.submit(sender, symbol, command)
+        self.dispatch(ctx, symbol, events)
 
+    def uncross(self, ctx: SimulationContext, symbol: str) -> Any:
+        """Clear a call phase and tell the participants what happened to them.
+
+        Routed through here rather than called on the venue directly, because
+        this is the thing that owns the mailbox. An auction that books fills
+        into the ledger without delivering them leaves every filled agent
+        trading on a position it does not know it has.
+        """
+        result, events = self.venue.uncross_events(symbol)
+        self.dispatch(ctx, symbol, events)
+        return result
+
+    def dispatch(self, ctx: SimulationContext, symbol: str, events: list[Event]) -> None:
+        """Deliver private events to their owners, then publish the public ones."""
         for event in events:
             owner = _owner(event)
             if owner is not None:
@@ -213,9 +262,25 @@ class VenueAgent:
                 if subscription.feed is not feed or not subscription.covers(symbol):
                     continue
                 if subscription.throttle > 0:
-                    if int(ctx.now) - subscription.last_sent < subscription.throttle:
-                        continue
+                    elapsed = int(ctx.now) - subscription.last_sent
+                    if elapsed < subscription.throttle:
+                        # Held, not dropped. A conflated feed sends the latest
+                        # state at the next allowed moment; it does not decide
+                        # the subscriber did not need to know.
+                        #
+                        # Dropping was the first version and it deadlocked the
+                        # market. A maker that has not moved its quote sends no
+                        # order, so nothing publishes; if the one update that
+                        # announced the book was thrown away, every agent
+                        # waiting for a price waited forever. Measured: an
+                        # experiment trial went from 2,039 trades to **zero**.
+                        subscription.held = symbol
+                        self._schedule_flush(
+                            ctx, subscription.throttle - elapsed
+                        )
+                        break
                 subscription.last_sent = int(ctx.now)
+                subscription.held = None
                 ctx.send(recipient, message)
                 break
 

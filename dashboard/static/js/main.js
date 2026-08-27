@@ -546,7 +546,11 @@ function submitOrder() {
 }
 
 async function act(action, data) {
-  if (action === 'cancel') return send({ action: 'cancel', order_id: Number(data.order) });
+  // The symbol travels with the id, because an id is only unique inside its
+  // own book: order 5 exists on every contract at once.
+  if (action === 'cancel') {
+    return send({ action: 'cancel', order_id: Number(data.order), symbol: data.symbol });
+  }
   if (action === 'cancel_all') return send({ action: 'cancel_all' });
   if (action === 'flatten') {
     // Destructive and irreversible: it sells every position at market, and

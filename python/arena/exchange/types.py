@@ -146,3 +146,9 @@ class RejectReason(Enum):
     # order reaches a book, because an exchange cannot unprint a trade it
     # should not have allowed.
     INSUFFICIENT_COLLATERAL = "insufficient_collateral"
+    # Priced beyond where a trade may print. The rule this models prevents
+    # executions outside its bands rather than only pausing after one, and a
+    # limit order left resting outside them would lock the book against itself:
+    # a bid above the band and an ask below it, neither allowed to trade,
+    # crossed and stuck until something halted.
+    OUTSIDE_PRICE_BAND = "outside_price_band"

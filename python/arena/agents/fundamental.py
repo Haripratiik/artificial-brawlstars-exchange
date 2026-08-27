@@ -69,6 +69,8 @@ class FundamentalTrader(TradingAgent):
         base_size: int = 8,
         patience: float = 0.5,
         open_interest: bool = False,
+        reveal_over: Duration | None = None,
+        prior_level: dict[str, float] | None = None,
     ) -> None:
         super().__init__(agent_id, venue_id, instruments, wake_interval)
         self.truth_level = truth_level
@@ -82,6 +84,38 @@ class FundamentalTrader(TradingAgent):
         self._noise_scale: dict[str, float] = {}
         # One view per underlying, shared by every contract written on it.
         self._views: dict[str, tuple[float, list[float]]] = {}
+        # Over what span this agent's evidence arrives. ``None`` means all of
+        # it at once, which is what every published experiment here was run
+        # with and therefore stays the default.
+        #
+        # The difference is not a detail of pacing. With everything known at
+        # t=0 the market has an information *stock*: the price converges in
+        # seconds and then nothing can move it, because there is nothing left
+        # to arrive. Measured, the realised dispersion of `SPIKE_WR_FUT` over a
+        # ten-minute session was 14.6 on a price near 4,670 -- so options
+        # carried almost no time value, binaries were foregone conclusions
+        # within a minute, and a market whose whole subject is disagreement had
+        # nothing to disagree about. A flow of evidence is what makes the
+        # underlying diffuse.
+        self.reveal_over = reveal_over
+        # What the metric did over the period *before* the contract's window,
+        # per symbol. This is where an agent's belief starts.
+        #
+        # Starting from the truth and adding noise -- which is what this did --
+        # makes every agent unbiased from the first instant, so the market opens
+        # at the answer with a wide spread and merely tightens. Real markets
+        # open at what history said and then discover that history was wrong,
+        # which on this fixture is a real event: SPIKE ran at 0.4839 for the
+        # twelve weeks before the window and settles at 0.4669. An agent that
+        # begins at 0.4839 and is pulled toward 0.4669 by evidence is doing what
+        # an analyst does; one that begins at 0.4669 has nothing to learn.
+        #
+        # It is lookahead-free by construction: the prior window ends where the
+        # contract's window begins, so it is data that exists on the day the
+        # contract is published.
+        self.prior_level = prior_level or {}
+        # Accumulated Brownian information per underlying: (w, tau, normals).
+        self._learning: dict[str, tuple[float, float, list[float]]] = {}
         # Whether to post interest into a book that has no price yet.
         self.open_interest = open_interest
 
@@ -92,12 +126,72 @@ class FundamentalTrader(TradingAgent):
         same thing is valued from the same numbers.
         """
         key = underlying_key(instrument)
-        cached = self._views.get(key)
-        if cached is None:
-            centre = level + ctx.rng.gauss(0.0, sigma)
-            cached = (centre, [centre + ctx.rng.gauss(0.0, sigma) for _ in range(self.draws)])
-            self._views[key] = cached
-        return cached
+        if self.reveal_over is None:
+            cached = self._views.get(key)
+            if cached is None:
+                centre = level + ctx.rng.gauss(0.0, sigma)
+                cached = (
+                    centre,
+                    [centre + ctx.rng.gauss(0.0, sigma) for _ in range(self.draws)],
+                )
+                self._views[key] = cached
+            return cached
+        # Falls back to the truth when no prior is supplied, which keeps the
+        # agent usable in a world that has no history to look back at.
+        prior = self.prior_level.get(instrument.symbol, level)
+        return self._learned(ctx, key, level, sigma, prior)
+
+    def _learned(self, ctx, key: str, level: float, sigma: float, prior: float):
+        """A belief that starts at the prior and is pulled toward the truth.
+
+        Ordinary Gaussian updating, written in precision because that is the
+        unit evidence actually arrives in. With a prior ``N(mu, 1/t0)`` and
+        evidence of accumulated precision ``te`` centred on the truth, the
+        posterior mean is
+
+            m = (t0 * mu + te * truth + W(te)) / (t0 + te)
+
+        for a standard Brownian motion ``W`` in accumulated precision, and the
+        posterior variance is exactly ``1 / (t0 + te)``. At ``te = 0`` that is
+        the prior, unchanged and unperturbed; as evidence accumulates it slides
+        to the truth.
+
+        The Brownian term is what makes it a *martingale*: the agent's view at
+        any moment is its own best guess at its later view, so it never drifts
+        predictably and cannot be anticipated by anything except better
+        information. Redrawing the whole view each wakeup would have been far
+        simpler and would have produced a noise trader wearing a posterior --
+        its opinion would average away and exert no directional pull on price.
+        The increments are independent; the *belief* accumulates.
+        """
+        prior_precision = 1.0 / max(1e-12, self.metric_sigma * self.metric_sigma)
+        evidence_precision = 1.0 / max(1e-12, sigma * sigma)
+        fraction = min(1.0, max(0.0, int(ctx.now) / max(1, int(self.reveal_over))))
+        target = evidence_precision * fraction
+
+        walk, seen, normals = self._learning.get(key, (0.0, 0.0, []))
+        if not normals:
+            normals = [ctx.rng.gauss(0.0, 1.0) for _ in range(self.draws)]
+        if target > seen:
+            walk += ctx.rng.gauss(0.0, (target - seen) ** 0.5)
+            seen = target
+        self._learning[key] = (walk, seen, normals)
+
+        total = prior_precision + seen
+        centre = (prior_precision * prior + seen * level + walk) / total
+        spread = (1.0 / total) ** 0.5
+        return centre, [centre + z * spread for z in normals]
+
+    def dispersion_for(self, ctx, instrument) -> float:
+        """This agent's current uncertainty about one underlying, in metric units."""
+        sigma = self.metric_sigma / self.precision
+        if self.reveal_over is None:
+            return sigma
+        _walk, seen, _normals = self._learning.get(
+            underlying_key(instrument), (0.0, 0.0, [])
+        )
+        prior_precision = 1.0 / max(1e-12, self.metric_sigma * self.metric_sigma)
+        return (1.0 / (prior_precision + seen)) ** 0.5
 
     def _view(self, ctx: SimulationContext, symbol: str) -> tuple[float, float]:
         """This agent's estimate of settlement, and its own uncertainty.
@@ -124,6 +218,13 @@ class FundamentalTrader(TradingAgent):
         an agent with a different view of SPIKE for every contract written on
         SPIKE does not have a view of SPIKE.
         """
+        if self.reveal_over is not None:
+            # The estimate is a function of evidence that is still arriving, so
+            # the cached value is only good for as long as nothing has arrived.
+            # Leaving it in place was the first version and made the whole
+            # mechanism inert: the agent learned continuously and quoted its
+            # first opinion forever.
+            self._estimate.pop(symbol, None)
         if symbol not in self._estimate:
             instrument = self.instruments[symbol]
             level = self.truth_level.get(symbol)
@@ -210,11 +311,14 @@ class FundamentalTrader(TradingAgent):
             return
         inventory = self.position.get(symbol, 0)
         size = max(1, self.base_size // 2)
-        self.cancel_all(ctx, symbol)
         if inventory < self.max_position:
-            self.quote(ctx, symbol, Side.BUY, bid, size, TimeInForce.GTC)
+            self.post(ctx, symbol, Side.BUY, bid, size)
+        else:
+            self.withdraw(ctx, symbol, Side.BUY)
         if -inventory < self.max_position:
-            self.quote(ctx, symbol, Side.SELL, ask, size, TimeInForce.GTC)
+            self.post(ctx, symbol, Side.SELL, ask, size)
+        else:
+            self.withdraw(ctx, symbol, Side.SELL)
 
     def _trade(self, ctx: SimulationContext, symbol: str) -> None:
         book = self.books[symbol]
@@ -247,17 +351,20 @@ class FundamentalTrader(TradingAgent):
         headroom = self.max_position - abs(inventory)
         size = max(1, min(size, headroom))
 
-        self.cancel_all(ctx, symbol)
+        # Whatever it does next, it is no longer interested in the other side.
+        self.withdraw(ctx, symbol, side.opposite)
 
         # Cross when the touch is already inside the estimate; otherwise post at
         # the touch and wait. Always crossing would pay the spread away on every
         # trade and turn a correct view into a losing strategy.
         if side is Side.BUY and book.ask is not None and int(book.ask) < estimate:
+            self.withdraw(ctx, symbol, side)
             self.take(ctx, symbol, side, size)
         elif side is Side.SELL and book.bid is not None and int(book.bid) > estimate:
+            self.withdraw(ctx, symbol, side)
             self.take(ctx, symbol, side, size)
         else:
             anchor = book.bid if side is Side.BUY else book.ask
             if anchor is None:
                 return
-            self.quote(ctx, symbol, side, Price(int(anchor)), size, TimeInForce.GTC)
+            self.post(ctx, symbol, side, Price(int(anchor)), size)

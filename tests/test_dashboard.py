@@ -116,11 +116,26 @@ def test_the_agent_roster_is_published(client):
 
 
 def test_the_book_endpoint_returns_a_two_sided_ladder(client):
-    book = client.get(f"/api/book/{SYMBOL}?levels=12").json()
+    # Polled rather than sampled once. The market this serves has an opening
+    # call and a circuit breaker, so there are real moments when a book has one
+    # side or none -- and a test that happens to land on one of them is
+    # reporting the clock rather than the endpoint.
+    for _ in range(40):
+        book = client.get(f"/api/book/{SYMBOL}?levels=12").json()
+        if book["bids"] and book["asks"]:
+            break
+        time.sleep(0.05)
     assert book["bids"] and book["asks"]
-    best_bid = float(book["bids"][0][0])
-    best_ask = float(book["asks"][0][0])
-    assert best_bid < best_ask, "the published ladder is crossed"
+    assert book["session"], "a ladder without its phase cannot be read"
+    if book["session"] == "continuous":
+        best_bid = float(book["bids"][0][0])
+        best_ask = float(book["asks"][0][0])
+        assert best_bid < best_ask, "the published ladder is crossed"
+    else:
+        # A call phase accumulates orders without matching them, so a crossed
+        # ladder is the mechanism rather than a fault -- and the indicative
+        # price is what a reader should be looking at instead.
+        assert "indicative" in book
 
 
 def test_the_book_endpoint_bounds_the_level_count(client):

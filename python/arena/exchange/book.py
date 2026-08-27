@@ -133,6 +133,21 @@ class BookSnapshot:
         return _first_priced(self.asks)
 
     @property
+    def priced_bids(self) -> tuple[tuple[Price, Quantity], ...]:
+        """Bids that name a price, for anything a person will look at.
+
+        The raw levels keep market-on-open interest at its sentinel price
+        because the auction has to count it. A ladder on a screen must not
+        show it: the API published a bid of 4,611,686,018,427,387,904 and the
+        page dutifully rendered it.
+        """
+        return tuple((p, q) for p, q in self.bids if abs(int(p)) < _SENTINEL)
+
+    @property
+    def priced_asks(self) -> tuple[tuple[Price, Quantity], ...]:
+        return tuple((p, q) for p, q in self.asks if abs(int(p)) < _SENTINEL)
+
+    @property
     def spread(self) -> int | None:
         if self.best_bid is None or self.best_ask is None:
             return None

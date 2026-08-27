@@ -235,12 +235,12 @@ class FlowTrader(TradingAgent):
 
     def _churn(self, ctx: SimulationContext) -> None:
         """Pull most of what is resting. This is what a real book mostly does."""
-        for order_id, order_symbol in list(self.live_orders.items()):
+        for key, order_symbol in list(self.live_orders.items()):
             if ctx.rng.random() >= self.cancel_rate:
                 continue
             ctx.send(
                 self.venue_id,
-                SymbolCommand(order_symbol, Cancel(self.agent_id, OrderId(order_id))),
+                SymbolCommand(order_symbol, Cancel(self.agent_id, OrderId(key[1]))),
             )
-            self.live_orders.pop(order_id, None)
+            self.live_orders.pop(key, None)
             self.cancelled += 1

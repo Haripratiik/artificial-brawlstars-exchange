@@ -17,7 +17,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from arena.sim.time import seconds
+from arena.sim.time import Timestamp, millis, seconds
 
 from dashboard.identity import COOKIE, display_name, sign, verify
 import dashboard.server as server
@@ -55,6 +55,30 @@ def test_a_name_is_trimmed_capped_and_stripped():
     assert " " in display_name(None), "a generated name should read as a name"
 
 
+def _open_book(market, symbol: str = "SPIKE_WR_FUT", until: int = 240):
+    """Advance until ``symbol`` is trading two-sided, and return its touch.
+
+    A market with a circuit breaker spends part of its session halted, and the
+    opening minutes are when it happens most. A test that acts at a fixed
+    moment is testing what the breaker happened to be doing rather than what it
+    set out to.
+    """
+    from arena.exchange.session import SessionState
+
+    moment = int(market.kernel.now // 1_000_000_000) + 5
+    while moment <= until:
+        market.kernel.advance(until=seconds(moment))
+        book = market.venue.engine(symbol).book.snapshot()
+        if (
+            market.venue.session(symbol) is SessionState.CONTINUOUS
+            and book.best_bid is not None
+            and book.best_ask is not None
+        ):
+            return book
+        moment += 5
+    raise AssertionError(f"{symbol} never traded two-sided by t={until}")
+
+
 # --------------------------------------------------------------------------
 # The exchange
 # --------------------------------------------------------------------------
@@ -66,7 +90,7 @@ def test_two_people_get_two_accounts():
 
     market = build(seed=7)
     market.kernel.start()
-    market.kernel.advance(until=seconds(30))
+    market.kernel.advance(until=seconds(45))
 
     ada = market.seat("Ada")
     grace = market.seat("Grace")
@@ -111,14 +135,43 @@ def test_one_person_cannot_cancel_another_persons_order():
 
     market = build(seed=7)
     market.kernel.start()
-    market.kernel.advance(until=seconds(30))
+    market.kernel.advance(until=seconds(180))
+    book = _open_book(market, until=300)
 
     ada = market.seat("Ada")
     grace = market.seat("Grace")
-    market.submit("SPIKE_WR_FUT", "buy", 5, "4000.00", trader=ada)
-    market.kernel.advance(until=seconds(40))
-
-    working = list(market.traders[ada].live_orders)
+    # Just behind the touch, and checked a fraction of a second later.
+    #
+    # Two earlier versions were defeated by the market itself. A bid at 1,000
+    # was *filled*, because with evidence arriving over the session the price
+    # swings far enough that a price nobody should hit gets hit; a bid at 0.25
+    # was then refused outright once trades outside the band were prevented.
+    # An order behind the touch, inspected before anyone has had time to lift
+    # it, is a working order for the reason a working order is usually one.
+    # Placed until one of them survives long enough to be looked at.
+    #
+    # Three earlier versions were defeated by the market rather than by the
+    # code. A bid at 1,000 was *filled*, because with evidence arriving over
+    # the session the price swings far enough that a price nobody should hit
+    # gets hit. A bid at 0.25 was then refused outright once unpriced orders
+    # were collared. A bid just behind the touch was lifted seventy
+    # milliseconds after it was acknowledged, because the book is about sixty
+    # lots a side and something is always sweeping it. A working order is a
+    # thing markets keep taking away; the test asks again.
+    instrument = market.venue.registry.require("SPIKE_WR_FUT")
+    working: list = []
+    for attempt in range(12):
+        book = _open_book(market, until=600)
+        resting = float(instrument.from_ticks(book.best_bid)) - (
+            float(instrument.tick_size) * (1 + attempt * 4)
+        )
+        market.submit("SPIKE_WR_FUT", "buy", 5, f"{resting:.2f}", trader=ada)
+        market.kernel.advance(
+            until=Timestamp(int(market.kernel.now) + int(millis(120)))
+        )
+        working = list(market.traders[ada].live_orders)
+        if working:
+            break
     assert working, "Ada has no working order; the test proves nothing"
     result = market.cancel(working[0], trader=grace)
     assert result["ok"] is False

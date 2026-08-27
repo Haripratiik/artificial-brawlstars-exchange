@@ -243,8 +243,12 @@ async def api_book(symbol: str, levels: int = 20) -> JSONResponse:
     return JSONResponse(
         {
             "symbol": symbol,
-            "bids": [[str(instrument.from_ticks(p)), int(q)] for p, q in snapshot.bids],
-            "asks": [[str(instrument.from_ticks(p)), int(q)] for p, q in snapshot.asks],
+            "bids": [
+                [str(instrument.from_ticks(p)), int(q)] for p, q in snapshot.priced_bids
+            ],
+            "asks": [
+                [str(instrument.from_ticks(p)), int(q)] for p, q in snapshot.priced_asks
+            ],
             "indicative": runner.indicative(symbol),
             "session": venue.session(symbol).value,
         }
@@ -330,7 +334,11 @@ async def _receive(socket: WebSocket, seat: AgentId | None = None) -> None:
                     trader=seat,
                 )
             elif action == "cancel":
-                result = runner.market.cancel(int(message["order_id"]), trader=seat)
+                result = runner.market.cancel(
+                    int(message["order_id"]),
+                    trader=seat,
+                    symbol=message.get("symbol"),
+                )
             elif action == "flatten":
                 result = runner.market.flatten(trader=seat)
             elif action == "cancel_all":

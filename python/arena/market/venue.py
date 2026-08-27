@@ -318,7 +318,12 @@ class Venue:
         instrument = self.registry.require(symbol)
         tick = instrument.tick_in_minor
         book = self._engines[symbol].book.snapshot()
-        if book.best_bid is not None and book.best_ask is not None:
+        crossed = (
+            book.best_bid is not None
+            and book.best_ask is not None
+            and int(book.best_bid) > int(book.best_ask)
+        )
+        if not crossed and book.best_bid is not None and book.best_ask is not None:
             # Averaged in minor units rather than in ticks, so a one-tick spread
             # marks at the true midpoint instead of being floored to the bid.
             return Money((int(book.best_bid) * tick + int(book.best_ask) * tick) // 2)
@@ -329,10 +334,16 @@ class Venue:
         else:
             low, high = self.bounds_in_minor(instrument)
             reference = (int(low) + int(high)) // 2
-        if book.best_bid is not None:
-            reference = max(reference, int(book.best_bid) * tick)
-        if book.best_ask is not None:
-            reference = min(reference, int(book.best_ask) * tick)
+        # Not clamped into a crossed touch. A book in a call phase is crossed
+        # on purpose -- orders accumulate without matching -- so "inside the
+        # touch" is an empty interval, and forcing a number into it produced a
+        # mark *below* the standing bid, which is the opposite of what the
+        # clamp exists to prevent.
+        if not crossed:
+            if book.best_bid is not None:
+                reference = max(reference, int(book.best_bid) * tick)
+            if book.best_ask is not None:
+                reference = min(reference, int(book.best_ask) * tick)
         return Money(reference)
 
     def bounds_in_minor(self, instrument: Instrument) -> tuple[Money, Money]:
@@ -398,7 +409,9 @@ class Venue:
                 )
             ]
 
+        self._apply_band(symbol)
         events = self._engines[symbol].apply(command)
+        self._check_limit_state(symbol)
         self._book_fills(symbol, instrument, events)
         self._track_working(agent_id, symbol, events)
         return events
@@ -660,7 +673,20 @@ class Venue:
         )
 
     def uncross(self, symbol: str) -> AuctionResult | None:
-        """Clear the call phase and return to continuous trading.
+        """Clear the call phase and return to continuous trading."""
+        result, _events = self.uncross_events(symbol)
+        return result
+
+    def uncross_events(self, symbol: str) -> tuple[AuctionResult | None, list[Event]]:
+        """The same, and the events it produced, so they can be delivered.
+
+        An auction fills real orders belonging to real participants, and until
+        this existed nobody told them. The ledger moved, the agents did not
+        hear, and every one of them then traded on a position it did not have:
+        measured after two minutes, **342 of 483** (agent, symbol) pairs had an
+        agent's own belief about its position disagreeing with the venue's
+        record. A market maker skewing its quotes off an inventory that is not
+        its inventory is not managing risk, it is guessing.
 
         The fills go through exactly the same account path as continuous ones,
         so collateral, fees and conservation cannot diverge between the two --
@@ -672,13 +698,23 @@ class Venue:
         result = indicative_auction(engine.book, self._reference.get(symbol))
         events = engine.uncross(self._reference.get(symbol))
         self._book_fills(symbol, instrument, events, auction=True)
+        # Grouped by owner, because an auction's events belong to everyone who
+        # was in it. Skipping this left collateral reserved against orders the
+        # uncross had already filled or cancelled.
+        by_owner: dict[AgentId, list[Event]] = {}
+        for event in events:
+            owner = getattr(event, "agent_id", None)
+            if owner is not None:
+                by_owner.setdefault(owner, []).append(event)
+        for owner, owned in by_owner.items():
+            self._track_working(owner, symbol, owned)
         if result is not None and result.volume > 0:
             self._reference[symbol] = result.price
             self._recent.setdefault(symbol, deque()).append((self._now(), result.price))
         self._reopen_at.pop(symbol, None)
         self._limit_since.pop(symbol, None)
         self._set_phase(symbol, SessionState.CONTINUOUS)
-        return result
+        return result, events
 
     def halt(self, symbol: str, reason: str = "manual") -> None:
         """Suspend trading. Orders keep arriving; the reopen is an auction.
@@ -711,35 +747,111 @@ class Venue:
         auction price, so it is a price size actually transacted at.
         """
         window = self._recent.get(symbol)
-        if not window:
-            return self._reference.get(symbol)
         cutoff = self._now() - self.reference_window_ns
         while window and window[0][0] < cutoff:
             window.popleft()
-        if not window:
-            return self._reference.get(symbol)
-        return Price(sum(int(price) for _t, price in window) // len(window))
+        if window:
+            return Price(sum(int(price) for _t, price in window) // len(window))
+        return self._quoted_reference(symbol)
+
+    def _quoted_reference(self, symbol: str) -> Price | None:
+        """Where the market is, when nothing has traded recently.
+
+        The mid, and only then the last cleared price. Falling straight back to
+        the stored one was the obvious thing and it strands the band: a symbol
+        that goes quiet keeps a reference from whenever it last printed, the
+        market walks away from it, and every unpriced order is then collared
+        against a price that no longer exists. Measured, the band on
+        `SPIKE_WR_FUT` sat at 6,392 while the book was quoting 4,760 -- a third
+        of the way across the contract's range -- and no market order could
+        trade at all.
+
+        A quote is weaker evidence than a trade, which is why it is the
+        fallback rather than the rule. It is much better evidence than a price
+        from a minute ago.
+        """
+        book = self._engines[symbol].book.snapshot()
+        if book.best_bid is not None and book.best_ask is not None:
+            if int(book.best_bid) <= int(book.best_ask):
+                return Price((int(book.best_bid) + int(book.best_ask)) // 2)
+        return self._reference.get(symbol)
 
     def _check_price_band(self, symbol: str, price: Price) -> None:
-        """Track the reference, and pause if price stays outside the band.
+        """Record a print in the reference window. Nothing else.
 
-        Three states rather than two, which is the whole point of modelling
-        this properly: inside the band, in a *limit state* outside it, and
-        paused. A print outside the band starts a clock; another print outside
-        it once that clock has run enters an auction. One bad order is not an
-        outage.
+        Prints cannot leave the band any more -- the engine refuses to match
+        outside it -- so a print is no longer evidence of anything except where
+        the market is. The limit state is judged from the *quote* instead, in
+        :meth:`_check_limit_state`, which is what the rule actually says: a
+        symbol is in a limit state when the best bid or offer is *at* a band,
+        not when a trade has already happened beyond it.
         """
-        now = self._now()
         window = self._recent.setdefault(symbol, deque())
-        if self.price_band is None:
-            window.append((now, price))
-            self._reference.setdefault(symbol, price)
+        window.append((self._now(), price))
+        self._reference.setdefault(symbol, price)
+
+    def _check_price_band(self, symbol: str, price: Price) -> None:
+        """Record a print in the reference window. Nothing else.
+
+        Prints cannot leave the band any more -- the engine refuses to match
+        outside it -- so a print is no longer evidence of anything except where
+        the market is. The limit state is judged from the *quote* instead, in
+        :meth:`_check_limit_state`, which is what the rule actually says: a
+        symbol is in a limit state when the best bid or offer is *at* a band,
+        not when a trade has already happened beyond it.
+        """
+        window = self._recent.setdefault(symbol, deque())
+        window.append((self._now(), price))
+        self._reference.setdefault(symbol, price)
+
+    def _check_limit_state(self, symbol: str) -> None:
+        """Enter a limit state while the quote presses against a band, and pause
+        if it stays there.
+
+        Three states rather than two, which is the whole point of modelling this
+        properly: quoting inside the band, pressing against it, and paused. One
+        order that reaches the edge is not an outage -- it is one order -- so
+        reaching it starts a clock and only staying there stops the market.
+        """
+        if self.price_band is None or self.session(symbol) is not SessionState.CONTINUOUS:
+            return
+        now = self._now()
+
+        # A locked book is a limit state by definition, whatever the reference
+        # says. Bid above offer while trading means interest that wants to
+        # cross and is not allowed to -- which happens when an order slid to a
+        # band edge and the band later moved away from it. Nothing in
+        # continuous trading can clear that; an auction can, and clearing it at
+        # one price is exactly what an auction is for.
+        book = self._engines[symbol].book.snapshot()
+        if (
+            book.best_bid is not None
+            and book.best_ask is not None
+            and int(book.best_bid) > int(book.best_ask)
+        ):
+            since = self._limit_since.get(symbol)
+            if since is None:
+                self._limit_since[symbol] = now
+                self.halts.append(
+                    {"symbol": symbol, "reason": "limit_state", "locked": True}
+                )
+                return
+            if now - since < self.limit_state_ns:
+                return
+            self._limit_since.pop(symbol, None)
+            self._reopen_at[symbol] = now + self.pause_ns
+            self.halts.append(
+                {"symbol": symbol, "reason": "price_band", "locked": True}
+            )
+            self._set_phase(symbol, SessionState.AUCTION)
             return
 
+        window = self._recent.get(symbol)
         reference = self._reference_price(symbol)
-        if reference is None or len(window) < self.min_reference_prints:
-            self._reference.setdefault(symbol, price)
-            window.append((now, price))
+        if reference is None or not window or len(window) < self.min_reference_prints:
+            # Pausing a market is disruptive, so it waits for a reference
+            # several prints deep. Banding an execution is protective and does
+            # not: the worst it does is leave an order unfilled.
             return
 
         # A fraction of what the contract can be *worth*, not of what it costs.
@@ -756,14 +868,18 @@ class Venue:
         # flip.
         low, high = self.registry.require(symbol).tick_bounds
         allowed = abs(int(high) - int(low)) * self.price_band
-        outside = abs(int(price) - int(reference)) > allowed
-        if not outside:
-            # Back inside: the clock resets, and the print counts toward the
-            # reference. Prints from outside the band deliberately do not --
-            # letting a runaway drag its own reference along is how a breaker
-            # ends up chasing the move it exists to stop.
+        book = self._engines[symbol].book.snapshot()
+        # Pressing against a band means there is interest that cannot trade: a
+        # bid at or above the top of the band, or an offer at or below the
+        # bottom of it. Either is the market saying it wants to be somewhere
+        # the venue will not let it go.
+        price = None
+        if book.best_bid is not None and int(book.best_bid) - int(reference) >= allowed:
+            price = book.best_bid
+        elif book.best_ask is not None and int(reference) - int(book.best_ask) >= allowed:
+            price = book.best_ask
+        if price is None:
             self._limit_since.pop(symbol, None)
-            window.append((now, price))
             return
 
         since = self._limit_since.get(symbol)
@@ -794,6 +910,37 @@ class Venue:
             }
         )
         self._set_phase(symbol, SessionState.AUCTION)
+
+    def _apply_band(self, symbol: str) -> None:
+        """Tell the engine where trades may print, before it matches anything.
+
+        Recomputed per command because the reference is a trailing mean and
+        moves with the tape. Cheap: it is two integers and a lookup.
+
+        Applied as soon as there is any reference at all, which is a lower bar
+        than the one for *halting*, and deliberately. Banding an execution is
+        protective: the worst it does is leave an order unfilled. Halting is
+        disruptive, so it waits for a reference several prints deep. Holding
+        both to the strict bar meant a market order could still walk a thin
+        book to the floor for as long as the tape was quiet -- which is exactly
+        when a thin book is walkable.
+        """
+        engine = self._engines.get(symbol)
+        if engine is None:
+            return
+        if self.price_band is None:
+            engine.execution_band = None
+            return
+        reference = self._reference_price(symbol)
+        if reference is None:
+            engine.execution_band = None
+            return
+        low, high = self.registry.require(symbol).tick_bounds
+        allowed = abs(int(high) - int(low)) * self.price_band
+        engine.execution_band = (
+            int(max(int(low), int(reference) - allowed)),
+            int(min(int(high), int(reference) + allowed)),
+        )
 
     def reopen_due(self) -> tuple[str, ...]:
         """Symbols whose pause has run its course, in canonical order.

@@ -277,10 +277,25 @@ class LiveMarket:
         who.enqueue(SymbolCommand(symbol, command))
         return {"ok": True}
 
-    def cancel(self, order_id: int, trader: AgentId | None = None) -> dict[str, Any]:
+    def cancel(
+        self, order_id: int, trader: AgentId | None = None, symbol: str | None = None
+    ) -> dict[str, Any]:
+        """Pull one working order.
+
+        The symbol is part of the address, not decoration. Order ids come from
+        the matching engine and there is one per book, so id 5 exists on every
+        contract at once -- cancelling by id alone means cancelling whichever
+        of them happened to be found first. The client sends both because the
+        blotter it is reading already shows both; without one, the lookup falls
+        back to a search and refuses if it is ambiguous.
+        """
         who = self.trader(trader)
-        symbol = who.live_orders.get(order_id)
         if symbol is None:
+            matches = [key for key in who.live_orders if key[1] == order_id]
+            if len(matches) != 1:
+                return {"ok": False, "error": "no such live order"}
+            symbol = matches[0][0]
+        if (symbol, order_id) not in who.live_orders:
             # Someone else's order, or none. Reported the same way either way:
             # confirming that an id exists but belongs to another account tells
             # a stranger something about that account.
@@ -291,7 +306,7 @@ class LiveMarket:
     def cancel_all(self, trader: AgentId | None = None) -> dict[str, Any]:
         """Pull every working order. Distinct from flatten, which closes risk."""
         who = self.trader(trader)
-        for order_id, symbol in list(who.live_orders.items()):
+        for (symbol, order_id), _ in list(who.live_orders.items()):
             who.enqueue(SymbolCommand(symbol, Cancel(who.agent_id, order_id)))
         return {"ok": True}
 
@@ -338,8 +353,16 @@ class LiveMarket:
             instrument = self.venue.registry.require(symbol)
             snap = self.venue.engine(symbol).book.snapshot(8)
             books[symbol] = {
-                "bids": [[str(instrument.from_ticks(p)), int(q)] for p, q in snap.bids],
-                "asks": [[str(instrument.from_ticks(p)), int(q)] for p, q in snap.asks],
+                # Priced levels only. Market-on-open interest rests at a
+                # sentinel so it crosses every candidate the auction weighs;
+                # putting it on a screen published a bid of
+                # 4,611,686,018,427,387,904 and a spread to match.
+                "bids": [
+                    [str(instrument.from_ticks(p)), int(q)] for p, q in snap.priced_bids
+                ],
+                "asks": [
+                    [str(instrument.from_ticks(p)), int(q)] for p, q in snap.priced_asks
+                ],
                 "mark": str(from_money(marks[symbol])),
                 # A crossed book has no spread, and during a call phase it is
                 # *meant* to be crossed: orders accumulate without matching
@@ -426,7 +449,7 @@ class LiveMarket:
             },
             "orders": [
                 {"order_id": oid, "symbol": sym}
-                for oid, sym in sorted(who.live_orders.items())
+                for (sym, oid), _ in sorted(who.live_orders.items())
             ],
             "log": who.log[-12:][::-1],
             "you": {"id": str(who.agent_id), "name": who.display_name},

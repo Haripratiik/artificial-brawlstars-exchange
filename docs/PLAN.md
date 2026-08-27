@@ -258,8 +258,19 @@ a limit-state circuit breaker, three market makers, and the scoring-rule venue r
 from the Lab. Turning it on found four bugs in tested code and cost 4.00 percentage points
 of pricing error on six paired seeds. Both are recorded in `docs/GAPS.md`.
 
-Still open in this phase: nothing requotes faster than 300ms, so the cancel-to-trade ratio
-reaches about 60% against the >90% of real books.
+The cancel-rate gap turned out to be a measurement of a bug: agents keyed their working
+orders by an id that is only unique within one book, so with twenty-six contracts they lost
+track of most of them and most cancels were never sent. Fixing that, and the auction that
+filled orders without telling their owners, took position disagreement between agents and
+the ledger from 362 of 494 pairs to 2.
+
+Evidence now arrives over the session rather than all at `t=0`, anchored on the pre-window
+level, so the underlying genuinely diffuses -- late-session dispersion of the future goes
+from 11 to 279 across six paired seeds -- at an accuracy cost of +2.20% of range, 95%
+interval [-0.21%, +4.61%].
+
+Still open in this phase: stop and stop-limit orders, iceberg and pegged orders, tiered
+tick tables, message throttling and a kill switch, and clearing through a CCP.
 
 ### Phase 8 — Real historical replay
 Only now, once Track A has accrued enough. Same harness, `BrawlReplayWorld`, one real patch as

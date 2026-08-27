@@ -230,7 +230,11 @@ each item. Struck items link to what actually happened.
    from 0.50 to 1,021.00 and was **exactly** 1,021.00 three minutes later. Not
    a slow repair: no repair. A real book mends in milliseconds because the
    maker that got run over is one of several; there it was the only one.
-5. **Cancel rate is ~60%, not >90%.** Nothing requotes faster than 300ms.
+5. ~~Cancel rate is ~60%, not >90%.~~ **The measurement was of a bug.** Most
+   quotes were never cancelled at all, because agents had lost track of them;
+   see below. What replaced it is a maker that leaves a quote alone when it has
+   not moved, which is what a real maker does and what a cancel-to-trade ratio
+   is really measuring.
 6. ~~A share and its future have no relation the arbitrageur knows.~~
    **Fixed by listing the legs.** The 0.4x relation to the four-week future was
    never an identity -- the four weekly rates are each battle-weighted, so they
@@ -241,6 +245,137 @@ each item. Struck items link to what actually happened.
    windows under the same evidential bar. Settlement confirms it to the tick:
    1,874 + 1,859 + 1,875 + 1,869 = 7,477. `CROW_EQ` deliberately has no legs,
    so one share is arbitrage-linked and one is not.
+
+## A flow of information, and the two bugs it uncovered
+
+Every agent used to receive its whole sample at `t=0`. The market therefore had
+an information *stock*: it converged within seconds and then nothing could move
+it, because there was nothing left to arrive. Realised dispersion of
+`SPIKE_WR_FUT` over ten minutes was **14.6** on a price near 4,670, so options
+were worth their intrinsic value and nothing more.
+
+Evidence now arrives over the session as ordinary Gaussian updating, written in
+units of precision because that is the unit evidence comes in. With a prior
+`N(mu, 1/t0)` and evidence of accumulated precision `te` centred on the truth,
+
+    m = (t0 * mu + te * truth + W(te)) / (t0 + te)
+
+for a standard Brownian motion `W`, with posterior variance exactly
+`1 / (t0 + te)`. The Brownian term is what makes it a **martingale**: an agent's
+view at any moment is its own best guess at its later view, so it never drifts
+predictably and cannot be anticipated by anything except better information.
+Redrawing a view each wakeup would have been far simpler and would have
+produced a noise trader wearing a posterior.
+
+**Beliefs start at the pre-window level, not at the truth.** SPIKE ran at 0.4839
+for the twelve weeks before the contract window and settles at 0.4669, so a
+market that opens on history opens wrong and has something to discover. Starting
+from the truth and adding noise makes every agent unbiased from the first
+instant: the market opens at the answer with a wide spread and merely tightens.
+The prior is lookahead-free by construction -- the window it measures ends where
+the contract's window begins.
+
+**Six informed traders, log-spaced in precision, rather than two.** Two is not a
+population, it is an anecdote, and it had a measurable consequence: both ran
+into their position limits about a minute in and the price stopped there.
+`fund-sharp` believed 4,687 against a true 4,669, was short its full 900 lots,
+and could do nothing while the market printed 5,005 -- with the makers holding
+capacity for 1,300 more.
+
+### What it cost, on six paired seeds
+
+| | stock | flow |
+|---|---|---|
+| mean pricing error, end of session | 10.5% of range | 12.7% |
+| late-session dispersion of the future | 11.0 | 278.6 |
+
+The accuracy difference is **+2.20%, 95% interval [-0.21%, +4.61%]** -- leaning
+worse and not distinguishable from zero. The dispersion difference is a factor
+of twenty-five, and it is the point: an option is written on how much something
+moves, and under a stock of information the answer was "it does not". Two of the
+six seeds show a dispersion of exactly zero under flow, which is not stillness
+but a halted symbol, and that is worth saying rather than averaging away.
+
+## Two bugs that only a moving market revealed
+
+**Order ids are unique within a book, not across the exchange.** Every agent
+keyed its working orders by id alone. There is one matching engine per symbol,
+so id 5 exists on all twenty-six contracts at once: a new acknowledgement
+overwrote the entry for a different symbol's order, and completing one order put
+its id in the "already finished" set, after which another book's order with the
+same id was discarded as a late duplicate and never cancelled again. Measured
+after two minutes, `mm-3` believed it had **8 working orders across the whole
+exchange** and had **123 resting in one book**. The stale ones formed a wall the
+price could not move through.
+
+It also explains the cancel-rate gap this document used to record. The ratio was
+low because most quotes were never cancelled, not because nothing requoted fast
+enough.
+
+**An auction filled orders and told nobody.** `SessionOperator` called
+`venue.uncross()` directly, which moved cash and positions in the ledger and
+sent not one participant a fill. Measured after two minutes: **362 of 494**
+(agent, symbol) pairs had an agent's belief about its own position disagreeing
+with the venue's record -- `mm-1` believed +807 where the ledger said -63. A
+market maker skewing its quotes off an inventory that is not its inventory is
+not managing risk, it is guessing. Uncrossing now goes through the venue agent,
+which owns the mailbox. Afterwards: **2 of 494**, and both are fills genuinely
+still in flight to agents 45ms away.
+
+### And the performance problem the first bug was hiding
+
+With agents finally tracking their orders, they started actually cancelling
+them: **1.6 million events per simulated minute**. The leak had been acting as
+an accidental rate limiter. Two fixes, both of them things real participants do:
+
+- **A quote that has not moved is left alone.** Cancelling and replacing an
+  order at the price it is already at surrenders queue priority for nothing and
+  pays a message for the privilege.
+- **Market data is conflated to each agent's own decision cadence.** An agent
+  cannot act on a book update that arrives between two of its wakeups. Real
+  feeds conflate for this reason and unconflated ones are a product you pay
+  extra for. Trades are *not* conflated: the tape is the record of what
+  happened, and the maker's anchor is an average over it.
+
+Conflation has to *delay*, not drop, and the first version dropped. A maker that
+has not moved its quote sends no order, so nothing publishes; if the one update
+that announced the book was thrown away, every agent waiting for a price waited
+forever. An experiment trial went from 2,039 trades to **zero**. Held and
+flushed on a wakeup: **1.64M events down to 317K**, and 38.8s of wall clock down
+to 11.0s per simulated minute.
+
+## A collar, and three things it took to get right
+
+A resting bid at **0.25** was filled on a contract worth 4,700. A market order
+names no price, so nothing stopped it walking a thin book to the floor, and the
+circuit breaker then halted a symbol whose damage was already done. Real venues
+collar unpriced orders, and now so does this one: a market order stops at the
+edge of the band and cancels whatever is left.
+
+Getting there took two wrong turns worth recording, because both looked more
+principled than the answer.
+
+**Collaring limit orders too.** They slid to the band's edge, the band later
+moved away from them, and the book locked -- bid above offer, neither permitted
+to trade, and nothing in continuous trading able to clear it. On that version:
+**2,492 limit states in five minutes** and a future marking at 9,267 against a
+settlement of 4,669. A trader who says 30,000 has said 30,000; the collar is for
+orders that said nothing.
+
+**A reference that fell back to the last cleared price.** A symbol that goes
+quiet keeps a reference from whenever it last printed, the market walks away
+from it, and every unpriced order is collared against a price that no longer
+exists. Measured: the band on `SPIKE_WR_FUT` sat at 6,392 while the book quoted
+4,760, a third of the way across the contract's range, and no market order could
+trade at all. The fallback is now the quote -- weaker evidence than a trade,
+which is why it is the fallback, and much better evidence than a price from a
+minute ago.
+
+**A limit state triggered by a print.** Once trades cannot leave the band, a
+rule written in terms of prints outside it can never fire. A symbol is in a
+limit state when the best bid or offer is *at* a band -- interest that wants to
+be somewhere the venue will not let it go -- which is what the rule says and
+what it now checks.
 
 ## Running the machinery, and what that found
 

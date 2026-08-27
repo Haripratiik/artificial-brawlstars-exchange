@@ -66,6 +66,18 @@ class MatchingEngine:
         # Continuous by default, so an engine used on its own behaves exactly
         # as it always has and every existing test keeps its meaning.
         self.phase = SessionState.CONTINUOUS
+        # Prices a trade may print at, or ``None`` for no limit.
+        #
+        # The rule this models does not only pause a runaway after the fact: it
+        # *prevents trades outside the bands*, and that is the half that
+        # protects anyone. Without it a market order with no price protection
+        # walks a thin book to the floor -- measured here, a resting bid at
+        # **0.25** was filled on a contract worth 4,700, and the breaker then
+        # dutifully halted a symbol whose damage was already done.
+        #
+        # Set by the venue before each command, because the band moves with the
+        # reference price and only the venue tracks that.
+        self.execution_band: tuple[int, int] | None = None
         self._sequence = 0
         self._next_order_id = 0
         self._arrival = 0
@@ -172,7 +184,14 @@ class MatchingEngine:
             )
             return events
 
-        events.extend(self._match(order))
+        events.extend(
+            self._match(
+                order,
+                self.execution_band
+                if command.order_type is OrderType.MARKET
+                else None,
+            )
+        )
 
         if order.remaining > 0:
             if command.time_in_force in (TimeInForce.GTC, TimeInForce.POST_ONLY):
@@ -401,8 +420,30 @@ class MatchingEngine:
 
         return events
 
-    def _match(self, incoming: Order) -> list[Event]:
-        """Walk the opposite side until filled or out of crossable price."""
+    def _tradeable(self, price: Price) -> bool:
+        """Whether a trade may print at this price."""
+        if self.execution_band is None:
+            return True
+        low, high = self.execution_band
+        return low <= int(price) <= high
+
+    def _match(
+        self, incoming: Order, collar: tuple[int, int] | None = None
+    ) -> list[Event]:
+        """Walk the opposite side until filled, out of crossable price, or out
+        of collar.
+
+        The collar applies to **market orders only**, and that distinction is
+        the whole of it. A market order names no price, so it needs protecting
+        from the book: without a collar one walked a thin book to the floor and
+        filled a resting bid at **0.25** on a contract worth 4,700. A limit
+        order names a price and is entitled to it; collaring one too was tried
+        and was much worse than the disease. Orders slid to a band edge, the
+        band later moved away from them, and the book locked -- bid above offer,
+        neither allowed to trade, nothing in continuous trading able to clear
+        it. Measured on that version: 2,492 limit states in five minutes and a
+        future marking at 9,267 against a settlement of 4,669.
+        """
         events: list[Event] = []
 
         while incoming.remaining > 0:
@@ -412,6 +453,13 @@ class MatchingEngine:
             resting_price = level.price
             if not incoming.side.crosses(resting_price, incoming.price):
                 break
+            if collar is not None:
+                low, high = collar
+                if not low <= int(resting_price) <= high:
+                    # Past the edge of the collar. The order stops here rather
+                    # than printing beyond it, and whatever is left is
+                    # cancelled -- a market order was never willing to rest.
+                    break
 
             level.prune()
             if level.empty:

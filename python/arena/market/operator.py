@@ -48,9 +48,13 @@ class SessionOperator:
         venue: Venue,
         opens_at: Duration = seconds(10),
         poll: Duration = seconds(1),
+        venue_agent: Any = None,
     ) -> None:
         self.agent_id = agent_id
         self.venue = venue
+        # The mailbox the uncross's fills go out through. Without it the
+        # auction books fills into the ledger and tells nobody.
+        self.venue_agent = venue_agent
         # How long the opening call runs before it clears. Long enough that
         # every agent has woken at least once and had something to say, or the
         # auction clears on whoever happened to be quickest, which is the
@@ -78,7 +82,7 @@ class SessionOperator:
             self.opened = True
             for symbol in self.venue.registry.symbols:
                 if self.venue.session(symbol) is SessionState.PRE_OPEN:
-                    result = self.venue.uncross(symbol)
+                    result = self._uncross(ctx, symbol)
                     self.reopens.append(
                         {
                             "symbol": symbol,
@@ -89,7 +93,7 @@ class SessionOperator:
                     )
         else:
             for symbol in self.venue.reopen_due():
-                result = self.venue.uncross(symbol)
+                result = self._uncross(ctx, symbol)
                 self.reopens.append(
                     {
                         "symbol": symbol,
@@ -99,3 +103,8 @@ class SessionOperator:
                     }
                 )
         ctx.request_wakeup(self.poll)
+
+    def _uncross(self, ctx: SimulationContext, symbol: str) -> Any:
+        if self.venue_agent is not None:
+            return self.venue_agent.uncross(ctx, symbol)
+        return self.venue.uncross(symbol)

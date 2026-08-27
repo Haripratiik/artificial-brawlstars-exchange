@@ -132,7 +132,46 @@ class MarketMaker(TradingAgent):
             low, high = instrument.tick_bounds
             anchor = (int(low) + int(high)) / 2.0
 
-        self.cancel_all(ctx, symbol)
+        low, high = instrument.tick_bounds
+        span = max(1.0, float(int(high) - int(low)))
+        skew_per_lot = (span * self.max_skew_fraction) / max(1, self.position_limit)
+        reservation = anchor - inventory * skew_per_lot
+
+        # Widen with inventory. A maker deep in a position is more likely to be
+        # on the wrong side of whatever is driving the market, so the extra
+        # width is compensation for that risk rather than greed.
+        pressure = abs(inventory) / max(1, self.position_limit)
+        half = self.half_spread * (1.0 + 2.0 * pressure)
+
+        bid = Price(int(reservation - half))
+        ask = Price(int(reservation + half) + 1)
+
+        # Respect the limit by simply not adding to the side that would breach
+        # it. Quoting and relying on the venue to reject is worse: it burns
+        # order ids and hides the constraint from the agent's own logic.
+        if inventory < self.position_limit:
+            self.post(ctx, symbol, Side.BUY, bid,
+                       min(self.quote_size, self.position_limit - inventory))
+        else:
+            self.withdraw(ctx, symbol, Side.BUY)
+        if -inventory < self.position_limit:
+            self.post(ctx, symbol, Side.SELL, ask,
+                       min(self.quote_size, self.position_limit + inventory))
+        else:
+            self.withdraw(ctx, symbol, Side.SELL)
+
+    def _requote(self, ctx: SimulationContext, symbol: str) -> None:
+        instrument = self.instruments[symbol]
+        inventory = self.position.get(symbol, 0)
+
+        anchor = self._anchor.get(symbol)
+        if anchor is None:
+            anchor = self.reference.get(symbol)
+        if anchor is None:
+            if not self.quote_without_reference:
+                return
+            low, high = instrument.tick_bounds
+            anchor = (int(low) + int(high)) / 2.0
 
         low, high = instrument.tick_bounds
         span = max(1.0, float(int(high) - int(low)))
@@ -152,8 +191,31 @@ class MarketMaker(TradingAgent):
         # it. Quoting and relying on the venue to reject is worse: it burns
         # order ids and hides the constraint from the agent's own logic.
         if inventory < self.position_limit:
-            size = min(self.quote_size, self.position_limit - inventory)
-            self.quote(ctx, symbol, Side.BUY, bid, size, TimeInForce.GTC)
+            self.post(ctx, symbol, Side.BUY, bid,
+                       min(self.quote_size, self.position_limit - inventory))
+        else:
+            self.withdraw(ctx, symbol, Side.BUY)
         if -inventory < self.position_limit:
-            size = min(self.quote_size, self.position_limit + inventory)
-            self.quote(ctx, symbol, Side.SELL, ask, size, TimeInForce.GTC)
+            self.post(ctx, symbol, Side.SELL, ask,
+                       min(self.quote_size, self.position_limit + inventory))
+        else:
+            self.withdraw(ctx, symbol, Side.SELL)
+
+    def _post(
+        self, ctx: SimulationContext, symbol: str, side: Side, price: Price, size: int
+    ) -> None:
+        """Work a quote, replacing the existing one only if it has moved."""
+        wanted = (int(price), int(size))
+        working = any(
+            order_symbol == symbol and self.order_side.get(key) is side
+            for key, order_symbol in self.live_orders.items()
+        )
+        if working and self._intent.get((symbol, side)) == wanted:
+            return
+        self.cancel_side(ctx, symbol, side)
+        self._intent[(symbol, side)] = wanted
+        self.quote(ctx, symbol, side, price, size, TimeInForce.GTC)
+
+    def _withdraw(self, ctx: SimulationContext, symbol: str, side: Side) -> None:
+        if self.cancel_side(ctx, symbol, side):
+            self._intent.pop((symbol, side), None)
