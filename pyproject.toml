@@ -1,5 +1,5 @@
 [project]
-name = "arena-markets"
+name = "artificial-brawlstars-exchange"
 version = "0.0.1"
 description = "A deterministic multi-agent electronic market simulator for studying market microstructure, information aggregation, and event-linked derivatives."
 readme = "README.md"

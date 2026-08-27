@@ -1,4 +1,4 @@
-# Arena Markets
+# Artificial Brawl Stars Exchange
 
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=flat&logo=python&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-745%20passing-2ea44f?style=flat)
@@ -6,9 +6,9 @@
 ![Collateral](https://img.shields.io/badge/collateral-exact%2C%20not%20modelled-8b5cf6?style=flat)
 ![Determinism](https://img.shields.io/badge/replay-bit%20identical-0ea5e9?style=flat)
 
-> A complete electronic exchange, built to answer one question with evidence rather than opinion: **does a market aggregate dispersed information better than the agents trading inside it?** Nine asset classes clear against a real settlement source, every position is collateralised by arithmetic instead of a risk model, and money conservation is exactly zero rather than approximately zero.
+> A complete electronic exchange built from scratch, in which **Brawl Stars battle statistics are the economic fundamentals**, and built to answer one question with evidence rather than opinion: **does a market aggregate dispersed information better than the agents trading inside it?** Nine asset classes clear against a real settlement source, every position is collateralised by exact arithmetic instead of a risk model, and money conservation is integer zero rather than approximately zero.
 
-The exchange is finished and runs end to end: a discrete-event kernel with per-agent latency, a price-time matching engine carrying the order types real venues actually list, opening and closing auctions, circuit breakers, a clearing house, settlement against Brawl Stars battle statistics, and a browser front end any user can log into and trade on.
+It is more than a matching engine. The exchange is finished and runs end to end: a deterministic discrete-event kernel with per-agent latency, a price-time book carrying the order types real venues actually list, opening and closing auctions, circuit breakers, a clearing house that nets portfolios exactly, live settlement against measured game statistics, a population of heterogeneous trading agents, a research harness that runs paired ablations from a manifest, and a browser front end any user can log into and trade on.
 
 The research result is a negative. **The market does not beat its own agents.** It reproduces an unweighted average of their beliefs, and loses by a factor of 2.2 to those same beliefs weighted by evidence. A logarithmic scoring rule with none of an order book's structural limits lands in the identical place (p = 0.97), which rules out the explanation everyone reaches for first.
 

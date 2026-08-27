@@ -2,7 +2,7 @@
 
 Complete setup, start to finish, at zero cost.
 
-The collector is the only part of Arena Markets whose value depends on wall-clock time. Every
+The collector is the only part of Artificial Brawl Stars Exchange whose value depends on wall-clock time. Every
 other phase can be rebuilt in an afternoon; the corpus can only be *accumulated*. So the goal of
 this document is to get you collecting today, not to get you the perfect deployment eventually.
 
@@ -79,7 +79,7 @@ editing the key's allow-list to match. Nothing else changes.
 
    | Field | Value |
    |---|---|
-   | Name | `arena-markets` |
+   | Name | `artificial-brawlstars-exchange` |
    | Description | `Research data collection` |
    | **Allowed IP Addresses** | **`45.79.218.79`** |
 
@@ -248,7 +248,7 @@ Setup:
 
 ```bash
 sudo apt update && sudo apt install -y python3-pip git
-git clone <your-repo-url> arena-markets && cd arena-markets
+git clone <your-repo-url> artificial-brawlstars-exchange && cd artificial-brawlstars-exchange
 pip install -e ".[collect]"
 ```
 
@@ -267,15 +267,15 @@ Same caveat on the credit card. Same setup steps.
 ```ini
 # /etc/systemd/system/arena-collector.service
 [Unit]
-Description=Arena Markets Brawl collector
+Description=Artificial Brawl Stars Exchange Brawl collector
 After=network-online.target
 
 [Service]
 Type=simple
 User=ubuntu
-WorkingDirectory=/home/ubuntu/arena-markets
+WorkingDirectory=/home/ubuntu/artificial-brawlstars-exchange
 Environment=BRAWL_API_KEY=REPLACE_ME
-Environment=PYTHONPATH=/home/ubuntu/arena-markets
+Environment=PYTHONPATH=/home/ubuntu/artificial-brawlstars-exchange
 ExecStart=/usr/bin/python3 -m collectors.brawl_api --proxy --data-dir data/raw
 Restart=always
 RestartSec=30
@@ -296,7 +296,7 @@ The entire collector state is one SQLite file plus append-only gzip shards, so m
 merging a laptop's head start into a server is a copy:
 
 ```bash
-rsync -av data/raw/ user@host:~/arena-markets/data/raw/
+rsync -av data/raw/ user@host:~/artificial-brawlstars-exchange/data/raw/
 ```
 
 Back this up somewhere periodically. Free cloud instances do occasionally get reclaimed, and the

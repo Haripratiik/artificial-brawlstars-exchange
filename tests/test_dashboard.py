@@ -305,7 +305,7 @@ def test_the_server_starts_the_way_it_is_documented():
         timeout=180,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "Arena Markets" in result.stdout
+    assert "Artificial Brawl Stars Exchange" in result.stdout
 
 
 @pytest.mark.parametrize(

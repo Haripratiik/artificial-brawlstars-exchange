@@ -1,4 +1,4 @@
-"""Arena Markets: the exchange, served to a browser.
+"""Artificial Brawl Stars Exchange: the exchange, served to a browser.
 
     python -m dashboard.server
     # then open http://127.0.0.1:8000
@@ -73,7 +73,7 @@ TICK_SECONDS = 0.05
 _SEATS: dict[str, AgentId] = {}
 
 
-app = FastAPI(title="Arena Markets")
+app = FastAPI(title="Artificial Brawl Stars Exchange")
 runner = MarketRunner()
 _pump: asyncio.Task | None = None
 
@@ -417,7 +417,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
     args = parser.parse_args()
 
-    print(f"Arena Markets -> http://{args.host}:{args.port}")
+    print(f"Artificial Brawl Stars Exchange -> http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

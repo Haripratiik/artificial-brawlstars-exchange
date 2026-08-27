@@ -1,4 +1,4 @@
-# Arena Markets — Attack Plan
+# Artificial Brawl Stars Exchange — Attack Plan
 
 **Status:** planning, revised after the August 2026 feasibility research pass
 **Stack:** Python (research, agents, data, experiments, modeling) · C++ (exchange kernel, performance-critical simulation)
@@ -72,7 +72,7 @@ indefinitely. Brawler-statistic contracts carry the research and carry less risk
 
 ### 4. The market-making adaptation the spec flagged as an open problem now has a published answer.
 
-The spec notes Avellaneda–Stoikov "will need adaptation because Arena Markets contracts have
+The spec notes Avellaneda–Stoikov "will need adaptation because Artificial Brawl Stars Exchange contracts have
 bounded / settling payoffs." *Optimal Market Making in Prediction Markets* (arXiv 2607.17991,
 July 2026) does precisely that adaptation:
 
@@ -323,7 +323,7 @@ liquidation cascades, dashboard. In that order.
 | Build backend | scikit-build-core + CMake | Modern, not setuptools |
 | Engine order | Python reference → C++ port | Free correctness oracle for a Python-first dev |
 | BTN data | Manual export, bootstrap only | Closed source, unclear license, blocks bots |
-| Repo identity | `arena-markets` | Generic engine; Brawl is world #1 |
+| Repo identity | `artificial-brawlstars-exchange` | Generic engine; Brawl is world #1 |
 | Disclaimer | Exact Fan Content Policy wording | Required verbatim |
 
 ---
