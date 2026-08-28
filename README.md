@@ -1,7 +1,7 @@
 # Artificial Brawl Stars Exchange
 
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=flat&logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-745%20passing-2ea44f?style=flat)
+![Tests](https://img.shields.io/badge/tests-745-0A0A0A?style=flat)
 ![Asset classes](https://img.shields.io/badge/asset%20classes-9-0A0A0A?style=flat)
 ![Collateral](https://img.shields.io/badge/collateral-exact%2C%20not%20modelled-8b5cf6?style=flat)
 ![Determinism](https://img.shields.io/badge/replay-bit%20identical-0ea5e9?style=flat)

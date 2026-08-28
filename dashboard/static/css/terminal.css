@@ -1,8 +1,8 @@
-/* Arena Markets — terminal styling.
+/* Arena Markets, terminal styling.
  *
  * The aesthetic is a trading desk, not a fintech landing page: dense, hairline
  * ruled, monospaced wherever numbers must align, and dark because this is a
- * thing you stare at. Colour carries meaning rather than decoration — green and
+ * thing you stare at. Colour carries meaning rather than decoration, green and
  * red are reserved *strictly* for market direction, so they never appear on a
  * button or a border and always mean the same thing when they do appear.
  *
@@ -363,7 +363,7 @@ tbody tr:hover { background: var(--raised); }
   transition: border-color var(--tick), transform var(--tick);
 }
 .card:hover { border-color: var(--rule-bright); transform: translateY(-1px); }
-/* State ribbon down the left edge — the fastest read of session state. */
+/* State ribbon down the left edge, the fastest read of session state. */
 .card::before {
   content: '';
   position: absolute;
@@ -385,7 +385,7 @@ tbody tr:hover { background: var(--raised); }
 .card .sub { display: flex; gap: 12px; font-family: var(--mono); font-size: 10px; color: var(--ink-dim); }
 .card .spark { height: 34px; margin-top: 9px; }
 
-/* ── ladder — the signature element ─────────────────────────────────── */
+/* ── ladder, the signature element ─────────────────────────────────── */
 
 .ladder { font-family: var(--mono); font-size: 11.5px; }
 .lad-row {

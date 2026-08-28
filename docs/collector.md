@@ -26,7 +26,7 @@ your machine  ──►  bsproxy.royaleapi.dev  ──►  api.brawlstars.com
 ```
 
 Because Supercell only ever sees the proxy's address, your own IP becomes irrelevant. The
-collector runs anywhere — laptop, home server, Raspberry Pi, any free cloud VM — and keeps
+collector runs anywhere, laptop, home server, Raspberry Pi, any free cloud VM, and keeps
 working when your address changes.
 
 ### Is routing through someone else's proxy safe?
@@ -59,7 +59,7 @@ python -m collectors.brawl_api --check
 ```
 
 Allow-list your own public IP instead of the proxy's. The cost is that a home IP changes without
-warning, and when it does the collector stops with a 403. That is not silent — `--check` reports
+warning, and when it does the collector stops with a 403. That is not silent, `--check` reports
 it, **and prints your current public IP** so fixing it is a copy-paste into the portal rather than
 a hunt. On a typical home connection expect to do that every few weeks.
 
@@ -68,7 +68,7 @@ editing the key's allow-list to match. Nothing else changes.
 
 ---
 
-## Part 1 — Get collecting (10 minutes)
+## Part 1: Get collecting (10 minutes)
 
 ### Step 1: Create the API key
 
@@ -84,7 +84,7 @@ editing the key's allow-list to match. Nothing else changes.
    | **Allowed IP Addresses** | **`45.79.218.79`** |
 
    > **This is the step everything hinges on.** Enter the proxy's address, **not** your own.
-   > The portal will helpfully pre-fill your current IP — delete it and replace it. If you leave
+   > The portal will helpfully pre-fill your current IP, delete it and replace it. If you leave
    > your own address in, every request will fail with a 403.
 
 4. Click **Create Key**, then copy the token. It is long (a JWT, several hundred characters).
@@ -118,7 +118,7 @@ $env:BRAWL_API_KEY = "paste-your-key-here"
 export BRAWL_API_KEY="paste-your-key-here"
 ```
 
-Watch for a trailing newline or a truncated paste — both produce a confusing 403. The check in
+Watch for a trailing newline or a truncated paste, both produce a confusing 403. The check in
 the next step will tell you if that happened.
 
 ### Step 4: Verify before you commit to anything
@@ -139,7 +139,7 @@ The key and IP configuration are correct. Seed the frontier next:
   python -m collectors.brawl_api --seed-only --proxy
 ```
 
-If it fails, the error tells you *which* of the two possible problems you have — see
+If it fails, the error tells you *which* of the two possible problems you have, see
 [troubleshooting](#troubleshooting) below. Do not proceed until this passes.
 
 ### Step 5: Seed the frontier
@@ -161,7 +161,7 @@ seed spans a much wider skill range at identical request cost.
 python -m collectors.brawl_api --proxy --data-dir data/raw
 ```
 
-It runs until you stop it. Ctrl-C is safe at any point — all state is durable, and restarting
+It runs until you stop it. Ctrl-C is safe at any point, all state is durable, and restarting
 resumes exactly where it left off.
 
 Expect log lines like:
@@ -174,10 +174,10 @@ Expect log lines like:
 
 ---
 
-## Part 2 — Running it 24/7 (also free)
+## Part 2: Running it 24/7 (also free)
 
 The laptop setup above only collects while your machine is awake. Since the proxy removed the IP
-constraint, *any* always-on machine works — you are no longer forced into a cloud provider with a
+constraint, *any* always-on machine works, you are no longer forced into a cloud provider with a
 static IP.
 
 In rough order of how little effort they take:
@@ -186,7 +186,7 @@ In rough order of how little effort they take:
 
 Nothing breaks and nothing is lost. The collector's state is a SQLite file plus append-only
 shards, so suspending, killing, or rebooting costs you the *hours* you were asleep and nothing
-else — restart and it resumes from exactly the frontier position it had reached.
+else, restart and it resumes from exactly the frontier position it had reached.
 
 What it will not do is start itself. Use the supervisor so you never have to think about it:
 
@@ -200,27 +200,27 @@ key) rather than hammering the API with a bad credential.
 
 Then add a startup entry so it runs whenever the machine is awake:
 
-- **Windows** — Task Scheduler → Create Task → Trigger "At log on" → Action: your `python.exe`,
+- **Windows**: Task Scheduler → Create Task → Trigger "At log on" → Action: your `python.exe`,
   arguments `tools/run_collector.py -- --proxy`, Start in: the repo directory.
-- **macOS** — a `launchd` plist with `RunAtLoad`.
-- **Linux** — the systemd unit below already does it.
+- **macOS**: a `launchd` plist with `RunAtLoad`.
+- **Linux**: the systemd unit below already does it.
 
 **The honest caveat:** coverage gaps from a sleeping laptop are *not* missing-at-random. They
 correlate with your timezone, and therefore with which regions were playing. That biases the crawl
 in a way standardization does not fully remove, because it shifts which *players* you reach rather
 than only which strata. It is a real argument for an always-on host eventually. It is not an
-argument for delaying the start — a gappy corpus that exists beats a perfect one that does not.
+argument for delaying the start, a gappy corpus that exists beats a perfect one that does not.
 
-### Option A — A machine you already own
+### Option A: A machine you already own
 
 A spare laptop, a home server, a Raspberry Pi, or just leaving your desktop on. Genuinely the
 simplest choice, with no signup, no credit card, and no capacity lottery. The workload is tiny:
 under 8 requests/second of network traffic and a few hundred MB of RAM.
 
-On Linux, run it under systemd — see the [unit file](#systemd-unit) below. On Windows, Task
+On Linux, run it under systemd, see the [unit file](#systemd-unit) below. On Windows, Task
 Scheduler with "run whether user is logged on or not" works.
 
-### Option B — Oracle Cloud Always Free
+### Option B: Oracle Cloud Always Free
 
 The only major cloud whose free tier is permanent rather than a 12-month trial.
 
@@ -229,7 +229,7 @@ The only major cloud whose free tier is permanent rather than a 12-month trial.
 1. **Signup requires a credit card for identity verification.** It is not charged on an Always
    Free account, but if "no card at all" is a hard requirement, use Option A.
 2. **Do not chase the ARM instance.** The 2 OCPU / 12 GB Ampere A1 shape is what everyone wants
-   and it is nearly always out of capacity — provisioning it reliably means upgrading to
+   and it is nearly always out of capacity, provisioning it reliably means upgrading to
    Pay-As-You-Go, which is a real billing account with real risk of charges. Oracle also
    [halved that allowance in June 2026 without announcing it](https://www.infoq.com/news/2026/07/oracle-cloud-free-tier-limits/).
 
@@ -241,7 +241,7 @@ Setup:
 
 1. Sign up at <https://cloud.oracle.com/>, choosing a home region near you.
 2. **Compute → Instances → Create Instance.**
-3. Under **Image and shape → Change shape**, pick **Ampere?** No — pick **Specialty and previous
+3. Under **Image and shape → Change shape**, pick **Ampere?** No, pick **Specialty and previous
    generation → `VM.Standard.E2.1.Micro`**. Confirm it shows the *Always Free eligible* badge.
 4. Choose an Ubuntu image, upload or generate an SSH key, and create.
 5. SSH in and set it up:
@@ -257,7 +257,7 @@ pip install -e ".[collect]"
 Because you are using the proxy, you do **not** need a reserved public IP and you do **not** need
 to touch the key's allow-list again. That is the whole point.
 
-### Option C — Google Cloud free tier
+### Option C: Google Cloud free tier
 
 A single `e2-micro` in `us-west1`, `us-central1`, or `us-east1` is always-free and works fine.
 Same caveat on the credit card. Same setup steps.
@@ -310,13 +310,13 @@ A fair challenge, and the answer has two halves.
 
 ### There is no public API that serves the statistics
 
-This was checked rather than assumed. [BrawlAPI](https://brawlapi.com/) — the most open source
-available, requiring no key, no token, and imposing no rate limit — serves **only static reference
+This was checked rather than assumed. [BrawlAPI](https://brawlapi.com/), the most open source
+available, requiring no key, no token, and imposing no rate limit, serves **only static reference
 data**: the brawler roster, the map catalog, game modes, icons, and raw game config. Its `/v1/maps`
 endpoint returns empty `stats` and `teamStats` arrays. Its own documentation is explicit that it
 does not serve win rates, pick rates, or meta analytics.
 
-The sites that *do* have those numbers — Brawl Time Ninja, Brawlify, BrawlMeta, BrawlVision —
+The sites that *do* have those numbers, Brawl Time Ninja, Brawlify, BrawlMeta, BrawlVision,
 compute them internally from their own crawls and expose them through their web UIs, not through
 an API. BrawlMeta describes doing exactly what this collector does: storing match history hourly,
 because the official API only returns the last 25 games.
@@ -324,7 +324,7 @@ because the official API only returns the last 25 games.
 So "just use an existing API" is not an option that exists. The remaining alternative is scraping a
 stats site's web pages.
 
-### On scraping — a fair question, and a more nuanced answer
+### On scraping: a fair question, and a more nuanced answer
 
 "It is a public page" is a reasonable starting point, and largely right on the narrow legal
 question: courts have generally held that accessing publicly available data is not unauthorized
@@ -345,7 +345,7 @@ The complications are not really about legality:
 But the decisive objection is technical rather than any of those: **their pages do not carry what
 we need anyway.** A stats site shows current win rates. Replay needs per-observation "knowable at"
 timestamps. You could recover those by snapshotting the site repeatedly and stamping each
-snapshot — but that *is* building a collector, just one with more legal ambiguity and less control
+snapshot, but that *is* building a collector, just one with more legal ambiguity and less control
 over the population definition.
 
 The recommendation is therefore not "scraping is wrong", it is: **use the export button for
@@ -356,7 +356,7 @@ is periodic, low-effort, and gets you exactly the calibration data that is genui
 
 This is the deeper reason, and it is specific to this project rather than a general preference.
 
-A stats site tells you **what is true now**. Historical replay needs **what was knowable then** —
+A stats site tells you **what is true now**. Historical replay needs **what was knowable then**,
 every observation tagged with when it became available, so an agent standing at time *t* can be
 given exactly the information that existed at *t* and nothing more. Strip that out and the
 no-lookahead guarantee this whole layer is built around becomes unenforceable, and every research
@@ -365,7 +365,7 @@ result becomes unfalsifiable.
 Three consequences follow:
 
 - **Provenance.** A settlement must be able to name the bytes it came from. Brawl Time Ninja moved
-  to a private repository, so its methodology is no longer readable — if it silently changed how
+  to a private repository, so its methodology is no longer readable, if it silently changed how
   "adjusted win rate" is computed, every past settlement derived from it would become
   indefensible, with no way to detect that it had happened.
 - **Population.** Brawl Time Ninja states its data comes from *its visitors*, "usually better than
@@ -392,7 +392,7 @@ well-behaved collector accrues perhaps 10^5–10^6 per day. We will not catch up
 
 That is survivable because **the core research does not need to.** The flagship experiment asks
 whether a market aggregates information better than its constituent agents, and answering it
-requires knowing the *true* probability — which a synthetic, calibrated world provides exactly and
+requires knowing the *true* probability, which a synthetic, calibrated world provides exactly and
 real data never can. Real replay is the external-validity test that comes afterwards, and it needs
 a defensible corpus, not the largest one.
 
@@ -416,9 +416,9 @@ What the numbers should do over time:
 
 | Signal | Healthy | What it means if not |
 |---|---|---|
-| `battles_new` per battlelog | starts near 25, declines | If it hits ~0, the frontier has saturated — **raise** `--recrawl-hours`, don't lower it |
+| `battles_new` per battlelog | starts near 25, declines | If it hits ~0, the frontier has saturated, **raise** `--recrawl-hours`, don't lower it |
 | `players known` | climbs, then plateaus at `max_frontier` | Flat early means the snowball isn't expanding; check for fetch errors |
-| `fetch_errors` | near zero | Climbing steadily means throttling — lower `--rate` |
+| `fetch_errors` | near zero | Climbing steadily means throttling, lower `--rate` |
 | `players_missing` | small and slow | Deleted accounts. Normal |
 
 ---
@@ -469,7 +469,7 @@ python tools/rollup.py --data-dir data/raw --out data/derived --prune-after-days
 ```
 
 Measured end to end on 60,000 synthetic battles: a 1.93 MB raw shard becomes a 68 KB aggregate
-file — **28x smaller**, and that is before compressing the CSV.
+file, **28x smaller**, and that is before compressing the CSV.
 
 The reason it collapses so far is that **aggregate size is bounded by brawlers × strata, not by
 battle count**. Ten times the battles produce the same number of rows, just with bigger counts in
@@ -482,7 +482,7 @@ month of aggregates**, instead of 41 GB a year.
 Run the rollup on a schedule (weekly is plenty) alongside the collector.
 
 **Pruning is opt-in and never deletes a shard it did not just roll up successfully.** Raw battles
-are evidence — a settlement months from now may need to name the bytes it came from — so keeping a
+are evidence, a settlement months from now may need to name the bytes it came from, so keeping a
 buffer means a normalization bug stays recoverable. Trading that auditability for disk is your
 call, not a default. `--prune-after-days 0` (the default) deletes nothing.
 
@@ -495,7 +495,7 @@ mechanical baseline check:
 ```
 
 Because a battlelog names every participant of a 3v3, the pooled win rate across all brawlers
-*must* be 0.500. A gap means dropped participants, double-counted battles, or — the nasty one — the
+*must* be 0.500. A gap means dropped participants, double-counted battles, or, the nasty one, the
 log owner's team perspective inverted, which would corrupt half the corpus while leaving every
 number looking perfectly plausible.
 
@@ -529,7 +529,7 @@ contract specs, and the deterministic fixtures.
 The documented ceiling is about 10 requests/second per key, throttled with HTTP 429. The default
 here is 7.5, and the client backs off with full jitter on 429 and 5xx. There is no reason to push
 closer to the line: the binding constraint on corpus growth is how fast *players play*, not how
-fast we can ask. 404s are never retried — a deleted tag will not come back, and retrying it spends
+fast we can ask. 404s are never retried, a deleted tag will not come back, and retrying it spends
 budget the rest of the crawl needs.
 
 The proxy is a free community service. Staying well under the limit is the rent.
@@ -546,22 +546,22 @@ whatever the number happens to be today.
 
 | Source | Has win rates? | Historical? | Sample sizes? | Reachable? |
 |---|---|---|---|---|
-| Official Supercell API | no — per-player only | n/a | n/a | yes, via the proxy |
+| Official Supercell API | no, per-player only | n/a | n/a | yes, via the proxy |
 | Brawlify / BrawlAPI | **no, static metadata only** | n/a | n/a | yes, free, no key |
-| Brawl Time Ninja | yes | probably | probably | **no — authenticated** |
-| BrawlStats, BrawlVision, Brawl Planet, Brawl Data | yes, on screen | no | no | **no — 403 / 429 / reset** |
+| Brawl Time Ninja | yes | probably | probably | **no, authenticated** |
+| BrawlStats, BrawlVision, Brawl Planet, Brawl Data | yes, on screen | no | no | **no, 403 / 429 / reset** |
 | Kaggle battle-log dumps | computable from raw | **frozen 2021 / 2023** | yes | account needed |
 
 What the probes actually returned:
 
-* `api.brawlify.com` and `brawlapi.com` are **static metadata** — brawlers, 1,239 maps,
+* `api.brawlify.com` and `brawlapi.com` are **static metadata**, brawlers, 1,239 maps,
   68 game modes, icons. Free, no key, no rate limit, CORS open. The documentation says
   plainly that it carries no competitive statistics. Genuinely useful, but for the
   *universe definition* rather than the metric: it is the authoritative list of what
   strata exist, which the reference snapshot needs anyway.
 * `cube.brawltime.ninja/cubejs-api/v1/meta` returns `{"error":"Authorization header
   isn't set"}`. So Brawl Time Ninja computes exactly these aggregates behind a **Cube.js**
-  backend — and it is closed. Its own site API answers in **tRPC** envelopes, undocumented,
+  backend, and it is closed. Its own site API answers in **tRPC** envelopes, undocumented,
   and its source repository has gone private. The data exists and is not on offer.
 * The other meta sites answered 403, 429, or a reset connection to anything that was not
   a browser. They are consumer websites, not data providers, and scraping them would be
@@ -573,11 +573,11 @@ What the probes actually returned:
 
 ### The one genuinely useful finding
 
-The Kaggle dumps are **raw battle logs**, which is the right shape — the aggregation is
+The Kaggle dumps are **raw battle logs**, which is the right shape, the aggregation is
 ours to do either way. They are stale (2021 and 2023), so they cannot settle a 2026
 contract. But everything in this repository currently runs on `fixture-synthetic-v1`,
 and a real hundred-thousand-battle log would put the **normalizer, the mode mechanics,
-the shrinkage and the standardization** in front of real data for the first time — no
+the shrinkage and the standardization** in front of real data for the first time, no
 API key, no crawl, no waiting.
 
 That is worth doing before the collector ever runs, because it separates two failures

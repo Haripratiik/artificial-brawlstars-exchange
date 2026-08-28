@@ -4,9 +4,9 @@
 loses decisively to weighting those same beliefs by how much evidence each
 rests on.
 
-**Experiment 2: and the mechanism is not why.** A logarithmic scoring rule —
+**Experiment 2: and the mechanism is not why.** A logarithmic scoring rule,
 which has none of an order book's structural limitations, always quotes, and
-needs no counterparty — lands in exactly the same place (p = 0.97).
+needs no counterparty, lands in exactly the same place (p = 0.97).
 
 What is left, measured rather than assumed: agents stop trading once the price
 is inside their own uncertainty band, using under half their capacity. Nothing
@@ -15,7 +15,7 @@ one.
 
 ---
 
-# Experiment 1 — The market against its own agents
+# Experiment 1: The market against its own agents
 
 ```bash
 python experiments/information_aggregation/run.py --full --workers 8
@@ -30,12 +30,12 @@ battles, so the settled rate is a draw and
     truth = P(Binomial(2000, p*) / 2000 > θ)
 
 is a real probability, known exactly. Thresholds are chosen by bisection so the
-answers spread across [0.05, 0.95] — with a 2,000-battle window a *random*
+answers spread across [0.05, 0.95], with a 2,000-battle window a *random*
 threshold makes nearly every trial a foregone conclusion, and a set of foregone
 conclusions cannot separate any two forecasters.
 
 Eight informed agents see log-spaced battle counts from 50 to 5,000 (10,319
-battles in total), form Beta posteriors, and forecast the Beta-Binomial tail —
+battles in total), form Beta posteriors, and forecast the Beta-Binomial tail,
 **exactly Bayes-optimal** for what each has seen. They trade against one market
 maker and eight noise traders on the real matching engine, with heterogeneous
 latency. The market's forecast is the time-weighted mid over the final 10%.
@@ -47,7 +47,7 @@ tournament would need thousands.
 
 ## Result
 
-Primary metric — squared error to the true probability. Lower is better,
+Primary metric, squared error to the true probability. Lower is better,
 negative difference means the market won. Paired by trial; Benjamini–Hochberg
 across the four comparisons.
 
@@ -65,22 +65,22 @@ The market is statistically indistinguishable from an unweighted average of its
 agents. It is 11× worse than the best agent picked with hindsight, and **2.2×
 worse than the same agents weighted by evidence**.
 
-## Why — three ablations, each ruling something out
+## Why: three ablations, each ruling something out
 
 | condition | market error | vs default |
 |---|---|---|
-| default (8 dispersed agents, 8 noise, limit 800) | 0.03108 | — |
+| default (8 dispersed agents, 8 noise, limit 800) | 0.03108 | n/a |
 | noise traders removed entirely | 0.02818 | −9%, comparisons unchanged |
 | position limits raised 5× (800 → 4000) | 0.03152 | no change |
 | all 10,319 battles held by **one** agent | 0.08424 | **2.7× worse** |
 
 Plus a convergence check: market error by session length was 0.0144 (60s),
-0.0095 (300s), 0.0113 (600s), 0.0113 (1800s) — **flat from 300s onward**. The
+0.0095 (300s), 0.0113 (600s), 0.0113 (1800s), **flat from 300s onward**. The
 market has converged; it is not short of time.
 
 So it is not noise traders, not position limits, and not insufficient time.
 
-The conclusion drawn here was that what remained was the mechanism — that a
+The conclusion drawn here was that what remained was the mechanism, that a
 limit order book aggregates by capital rather than by evidence, because it needs
 a counterparty for every trade and its market maker anchors price to its own
 reference. **Experiment 2 tested that and refuted it.** The paragraph is left
@@ -98,12 +98,12 @@ through which that information reaches the price.
 The concentration ablation is the same point from the other side. Holding total
 information fixed and moving it all into one trader makes the market **2.7×
 worse**, because one agent has one balance sheet. Dispersed information reaches
-the price better than concentrated information — the opposite of the intuition
+the price better than concentrated information, the opposite of the intuition
 that an informed monopolist prices most efficiently.
 
 ## What the extremization factor says
 
-Fitted out of sample at 0.95 and 1.10 — straddling 1.0, so log-odds
+Fitted out of sample at 0.95 and 1.10, straddling 1.0, so log-odds
 extremization neither helps nor hurts here. The forecasting literature finds
 d ∈ [1.16, 3.92] optimal on geopolitical tournaments, where pooled forecasts are
 systematically under-confident. That does not reproduce here, and the reason is
@@ -113,7 +113,7 @@ construction. Pooling optimal forecasters produces a well-calibrated aggregate
 with nothing left to sharpen.
 
 The grid was widened below 1.0 for this run. In the concentrated ablation the
-fitted factor pins at **0.50**, the grid floor — seven agents at the prior and
+fitted factor pins at **0.50**, the grid floor, seven agents at the prior and
 one sharp agent produce a wildly over-confident log-odds pool that wants heavy
 shrinking. Had the grid been clamped at 1.0 as the original formulation
 specifies, a boundary value would have been reported as an interior optimum.
@@ -137,7 +137,7 @@ specifies, a boundary value would have been reported as an interior optimum.
 
 ---
 
-# Experiment 2 — Is it the mechanism?
+# Experiment 2: Is it the mechanism?
 
 **Answer: no. Swapping the limit order book for a logarithmic scoring rule
 changes nothing at all.**
@@ -149,7 +149,7 @@ python experiments/information_aggregation/run.py --compare-venues --full --work
 Experiment 1 left one obvious suspect. A book needs a counterparty for every
 trade, so an informed agent can only move price as fast as someone takes the
 other side; and its market maker quotes around its own reference, which acts as
-an anchor. A scoring rule has neither problem — it always quotes, at any size,
+an anchor. A scoring rule has neither problem, it always quotes, at any size,
 and its price is a function of cumulative net flow with nothing to revert to.
 
 The same 200 trials, the same agents, the same seeds, the same information. The
@@ -182,7 +182,7 @@ at full 200-trial power:
 | 346 | 5,997 | 0.04641 |
 
 A shallow U with its minimum at the depth-matched point, degrading in both
-directions — too deep and informed trading cannot move price, too thin and noise
+directions, too deep and informed trading cannot move price, too thin and noise
 traders push it around. Nothing anywhere near precision-weighting's 0.01436.
 
 > An 8-trial pilot of this sweep showed a clean monotonic improvement toward
@@ -192,7 +192,7 @@ traders push it around. Nothing anywhere near precision-weighting's 0.01436.
 > result that would have been reported if the sweep had stopped where it looked
 > most interesting.
 
-## What is actually binding — measured, not inferred
+## What is actually binding: measured, not inferred
 
 If agents were constrained, they would end sessions pinned at their limits. They
 do not:
@@ -204,7 +204,7 @@ do not:
 
 Agents use under half their capacity, and the price ends up **well inside** each
 one's uncertainty band. They stop because they are satisfied, not because they
-have run out of room — which is exactly what their rule says to do: stop once
+have run out of room, which is exactly what their rule says to do: stop once
 the price is within `patience × uncertainty` of your estimate.
 
 The two venues produce these numbers to two decimal places of each other. That
@@ -213,7 +213,7 @@ an agent converts belief into pressure, and both mechanisms are downstream of it
 
 So the price rests where pressure balances. A sharp agent has a narrow band and
 keeps pushing until price is close to its view; a vague agent has a wide band
-and gives up early. That *is* a form of information weighting — it is simply far
+and gives up early. That *is* a form of information weighting, it is simply far
 too weak to beat weighting by evidence directly, because a vague agent's early
 position moves price just as far as a sharp one's.
 
@@ -221,7 +221,7 @@ position moves price just as far as a sharp one's.
 
 Three things are now ruled out: the mechanism, liquidity depth, and trading
 capacity. What remains is the hypothesis Experiment 1 named and this one
-sharpens — **nothing makes a well-informed agent bet bigger than a poorly
+sharpens, **nothing makes a well-informed agent bet bigger than a poorly
 informed one.** Two ways to test it, and they are complementary:
 
 1. **Kelly-proportional sizing.** Let an agent's stake scale with its edge over
@@ -231,7 +231,7 @@ informed one.** Two ways to test it, and they are complementary:
    agents and let capital accumulate. If the market migrates from the simple
    mean toward precision-weighting over time, markets aggregate by evidence only
    once they have had time to reallocate capital toward the people who were
-   right — which would be a far more interesting claim than either experiment
+   right, which would be a far more interesting claim than either experiment
    here has established.
 
 ## Reproducing

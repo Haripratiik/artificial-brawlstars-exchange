@@ -1,11 +1,11 @@
-# Artificial Brawl Stars Exchange — Attack Plan
+# Artificial Brawl Stars Exchange: Attack Plan
 
 **Status:** planning, revised after the August 2026 feasibility research pass
 **Stack:** Python (research, agents, data, experiments, modeling) · C++ (exchange kernel, performance-critical simulation)
 
 ---
 
-## Part I — What the research changed
+## Part I: What the research changed
 
 The kickoff spec is sound. Five findings change *how* we sequence it.
 
@@ -38,11 +38,11 @@ built so it is *never blocked* waiting for it.
 
 ### 2. Brawl Time Ninja is a bootstrap reference, not an ingestion source.
 
-- Its repository now states development moved to a private repo — the methodology is no longer
+- Its repository now states development moved to a private repo, the methodology is no longer
   readable, and there is no license to rely on.
 - The site returns HTTP 403 to automated fetchers.
 - Its own documentation says statistics come from *its visitors*, "who are usually better than
-  the average" — the sample is explicitly **not** representative of the player base.
+  the average", the sample is explicitly **not** representative of the player base.
 - Its "adjusted win rate" is documented as the share of battles a brawler "wins or ranks high"
   (which generalizes across Showdown-style modes), with a **Bayesian average** interpolation for
   low-pick brawlers.
@@ -64,7 +64,7 @@ The policy requires this **exact** notice:
 and lists **gambling** among prohibited content, alongside a non-commercial requirement and a
 ban on implying endorsement.
 
-This does not threaten the project — simulated capital, no cash-out, research framing — but it
+This does not threaten the project, simulated capital, no cash-out, research framing, but it
 does re-rank the instruments. **Esports match-outcome binaries are the single highest-risk
 family** (they look exactly like sports betting to a casual reader), and they are also the ones
 with the smallest sample and the weakest connection to the battle dataset. Defer them
@@ -79,7 +79,7 @@ July 2026) does precisely that adaptation:
 - model a latent belief process `L_t` and set `p_t = f(L_t)` with logistic `f`, so price stays
   in (0,1) by construction rather than by clamping;
 - price evolves as `dp_t = ς(t, p_t) dW_t` with **state-dependent volatility that vanishes at
-  the boundaries** — a 0.02 contract simply cannot move like a 0.50 contract;
+  the boundaries**, a 0.02 contract simply cannot move like a 0.50 contract;
 - add a **terminal settlement penalty** `Φ(p_T, q_T) = −γ_T · q_T² · p_T(1−p_T)`, the variance
   of the settlement value of inventory still held at resolution. This term has no analogue in
   Avellaneda–Stoikov and is the whole difference;
@@ -92,7 +92,7 @@ We get a principled, citable market maker instead of an improvised one.
 "Does the market beat its constituent agents?" is nearly free to win against the *worst* agent
 or a naive average. The literature is sharper than that: Atanasov et al. (*Management Science*)
 find prediction markets beat the **simple mean** of forecasters, but **lose** to prediction polls
-once those are aggregated properly — temporal decay, performance weighting, and recalibration.
+once those are aggregated properly, temporal decay, performance weighting, and recalibration.
 
 So the experiment must be run against a **ladder** of baselines:
 
@@ -108,7 +108,7 @@ Designing this in from the start is the difference between a project and a *resu
 
 ---
 
-## Part II — The design idea this points to
+## Part II: The design idea this points to
 
 The single most useful consequence of the above:
 
@@ -118,7 +118,7 @@ The single most useful consequence of the above:
 Instead of hand-tuning "agent A gets Gaussian noise with σ=0.03", give agent *j* a sample of
 `n_j` battles from the true stratum-level DGP. Then:
 
-- its posterior over the win rate is an exact Beta/Normal update — no arbitrary noise model;
+- its posterior over the win rate is an exact Beta/Normal update, no arbitrary noise model;
 - information quality has a **unit**: one battle observed;
 - "how much is faster/better information worth?" becomes a measurable dollar-per-battle number;
 - ground truth `p*` is known exactly, so Brier score, calibration, and *resolution* can be
@@ -129,7 +129,7 @@ Instead of hand-tuning "agent A gets Gaussian noise with σ=0.03", give agent *j
 This is why the synthetic world is not a shortcut. For the core information-aggregation
 question it is **strictly better instrumentation** than real data, because real data gives you
 one realization and no `p*`. Real historical replay then serves as the external-validity test,
-which is exactly the right division of labour — and conveniently it is also the part that has
+which is exactly the right division of labour, and conveniently it is also the part that has
 to wait for the collector anyway.
 
 A second structural property worth exploiting, specific to these contracts:
@@ -145,7 +145,7 @@ is a genuinely distinctive feature of the asset class this project invents.
 
 ---
 
-## Part III — Two tracks
+## Part III: Two tracks
 
 ```
 TRACK A  (data)     day 1 ─────────────────────────────────────────────>  accrues forever
@@ -161,21 +161,21 @@ the agents, and the experiment harness never know which one is underneath.
 
 ---
 
-## Part IV — Phases
+## Part IV: Phases
 
 Each phase has an exit test. Do not start the next phase until it passes.
 
-### Phase 0 — Start the clock (days) — **DONE, pending an API key**
+### Phase 0: Start the clock (days): **DONE, pending an API key**
 Track A only, then leave it running.
 - Register an API key allow-listing the proxy address, not your own. No hosting decision needed.
 - Collector: rankings → player tags → battlelogs → append-only gzip JSONL, battles verbatim.
 - Snowball expansion through participant tags; SQLite frontier + dedupe index; restart-safe.
 - **Exit:** collector has run unattended for 72h and the deduplicated battle count is growing.
 
-Setup is in [collector.md](collector.md) — about ten minutes, zero cost. A laptop is a fine
+Setup is in [collector.md](collector.md), about ten minutes, zero cost. A laptop is a fine
 host; an always-on machine is strictly better only because it collects while you sleep.
 
-### Phase 1 — The economy (Python) — **DONE**
+### Phase 1: The economy (Python): **DONE**
 Contracts and settlement before any exchange, per the spec's Milestone 0.
 Implemented in detail in [ECONOMY.md](ECONOMY.md), including the open judgment calls.
 - Canonical metric definition, written down and frozen (stratified/standardized win rate with
@@ -187,7 +187,7 @@ Implemented in detail in [ECONOMY.md](ECONOMY.md), including the open judgment c
 - **Exit:** same contract + same dataset ⇒ byte-identical settlement digest, and a mutated
   reference-weight file changes that digest.
 
-### Phase 2 — Exchange kernel, Python reference — **DONE**
+### Phase 2: Exchange kernel, Python reference: **DONE**
 Deliberately in Python first.
 - Price-time priority book, limit/market/cancel/replace, partial fills, deterministic sequence
   numbers, trade tape, L2 snapshots.
@@ -196,37 +196,37 @@ Deliberately in Python first.
 - Property tests: no crossed book, conservation of quantity, replay determinism under seed.
 - **Exit:** adversarial matching-engine suite green; seeded run reproduces bit-for-bit.
 
-### Phase 3 — Minimal artificial market
+### Phase 3: Minimal artificial market
 - ~hundreds of noise agents, one fundamental agent, one inventory-skew market maker.
 - One instrument: a linear brawler-performance future.
 - **Exit:** a full session produces plausible order flow, trades, inventory, and PnL that
   survives eyeballing.
 
-### Phase 4 — C++ kernel, differential-tested against Phase 2
+### Phase 4: C++ kernel, differential-tested against Phase 2
 This is where the C++ half lands, and the ordering is the point: the Python engine becomes the
 **correctness oracle**, so the C++ port is validated rather than merely written.
 - C++20 core, `scikit-build-core` + CMake, **nanobind** bindings (vs pybind11: ~4× faster
   compiles, ~5× smaller binaries, ~10× lower call overhead, and one `ndarray` type that works
-  across NumPy/JAX/PyTorch — which matters given the JAX ambitions later).
-- Toolchain: MSVC Build Tools 14.50 / VS 2026 — defaults to C++20 and ships CMake 4.1.1, so
+  across NumPy/JAX/PyTorch, which matters given the JAX ambitions later).
+- Toolchain: MSVC Build Tools 14.50 / VS 2026, defaults to C++20 and ships CMake 4.1.1, so
   it is one install. *(Neither a compiler nor CMake is currently on this machine.)*
 - Differential test: identical order streams through both engines must produce identical tapes.
 - **Exit:** engines agree on randomized order streams; C++ is meaningfully faster on a
   throughput benchmark.
 
-### Phase 5 — Synthetic world + heterogeneous information
+### Phase 5: Synthetic world + heterogeneous information
 - `World` protocol; `SyntheticWorld` with a stratum-level DGP calibrated to whatever real data
   exists by then.
 - Agent information = `n_j` sampled battles. No-lookahead information interface.
 - **Exit:** an agent's forecast error scales as `1/√n_j` as theory demands.
 
-### Phase 6 — Experiment 1, done properly
+### Phase 6: Experiment 1, done properly
 - Market vs the **full baseline ladder** (best agent / simple mean / precision-weighted /
   recalibrated-extremized).
 - Brier decomposition into calibration + resolution + uncertainty against known `p*`.
 - **Exit:** a defensible result with error bars, including the case where the market *loses*.
 
-### Phase 7 — Multi-asset and microstructure — **mostly done**
+### Phase 7: Multi-asset and microstructure: **mostly done**
 Spreads, class indices, cross-market arbitrage, stat-arb; then latency tiers, maker/taker fees,
 queue position, adverse-selection diagnostics.
 
@@ -238,7 +238,7 @@ A **commodity** is written on an amount delivered rather than on a proportion, w
 makes its delivery window part of the contract and gives consecutive weeks a term
 structure instead of four copies of one thing. A **share** pays before it settles, which
 is the whole difference between a share and a future, and it needed a distribution that
-moves cash between holders while narrowing the range collateral is computed from — so
+moves cash between holders while narrowing the range collateral is computed from, so
 that meeting an obligation cannot be what makes an account insolvent.
 
 Deliberately not built: a perpetual. Every contract here settles inside a known interval,
@@ -302,16 +302,16 @@ wealth dynamics, carrying P&L across trials to see whether the market migrates f
 simple mean toward precision-weighting as capital tracks skill -- is the question the
 apparatus was built to answer.
 
-### Phase 8 — Real historical replay
+### Phase 8: Real historical replay
 Only now, once Track A has accrued enough. Same harness, `BrawlReplayWorld`, one real patch as
 the shock. This is the external-validity result.
 
-### Phase 9+ — Prediction-market venue (LMSR vs CLOB), options and event vol, margin and
+### Phase 9+: Prediction-market venue (LMSR vs CLOB), options and event vol, margin and
 liquidation cascades, dashboard. In that order.
 
 ---
 
-## Part V — Standing decisions
+## Part V: Standing decisions
 
 | Decision | Choice | Reason |
 |---|---|---|
@@ -330,12 +330,12 @@ liquidation cascades, dashboard. In that order.
 
 ## References
 
-- Supercell Brawl Stars API — https://developer.brawlstars.com/
-- Supercell Fan Content Policy — https://supercell.com/en/fan-content-policy/
-- Byrd, Hybinette & Balch, *ABIDES* — https://arxiv.org/abs/1904.12066
-- *Optimal Market Making in Prediction Markets* (2026) — https://arxiv.org/html/2607.17991v1
-- Avellaneda & Stoikov (2008) — https://doi.org/10.1080/14697680701381228
-- Kyle (1985) — https://www.jstor.org/stable/1913210
-- Atanasov et al., *Distilling the Wisdom of Crowds* — https://pubsonline.informs.org/doi/10.1287/mnsc.2015.2374
-- Frey et al., *JAX-LOB* (2023) — https://arxiv.org/abs/2308.13289
-- nanobind benchmarks — https://nanobind.readthedocs.io/en/latest/benchmark.html
+- Supercell Brawl Stars API, https://developer.brawlstars.com/
+- Supercell Fan Content Policy, https://supercell.com/en/fan-content-policy/
+- Byrd, Hybinette & Balch, *ABIDES*, https://arxiv.org/abs/1904.12066
+- *Optimal Market Making in Prediction Markets* (2026), https://arxiv.org/html/2607.17991v1
+- Avellaneda & Stoikov (2008), https://doi.org/10.1080/14697680701381228
+- Kyle (1985), https://www.jstor.org/stable/1913210
+- Atanasov et al., *Distilling the Wisdom of Crowds*, https://pubsonline.informs.org/doi/10.1287/mnsc.2015.2374
+- Frey et al., *JAX-LOB* (2023), https://arxiv.org/abs/2308.13289
+- nanobind benchmarks, https://nanobind.readthedocs.io/en/latest/benchmark.html

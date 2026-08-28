@@ -212,13 +212,13 @@ Most of the list below has been done since it was written; it is kept because
 the reasoning still holds and because the measured outcomes are recorded under
 each item. Struck items link to what actually happened.
 
-1. ~~Validate against stylized facts~~ — done, and three of four predictions
+1. ~~Validate against stylized facts~~, done, and three of four predictions
    were wrong.
-2. ~~Realistic order flow~~ — done. Power-law sizes, Hawkes arrivals. The cancel
+2. ~~Realistic order flow~~, done. Power-law sizes, Hawkes arrivals. The cancel
    rate reaches ~60%, not the >90% of real books; see below.
-3. ~~An arbitrageur~~ — written, measured, and **off by default**; see below.
-4. ~~Fees~~ — maker-taker, off by default.
-5. ~~Auctions and halts~~ — done, off by default.
+3. ~~An arbitrageur~~, written, measured, and **off by default**; see below.
+4. ~~Fees~~, maker-taker, off by default.
+5. ~~Auctions and halts~~, done, off by default.
 
 ### Still open, in the order that buys the most per unit of work
 
@@ -786,7 +786,7 @@ gives four consecutive weeks a term structure instead of four copies of the same
 thing. `battle_volume` is deliberately neither shrunk nor standardized:
 reweighting a count onto reference proportions produces a number that is the
 count of nothing. The consequence, stated in the metric and worth repeating, is
-that it measures volume **in the canonical corpus, not in the game** — a wider
+that it measures volume **in the canonical corpus, not in the game**, a wider
 crawl sees more battles. Sample-based volume indices trade on that footing in
 the real world; the honest move is to say so rather than imply a census.
 
