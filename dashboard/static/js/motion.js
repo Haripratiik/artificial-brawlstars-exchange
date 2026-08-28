@@ -11,8 +11,8 @@
  *     its new value says "this changed and here is by how much", which the
  *     static digits cannot. A panel that slides for its own sake charges an
  *     attention cost on every tick and repays nothing.
- *   * **Nothing is only motion.** Every animated change also has a static cue —
- *     a colour, a sign, a label — so a reader who missed the movement, or who
+ *   * **Nothing is only motion.** Every animated change also has a static cue,
+ *     a colour, a sign, a label, so a reader who missed the movement, or who
  *     has motion turned off entirely, loses nothing.
  *
  * The prediction-market design literature is explicit that aggressive red/green
@@ -37,7 +37,7 @@ export const EASE = 'cubicBezier(0.2, 0, 0, 1)';
  *
  * This is the one place a motion library earns its keep. Interpolating a value
  * over 260ms and reformatting it every frame is not something CSS can express,
- * and the design guidance for prediction markets asks for exactly this — a
+ * and the design guidance for prediction markets asks for exactly this, a
  * smooth transition in the 200-300ms band rather than a sudden jump.
  *
  * The element carries its own last value, so repeated calls chase the target
@@ -69,8 +69,8 @@ export function countTo(element, value, format = (v) => v.toFixed(2)) {
 /**
  * A staggered entrance for a set that has just appeared.
  *
- * Reserved for infrequent, staged moments — switching to a screen, a market
- * rebuild — where the sequence communicates that these are separate things.
+ * Reserved for infrequent, staged moments, switching to a screen, a market
+ * rebuild, where the sequence communicates that these are separate things.
  * Running it on every tick would be an animation nobody asked for, forty times
  * a minute.
  */

@@ -3,7 +3,7 @@
  * The views are pure functions of the store, which is what makes this possible:
  * node can import them directly and check the HTML they produce. What this
  * catches is the whole class of template bugs that look fine until someone
- * opens the page — a field renamed on the server showing up as `undefined`, a
+ * opens the page, a field renamed on the server showing up as `undefined`, a
  * number arriving as a string and rendering `NaN`, an object interpolated into
  * text as `[object Object]`.
  *
@@ -120,13 +120,13 @@ const lab = views.lab(store);
 check('lab shows the seed', lab.includes('c-seed'));
 check('lab lists fee schedules', lab.includes('maker-taker'));
 
-/* Formatting edge cases — every one of these has a wrong answer that renders. */
-check('price(null) is a dash', fmt.price(null) === '—', fmt.price(null));
-check('price("") is a dash', fmt.price('') === '—', fmt.price(''));
+/* Formatting edge cases, every one of these has a wrong answer that renders. */
+check('price(null) is a dash', fmt.price(null) === '-', fmt.price(null));
+check('price("") is a dash', fmt.price('') === '-', fmt.price(''));
 check('price(0) is still zero', fmt.price(0) === '0.00', fmt.price(0));
-check('money(null) is a dash', fmt.money(null) === '—', fmt.money(null));
+check('money(null) is a dash', fmt.money(null) === '-', fmt.money(null));
 check('money(0) is still zero', fmt.money(0) === '0.00', fmt.money(0));
-check('signed(null) is a dash', fmt.signed(null) === '—', fmt.signed(null));
+check('signed(null) is a dash', fmt.signed(null) === '-', fmt.signed(null));
 check('price("4660.25") formats', fmt.price('4660.25') === '4,660.25', fmt.price('4660.25'));
 check('money handles millions', fmt.money(2_500_000) === '2.50M', fmt.money(2_500_000));
 check('money marks negatives', fmt.money(-42).startsWith('−'), fmt.money(-42));
@@ -173,7 +173,7 @@ check('a future has no implied probability',
       fmt.impliedProbability(4660, { kind: 'linear', scale: 10000 }) === null);
 check('a missing payoff has no probability', fmt.impliedProbability(1, null) === null);
 check('percent formats', fmt.percent(0.425) === '42.5%', fmt.percent(0.425));
-check('percent of nothing is a dash', fmt.percent(null) === '—');
+check('percent of nothing is a dash', fmt.percent(null) === '-');
 
 /* ── a market must not print its own answer ───────────────────────────────
  *

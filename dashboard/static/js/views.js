@@ -10,7 +10,7 @@
  * backwards:
  *
  *   1. what the contract is, and the odds
- *   2. **how it resolves** — above the fold, not buried
+ *   2. **how it resolves**, above the fold, not buried
  *   3. the price history
  *   4. recent trades
  *   5. the order book, *collapsed by default*
@@ -18,7 +18,7 @@
  *
  * Leading with a depth ladder is right for an operator and wrong for everyone
  * else: it was the most technical thing on the page and it was the first thing
- * you saw, while the resolution rules were squeezed into a strip above it —
+ * you saw, while the resolution rules were squeezed into a strip above it,
  * which is the documented anti-pattern, burying the terms beneath the pricing.
  */
 
@@ -35,7 +35,7 @@ import {
  * The venue's own vocabulary is precise and unhelpful for browsing: "event" is
  * a prediction market and "call"/"put" are options. Grouping under these makes
  * the shape of the exchange visible, which a flat grid of seven tiles does not
- * — you could not tell, looking at the old page, that this venue lists
+ *, you could not tell, looking at the old page, that this venue lists
  * prediction markets and options at all.
  */
 const CLASS_GROUPS = [
@@ -172,7 +172,7 @@ export function matches(symbol, book, query) {
  */
 export function marketState(book) {
   if (!book?.session || book.session === 'continuous') return null;
-  const words = { pre_open: 'Opening auction', auction: 'Halted — auction',
+  const words = { pre_open: 'Opening auction', auction: 'Halted, auction',
                   closed: 'Closed' };
   const label = words[book.session] ?? book.session;
   return book.indicative ? `${label}, indicative ${price(book.indicative)}` : label;
@@ -349,7 +349,7 @@ function contractHead(symbol, book, meta, session) {
              <span>Implied Odds</span></div>`
         : ''}
       <div class="stat big"><b class="mono">${price(book.mark)}</b><span>Last</span></div>
-      <div class="stat"><b class="mono">${book.spread == null ? '—' : price(book.spread)}</b><span>Spread</span></div>
+      <div class="stat"><b class="mono">${book.spread == null ? '-' : price(book.spread)}</b><span>Spread</span></div>
       <div class="stat"><b class="mono">${count(book.trades)}</b><span>Trades</span></div>
       <div class="stat"><b class="mono">${expiry(book.contract, meta)}</b><span>Expiry</span></div>
     </div>
@@ -377,7 +377,7 @@ function resolution(book, meta) {
       <li><span>Measured over</span>
           <b>the observation window ending ${esc(book.contract?.expiry ?? 'expiry')}</b></li>
       <li><span>${stream ? 'Can be worth' : 'Settles between'}</span>
-          <b class="mono">${bounds || '—'}</b></li>
+          <b class="mono">${bounds || '-'}</b></li>
       ${stream
         ? `<li><span>Pays</span><b>${count(stream.periods)} times, the last on
              ${esc(stream.last)}</b></li>`
@@ -416,7 +416,7 @@ function specification(book) {
   return `<table><tbody>${rows
     .map(([label, value]) => `<tr>
       <td style="text-align:left" class="faint">${esc(label)}</td>
-      <td>${value == null || value === '' ? '—' : esc(String(value))}</td>
+      <td>${value == null || value === '' ? '-' : esc(String(value))}</td>
     </tr>`)
     .join('')}</tbody></table>`;
 }
@@ -426,7 +426,7 @@ function specification(book) {
  *
  * Bids and asks share a price column so the shape of the book is one vertical
  * scan; the bars show *cumulative* size, because that is what answers the
- * question anyone sizing an order is actually asking — what it costs to get
+ * question anyone sizing an order is actually asking, what it costs to get
  * through a level. Each row fills the ticket at its price.
  */
 function ladder(book, depth) {
@@ -475,7 +475,7 @@ function ladder(book, depth) {
  *
  * Everything a first-time trader needs is visible: which side, how many, and
  * what it costs against what it pays. Limit price, time in force and post-only
- * are real and reachable, but they sit behind a disclosure — a form that opens
+ * are real and reachable, but they sit behind a disclosure, a form that opens
  * on "time in force" has already lost most of the people looking at it.
  */
 function ticket(symbol, book, session) {
@@ -724,7 +724,7 @@ export function research(store) {
   const rows = (diagnostics?.verdicts ?? [])
     .map((v) => `<tr>
       <td style="text-align:left">${esc(v.name)}</td>
-      <td>${v.value == null ? '—' : Number(v.value).toFixed(3)}</td>
+      <td>${v.value == null ? '-' : Number(v.value).toFixed(3)}</td>
       <td class="faint" style="text-align:left">${esc(v.expected)}</td>
       <td class="${v.verdict === 'as expected' ? 'verdict-ok' : 'verdict-no'}">${esc(v.verdict)}</td>
     </tr>`)
@@ -737,7 +737,7 @@ export function research(store) {
         <span class="faint mono" style="margin-left:6px">${esc(a.kind)}</span></td>
       <td>${count(a.fills)}</td>
       <td class="${a.rejects ? 'down' : 'faint'}">${count(a.rejects)}</td>
-      <td>${a.equity == null ? '—' : money(a.equity)}</td>
+      <td>${a.equity == null ? '-' : money(a.equity)}</td>
       <td><button type="button" class="minor ${a.halted ? '' : 'danger'}"
               data-act="${a.halted ? 'revive' : 'kill'}" data-agent="${esc(a.id)}">
             ${a.halted ? 'Let back in' : 'Stop'}</button></td>
@@ -785,7 +785,7 @@ export function lab(store) {
 
   const schedules = Object.entries(s.fee_schedules || {})
     .map(([name, f]) => `<option value="${esc(name)}" ${name === c.fees ? 'selected' : ''}>
-        ${esc(name)} — taker ${f.taker_bps}bp / maker ${f.maker_bps}bp
+        ${esc(name)}, taker ${f.taker_bps}bp / maker ${f.maker_bps}bp
       </option>`)
     .join('');
 
@@ -869,7 +869,7 @@ export function lab(store) {
               <tr><td style="text-align:left">Taker fee</td><td>${s.fees.taker_bps} bp</td></tr>
               <tr><td style="text-align:left">Maker fee</td><td>${s.fees.maker_bps} bp</td></tr>
               <tr><td style="text-align:left">Fees collected</td><td>${money(Number(s.fees_collected) / 1e6)}</td></tr>
-              <tr><td style="text-align:left">Price band</td><td>${s.price_band ?? '—'}</td></tr>
+              <tr><td style="text-align:left">Price band</td><td>${s.price_band ?? '-'}</td></tr>
               <tr><td style="text-align:left">Uptime</td><td>${(s.uptime || 0).toFixed(0)}s</td></tr>
             </tbody></table>
           </div>
@@ -905,8 +905,8 @@ export function lab(store) {
                 .map((h) => `<tr>
                   <td style="text-align:left">${esc(h.symbol)}</td>
                   <td style="text-align:left" class="${h.reason === 'price_band' ? 'down' : 'dim'}">${esc(h.reason)}</td>
-                  <td>${h.reference ?? '—'}</td>
-                  <td>${h.price ?? '—'}</td>
+                  <td>${h.reference ?? '-'}</td>
+                  <td>${h.price ?? '-'}</td>
                 </tr>`)
                 .join('')}</tbody></table>`
           : `<div class="empty">No halts this session.</div>`

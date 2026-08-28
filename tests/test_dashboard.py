@@ -1,7 +1,7 @@
 """The exchange website: its API, and the views rendered against real data.
 
 Two halves. The Python half exercises the HTTP and WebSocket surface against a
-running market. The JavaScript half runs under node — the views are pure
+running market. The JavaScript half runs under node, the views are pure
 functions of a store, so they can be rendered and inspected without a browser,
 which catches the class of bug that looks fine until someone opens the page: a
 server-side rename surfacing as ``undefined``, a decimal string rendering as

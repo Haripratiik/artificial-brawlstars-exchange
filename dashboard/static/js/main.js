@@ -8,7 +8,7 @@
  *
  * The store is a plain object and the views are pure functions of it, so a tick
  * is just: merge, re-render. The one thing deliberately *not* re-rendered on a
- * tick is the order ticket — rewriting an input while somebody is typing into
+ * tick is the order ticket, rewriting an input while somebody is typing into
  * it is the fastest way to make a trading screen unusable.
  */
 
@@ -69,7 +69,7 @@ function connect() {
   };
 
   socket.onclose = () => {
-    toast('Disconnected — retrying', true);
+    toast('Disconnected, retrying', true);
     setTimeout(connect, 1200);
   };
 }
@@ -141,8 +141,8 @@ async function refreshSymbol() {
  * Rendering is decoupled from the socket.
  *
  * Snapshots arrive twenty times a second. Rebuilding the main panel that often
- * was wasteful — the display cannot show more than sixty frames and the socket
- * bursts can stack several messages into one frame — but the real damage was
+ * was wasteful, the display cannot show more than sixty frames and the socket
+ * bursts can stack several messages into one frame, but the real damage was
  * not the CPU:
  *
  *   * **Focus was destroyed every 50ms.** Replacing the subtree removes the
@@ -463,7 +463,7 @@ function bind() {
  * pay. It is all computable from the depth already on screen.
  *
  * The worst case is exact rather than estimated, because every contract here
- * settles inside a known interval — a long position cannot lose more than the
+ * settles inside a known interval, a long position cannot lose more than the
  * distance from its price down to the floor, and a short cannot lose more than
  * the distance up to the ceiling. That is the same arithmetic the venue uses to
  * hold collateral, so the number on the ticket is the number being reserved.
@@ -530,7 +530,7 @@ function updatePreview() {
   if (risk != null) rows.push(['Max loss', money(risk)]);
 
   // A binary pays a fixed amount, so the useful framing is what you win and
-  // what you staked — not a notional.
+  // what you staked, not a notional.
   if (payoff?.kind === 'binary') {
     const payout = Number(payoff.payout) * quantity;
     const stake = buying ? average * quantity : (Number(payoff.payout) - average) * quantity;
@@ -540,7 +540,7 @@ function updatePreview() {
   }
 
   const warning = walk && !walk.complete
-    ? `<div class="warn">Book holds only ${count(walk.filled)} — ${count(walk.shortfall)} would not fill.</div>`
+    ? `<div class="warn">Book holds only ${count(walk.filled)}, ${count(walk.shortfall)} would not fill.</div>`
     : '';
 
   panel.innerHTML =
@@ -577,7 +577,7 @@ async function act(action, data) {
       const result = await json(`/api/participant/${encodeURIComponent(data.agent)}/${action}`,
                                 { method: 'POST' });
       toast(action === 'kill'
-        ? `Stopped ${result.agent_id} — pulled ${(result.symbols ?? []).length} book(s)`
+        ? `Stopped ${result.agent_id}, pulled ${(result.symbols ?? []).length} book(s)`
         : `${result.agent_id} let back in`);
       refreshSlow();
     } catch (failure) {
@@ -652,7 +652,7 @@ async function rebuild() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    toast(`Rebuilt — generation ${result.generation}`);
+    toast(`Rebuilt, generation ${result.generation}`);
     store.history = {};
     refreshSlow();
   } catch (failure) {

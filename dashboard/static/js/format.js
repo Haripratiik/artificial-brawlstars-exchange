@@ -2,7 +2,7 @@
  *
  * Charts are hand-built SVG rather than a library. A price line and a sparkline
  * are perhaps forty lines each, and a charting dependency would bring its own
- * colour scheme, its own fonts and its own opinions about axes — all of which
+ * colour scheme, its own fonts and its own opinions about axes, all of which
  * would have to be fought back to match the terminal. Owning them is cheaper
  * than overriding them.
  */
@@ -15,7 +15,7 @@ export const esc = (s) =>
  * Absent, as distinct from zero.
  *
  * `Number(null)` and `Number('')` are both 0, which is finite, so a missing
- * mark rendered as "0.00" — a contract nobody had quoted looked like a
+ * mark rendered as "0.00", a contract nobody had quoted looked like a
  * contract worth nothing. On a screen people trade from, those must never be
  * the same glyph.
  */
@@ -26,7 +26,7 @@ const missing = (v) => v == null || v === '';
  *
  * `toLocaleString` constructs an `Intl.NumberFormat` on every call, and this
  * runs inside a render loop that fires twenty times a second across a book, a
- * ladder, a tape and a watchlist — thousands of constructions a second to
+ * ladder, a tape and a watchlist, thousands of constructions a second to
  * produce a few hundred numbers.
  *
  * They are pinned to en-US rather than the viewer's locale, which is a
@@ -51,16 +51,16 @@ const INTEGER = new Intl.NumberFormat('en-US');
 
 /** Prices arrive as decimal strings so the server never rounds for us. */
 export function price(value, dp = 2) {
-  if (missing(value)) return '—';
+  if (missing(value)) return '-';
   const n = Number(value);
-  if (!Number.isFinite(n)) return '—';
+  if (!Number.isFinite(n)) return '-';
   return formatter(dp).format(n);
 }
 
 export function money(value) {
-  if (missing(value)) return '—';
+  if (missing(value)) return '-';
   const n = Number(value);
-  if (!Number.isFinite(n)) return '—';
+  if (!Number.isFinite(n)) return '-';
   const sign = n < 0 ? '−' : '';
   const abs = Math.abs(n);
   if (abs >= 1e6) return `${sign}${(abs / 1e6).toFixed(2)}M`;
@@ -69,9 +69,9 @@ export function money(value) {
 }
 
 export function signed(value, dp = 2) {
-  if (missing(value)) return '—';
+  if (missing(value)) return '-';
   const n = Number(value);
-  if (!Number.isFinite(n)) return '—';
+  if (!Number.isFinite(n)) return '-';
   return `${n > 0 ? '+' : n < 0 ? '−' : ''}${Math.abs(n).toFixed(dp)}`;
 }
 
@@ -153,7 +153,7 @@ export function impliedProbability(mark, payoff) {
 }
 
 export function percent(fraction, dp = 1) {
-  if (fraction == null || !Number.isFinite(fraction)) return '—';
+  if (fraction == null || !Number.isFinite(fraction)) return '-';
   return `${(fraction * 100).toFixed(dp)}%`;
 }
 
@@ -221,7 +221,7 @@ export function sparkline(values, { width = 200, height = 34 } = {}) {
  *
  * Drawn at a fixed internal size and stretched, except for text and strokes,
  * which use non-scaling units so a wide panel does not produce stretched
- * letterforms — the failure that makes hand-rolled SVG charts look amateur.
+ * letterforms, the failure that makes hand-rolled SVG charts look amateur.
  */
 export function priceChart(values, { settlesAt = null, label = '' } = {}) {
   const pts = values.filter((v) => v != null && Number.isFinite(v));

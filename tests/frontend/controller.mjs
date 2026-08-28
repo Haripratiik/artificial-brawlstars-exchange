@@ -3,7 +3,7 @@
  * The controller had no coverage at all, which is awkward for the file that
  * owns the socket, the render loop and every event binding. A full DOM
  * emulator would be a heavy dependency for a project with no build step, so
- * this stubs the handful of APIs main.js actually touches — enough to catch a
+ * this stubs the handful of APIs main.js actually touches, enough to catch a
  * load-time error, and enough to assert the property that matters:
  *
  *   snapshots arrive at 20Hz, and the expensive subtree must NOT be rebuilt
