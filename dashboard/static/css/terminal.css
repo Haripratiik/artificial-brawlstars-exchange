@@ -1,4 +1,4 @@
-/* Arena Markets, terminal styling.
+/* Artificial Brawl Stars Exchange, terminal styling.
  *
  * The aesthetic is a trading desk, not a fintech landing page: dense, hairline
  * ruled, monospaced wherever numbers must align, and dark because this is a
@@ -49,6 +49,26 @@
    * the control is. Splitting them lets the rules stay whisper-quiet while
    * inputs and buttons clear 3:1. */
   --control-edge: #5f5f71;
+
+  /* Type scale. There was not one: 71 font-size declarations carried 19
+   * distinct values, including 8, 8.5, 9, 9.5, 10, 10.5, 11, 11.5, 13.5. The
+   * half-pixel steps are the tell -- they are nudges rather than decisions,
+   * and a reader cannot perceive a 0.5px difference as hierarchy, only as
+   * noise. Sixteen elements in the static shell alone sat below 12px, which
+   * is the floor most guidance puts on text a person has to read.
+   *
+   * Seven steps, no half pixels. `--t-micro` is the only value under 12px and
+   * it is reserved for uppercase letter-spaced labels, which read
+   * considerably larger than their nominal size because every glyph is
+   * cap-height.
+   */
+  --t-micro: 10px;
+  --t-xs: 11px;
+  --t-sm: 12px;
+  --t-base: 13px;
+  --t-lg: 15px;
+  --t-xl: 18px;
+  --t-hero: 24px;
 
   --mono: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
   --display: 'Chivo', system-ui, sans-serif;
@@ -162,7 +182,7 @@ header {
 }
 .brand small {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.16em;
   color: var(--ink-faint);
   text-transform: uppercase;
@@ -176,13 +196,19 @@ header {
 }
 .stat b {
   font-family: var(--mono);
-  font-weight: 500;
-  font-size: 12px;
-  letter-spacing: -0.01em;
+  font-weight: 600;
+  /* The figure, not its caption, is what a person came to read. It was 12px
+   * against an 8.5px label -- a ratio of 1.4, which is not enough separation
+   * to register as hierarchy, so the header read as four evenly grey blocks.
+   * Equity and P&L are now the largest text in the header, ahead of the
+   * brand, which is the correct order of importance on a trading screen. */
+  font-size: var(--t-lg);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
 }
 .stat span {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -196,7 +222,7 @@ header {
   align-items: center;
   gap: 7px;
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--ink-dim);
@@ -211,7 +237,7 @@ header {
 
 .speed { display: flex; align-items: center; gap: 6px; }
 .speed input { width: 90px; accent-color: var(--amber); }
-.speed b { font-family: var(--mono); font-size: 11px; min-width: 38px; color: var(--amber); }
+.speed b { font-family: var(--mono); font-size: 12px; min-width: 38px; color: var(--amber); }
 
 /* ── rail ───────────────────────────────────────────────────────────── */
 
@@ -229,7 +255,7 @@ nav {
   width: 100%;
   text-align: left;
   padding: 7px 16px;
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.11em;
   text-transform: uppercase;
   color: var(--ink-dim);
@@ -246,7 +272,7 @@ nav {
 .watch-head {
   padding: 9px 16px 6px;
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10px;
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -262,7 +288,7 @@ nav {
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 2px 8px;
-  padding: 7px 16px;
+  padding: 8px 16px;
   border-left: 2px solid transparent;
   border-bottom: 1px solid var(--rule);
   cursor: pointer;
@@ -270,10 +296,20 @@ nav {
 }
 .watch:hover { background: var(--panel); }
 .watch[aria-current='true'] { background: var(--amber-sunk); border-left-color: var(--amber); }
-.watch .sym { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: -0.02em; }
-.watch .px { font-family: var(--mono); font-size: 11.5px; text-align: right; }
-.watch .cls { font-size: 9px; color: var(--ink-faint); letter-spacing: 0.06em; text-transform: uppercase; }
-.watch .chg { font-family: var(--mono); font-size: 9.5px; text-align: right; }
+.watch .sym { font-family: var(--mono); font-size: var(--t-sm); font-weight: 600; letter-spacing: -0.02em; }
+/* The price led the row at 11.5px against a 9px category tag: the number a
+ * person scans the list for was within half a pixel of the label describing
+ * it. It now leads by a clear step over every other field on the row. */
+.watch .px {
+  font-family: var(--mono);
+  font-size: var(--t-lg);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.watch .cls { font-size: 10px; color: var(--ink-faint); letter-spacing: 0.06em; text-transform: uppercase; }
+.watch .chg { font-family: var(--mono); font-size: 11px; text-align: right; }
 .watch .spark { grid-column: 1 / -1; height: 16px; margin-top: 3px; }
 
 /* ── main ───────────────────────────────────────────────────────────── */
@@ -299,7 +335,7 @@ main { overflow: hidden; display: flex; flex-direction: column; }
 
 .panel > h2 {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.17em;
   text-transform: uppercase;
@@ -320,7 +356,7 @@ main { overflow: hidden; display: flex; flex-direction: column; }
 table { width: 100%; border-collapse: collapse; }
 th {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10px;
   font-weight: 500;
   letter-spacing: 0.13em;
   text-transform: uppercase;
@@ -336,13 +372,13 @@ th {
 th:first-child, td:first-child { text-align: left; }
 td {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 12px;
   padding: 5px 10px;
   text-align: right;
   border-bottom: 1px solid rgba(35, 35, 43, 0.55);
 }
 tbody tr:hover { background: var(--raised); }
-.empty { padding: 18px 11px; color: var(--ink-faint); font-size: 11px; font-family: var(--mono); }
+.empty { padding: 18px 11px; color: var(--ink-faint); font-size: 12px; font-family: var(--mono); }
 
 /* ── markets grid ───────────────────────────────────────────────────── */
 
@@ -378,16 +414,16 @@ tbody tr:hover { background: var(--raised); }
 .card .row1 { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .card .sym { font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: -0.02em; }
 .card .kind {
-  font-size: 8.5px; letter-spacing: 0.14em; text-transform: uppercase;
+  font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
   color: var(--ink-faint); font-family: var(--mono);
 }
 .card .price { font-family: var(--mono); font-size: 25px; font-weight: 400; letter-spacing: -0.035em; margin: 7px 0 1px; }
-.card .sub { display: flex; gap: 12px; font-family: var(--mono); font-size: 10px; color: var(--ink-dim); }
+.card .sub { display: flex; gap: 12px; font-family: var(--mono); font-size: 11px; color: var(--ink-dim); }
 .card .spark { height: 34px; margin-top: 9px; }
 
 /* ── ladder, the signature element ─────────────────────────────────── */
 
-.ladder { font-family: var(--mono); font-size: 11.5px; }
+.ladder { font-family: var(--mono); font-size: 12px; }
 .lad-row {
   width: 100%;
   font: inherit;
@@ -445,7 +481,7 @@ tbody tr:hover { background: var(--raised); }
   padding: 8px;
   min-height: 24px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   border: 1px solid var(--control-edge);
@@ -461,7 +497,7 @@ tbody tr:hover { background: var(--raised); }
 
 .field { display: flex; flex-direction: column; gap: 3px; }
 .field label {
-  font-family: var(--mono); font-size: 8.5px; letter-spacing: 0.14em;
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em;
   text-transform: uppercase; color: var(--ink-faint);
 }
 .field input, .field select {
@@ -481,7 +517,7 @@ tbody tr:hover { background: var(--raised); }
   background: var(--amber);
   color: #16120a;
   font-weight: 700;
-  font-size: 11px;
+  font-size: 12px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   transition: background var(--tick);
@@ -495,7 +531,7 @@ tbody tr:hover { background: var(--raised); }
   padding: 6px 8px;
   border: 1px solid var(--control-edge);
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 11px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--ink-dim);
@@ -532,13 +568,13 @@ tbody tr:hover { background: var(--raised); }
 .instrument-bar[data-session='pre_open'] { border-left-color: var(--amber); }
 .instrument-bar[data-session='closed'] { border-left-color: var(--closed); }
 
-.instrument-bar .name { font-family: var(--mono); font-size: 16px; font-weight: 600; letter-spacing: -0.03em; }
-.instrument-bar .terms { font-size: 10.5px; color: var(--ink-dim); max-width: 400px; line-height: 1.45; }
+.instrument-bar .name { font-family: var(--mono); font-size: 17px; font-weight: 600; letter-spacing: -0.03em; }
+.instrument-bar .terms { font-size: 11px; color: var(--ink-dim); max-width: 400px; line-height: 1.45; }
 .instrument-bar .terms code { font-family: var(--mono); color: var(--amber); }
 
 .badge {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10px;
   letter-spacing: 0.15em;
   text-transform: uppercase;
   padding: 3px 7px;
@@ -556,11 +592,11 @@ tbody tr:hover { background: var(--raised); }
 .verdict-no { color: var(--halt); }
 
 .controls { padding: 12px; display: flex; flex-direction: column; gap: 11px; }
-.check { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--ink-dim); }
+.check { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-dim); }
 .check input { accent-color: var(--amber); width: 14px; height: 14px; }
 
 .note {
-  font-size: 10.5px;
+  font-size: 11px;
   line-height: 1.55;
   color: var(--ink-faint);
   border-left: 2px solid var(--rule-bright);
@@ -580,7 +616,7 @@ tbody tr:hover { background: var(--raised); }
   border-left: 2px solid var(--amber);
   padding: 9px 13px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 12px;
   animation: rise 0.2s ease-out;
 }
 .toast.bad { border-left-color: var(--down); color: var(--down); }
@@ -625,7 +661,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   padding: 5px 0;
   min-height: 24px;
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 11px;
   border: 1px solid var(--control-edge);
   color: var(--ink-dim);
   transition: border-color var(--tick), color var(--tick);
@@ -651,7 +687,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 }
 .preview span {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10px;
   letter-spacing: 0.13em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -660,7 +696,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .preview .warn {
   display: block;
   color: var(--halt);
-  font-size: 10px;
+  font-size: 11px;
   line-height: 1.4;
   border-top: 1px solid var(--rule);
   padding-top: 6px;
@@ -710,7 +746,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 /* The contract as a question. This is the line that tells someone what they
  * would be betting on, so it gets the weight, not the ticker. */
 .question {
-  font-size: 13.5px;
+  font-size: 13px;
   line-height: 1.4;
   color: var(--ink);
   text-wrap: balance;
@@ -722,7 +758,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   display: flex;
   justify-content: space-between;
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -768,7 +804,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 }
 .resolution h2 {
   font-family: var(--mono);
-  font-size: 9px;
+  font-size: 10px;
   letter-spacing: 0.17em;
   text-transform: uppercase;
   color: var(--amber);
@@ -779,13 +815,13 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .resolution li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 12px; }
 .resolution li > span {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10px;
   letter-spacing: 0.13em;
   text-transform: uppercase;
   color: var(--ink-faint);
   min-width: 148px;
 }
-.resolution li > em { font-style: normal; font-size: 11px; color: var(--ink-faint); flex-basis: 100%; padding-left: 156px; }
+.resolution li > em { font-style: normal; font-size: 12px; color: var(--ink-faint); flex-basis: 100%; padding-left: 156px; }
 
 .chart-body { padding: 6px; min-height: 260px; }
 
@@ -816,14 +852,14 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .drop[open] > summary { border-bottom-color: var(--rule); }
 .drop > summary:hover { background: var(--raised); }
 .drop > summary h2 { border: none; padding: 0; }
-.hint { font-size: 10.5px; color: var(--ink-faint); }
+.hint { font-size: 11px; color: var(--ink-faint); }
 
 .advanced { border-top: 1px solid var(--rule); padding-top: 9px; }
 .advanced > summary {
   list-style: none;
   cursor: pointer;
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 11px;
   letter-spacing: 0.13em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -841,7 +877,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .sides button em {
   font-style: normal;
   font-family: var(--display);
-  font-size: 9.5px;
+  font-size: 11px;
   letter-spacing: 0.02em;
   text-transform: none;
   opacity: 0.7;
@@ -851,7 +887,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .pos > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .pos span {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10px;
   letter-spacing: 0.13em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -869,12 +905,12 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .figure { padding: 14px; gap: 5px; }
 .figure span {
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10px;
   letter-spacing: 0.15em;
   text-transform: uppercase;
   color: var(--ink-faint);
 }
-.figure b { font-size: 24px; letter-spacing: -0.035em; }
+.figure b { font-size: 25px; letter-spacing: -0.035em; }
 
 /* ── empty and first-run states ─────────────────────────────────────── */
 
@@ -887,7 +923,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .nav-group {
   padding: 10px 16px 5px;
   font-family: var(--mono);
-  font-size: 8.5px;
+  font-size: 10px;
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -910,7 +946,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   border: 1px solid var(--control-edge);
   color: var(--ink);
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 12px;
   padding: 7px 9px;
   outline: none;
   transition: border-color 130ms cubic-bezier(0.2, 0, 0, 1);
@@ -943,14 +979,14 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   border-bottom: 1px solid var(--rule);
 }
 .class-head h2 {
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 700;
   letter-spacing: -0.015em;
   color: var(--ink);
 }
-.class-head span { font-size: 11.5px; color: var(--ink-faint); flex: 1; }
+.class-head span { font-size: 12px; color: var(--ink-faint); flex: 1; }
 .class-head b {
-  font-size: 10px;
+  font-size: 11px;
   color: var(--amber);
   border: 1px solid var(--control-edge);
   padding: 1px 7px;
@@ -1022,7 +1058,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   list-style: none;
   cursor: pointer;
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 11px;
   letter-spacing: 0.13em;
   text-transform: uppercase;
   color: var(--ink-faint);
@@ -1050,14 +1086,14 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   min-height: 26px;
   color: var(--ink-dim);
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 11px;
   letter-spacing: 0.08em;
   cursor: pointer;
   transition-property: color, border-color, background-color;
   transition-duration: 130ms;
   transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
 }
-.whoami .ghost span { color: var(--up); font-size: 8px; }
+.whoami .ghost span { color: var(--up); font-size: 10px; }
 .whoami .ghost b { color: var(--ink); font-weight: 500; }
 .whoami .ghost:hover { color: var(--ink); border-color: var(--ink-faint); }
 .whoami .ghost:active { scale: 0.96; }
@@ -1073,7 +1109,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   border-radius: 3px;
   color: var(--amber);
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }

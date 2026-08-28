@@ -108,4 +108,70 @@ def test_every_palette_token_is_a_six_digit_hex():
     declared = set(re.findall(r"--([\w-]+):", root))
     parsed = set(tokens())
     non_colour = {"mono", "display", "rail", "tick", "amber-sunk", "up-sunk", "down-sunk"}
-    assert declared - parsed - non_colour == set()
+
+    # The type scale lives in the same block, under a `t-` namespace. Adding
+    # those seven names to `non_colour` would widen the very hole this test
+    # exists to close, so they are checked rather than skipped -- just against
+    # a different rule. Every one has to be a whole-pixel length, which is what
+    # stops the half-pixel steps creeping back: the stylesheet used to carry
+    # 8.5, 9.5, 10.5, 11.5 and 13.5px, and a half-pixel difference is not
+    # hierarchy a reader can perceive, only noise they cannot name.
+    type_tokens = {name for name in declared if name.startswith("t-")}
+    assert type_tokens, "the type scale has gone from :root"
+    for name in sorted(type_tokens):
+        value = re.search(rf"--{name}:\s*([^;]+);", root).group(1).strip()
+        assert re.fullmatch(r"\d+px", value), (
+            f"--{name} is {value!r}; the scale is whole pixels only"
+        )
+
+    assert declared - parsed - non_colour - type_tokens == set()
+
+
+def test_no_text_is_smaller_than_the_scale_allows():
+    """Ten pixels is the floor, and it is a floor rather than a target.
+
+    The stylesheet reached 71 font-size declarations carrying 19 distinct
+    values, nine of them below 12px and the smallest at 8px. Measured in the
+    browser on the static shell alone, sixteen elements rendered under 12px,
+    including the primary navigation at 11px and every header stat label at
+    8.5px -- while the largest text on the page was the 15px brand. An
+    interface whose entire type range is 8 to 15px has no hierarchy available
+    to it: everything arrives at the reader with the same weight, and half of
+    it is too small to read without leaning in.
+
+    Density on a trading screen comes from tight spacing and hairline rules,
+    not from shrinking the text until it fits.
+    """
+    text = CSS.read_text(encoding="utf-8")
+    sizes = [float(v) for v in re.findall(r"font-size:\s*([\d.]+)px", text)]
+    assert sizes, "no font sizes found; the parser has drifted from the file"
+
+    too_small = sorted({s for s in sizes if s < 10})
+    assert not too_small, f"text below the 10px floor: {too_small}"
+
+    fractional = sorted({s for s in sizes if s != int(s)})
+    assert not fractional, (
+        f"half-pixel sizes are nudges rather than decisions: {fractional}"
+    )
+
+
+def test_the_figures_outrank_their_labels():
+    """A number a person came to read must beat the caption describing it.
+
+    Both of these led by less than half a pixel over their own label. The
+    header stat was 12px against an 8.5px caption, and in the market rail the
+    price was 11.5px against a 9px category tag, so a list a person scans for
+    prices gave the price no more presence than the word 'future' beside it.
+    """
+    text = CSS.read_text(encoding="utf-8")
+
+    def size_of(selector: str) -> str:
+        block = text.split(selector, 1)[1].split("}", 1)[0]
+        found = re.search(r"font-size:\s*([^;]+);", block)
+        assert found, f"{selector} no longer sets a font size"
+        return found.group(1).strip()
+
+    # Both resolve through the scale rather than a literal, which is the point:
+    # a figure that is sized by hand drifts away from its caption again.
+    assert size_of(".stat b {") == "var(--t-lg)"
+    assert size_of(".watch .px {") == "var(--t-lg)"
