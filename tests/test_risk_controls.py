@@ -44,6 +44,7 @@ from arena.exchange.events import (
 from arena.exchange.types import (
     AgentId,
     OrderType,
+    PegReference,
     Price,
     Quantity,
     RejectReason,
@@ -401,3 +402,422 @@ def test_the_ledger_stays_exactly_balanced_through_limits_kills_and_revivals():
     assert venue.engine("F").tape, "nothing traded, so the run proved nothing"
     assert refusals > 0, "nothing was rate limited, so the run proved nothing"
     assert venue.conservation_check() == 0
+
+
+# --------------------------------------------------------------------------
+# Neither control may trap a participant in its own orders
+# --------------------------------------------------------------------------
+
+
+def test_a_participant_at_its_cap_can_still_withdraw_an_order():
+    """The rule the kill switch already keeps, kept by the other control too.
+
+    A participant at its message cap could not cancel: measured at a cap of
+    five, it sent five orders and then every attempt to pull one came back
+    RATE_LIMITED, through five retries, with fifty lots still standing in the
+    book. That is the same failure refusing a stopped participant's cancels
+    would be -- unable to place, unable to withdraw, holding exposure nobody is
+    permitted to manage -- arriving by the other door.
+
+    A cancel is also the one command that only ever makes things smaller: less
+    risk for the participant and less book for the venue. Refusing it is the
+    one refusal that makes both sides worse off.
+    """
+    clock = {"now": 0}
+    venue = _limited_venue(5, clock)
+
+    ids = []
+    for i in range(5):
+        ids.append(_order_id(_send(venue, "a", B, 18_600 - i, 10)))
+    assert _resting(venue, "F", "a") == [10] * 5
+    assert _reason(_send(venue, "a", B, 18_500, 10)) is RejectReason.RATE_LIMITED
+
+    for order_id in ids:
+        events = venue.submit(AgentId("a"), "F", Cancel(AgentId("a"), order_id))
+        assert RejectReason.RATE_LIMITED not in _reasons(events)
+    assert _resting(venue, "F", "a") == []
+    assert venue.conservation_check() == 0
+
+
+def test_a_cancel_is_still_counted_against_the_allowance():
+    """Never refused is not the same as free.
+
+    A burst of cancels is still traffic the venue has to take, so it still
+    costs the sender its ability to add anything. Exempting them from the count
+    as well would hand any participant an unmetered channel, which is the thing
+    the limit exists to deny.
+    """
+    clock = {"now": 0}
+    venue = _limited_venue(4, clock)
+    ids = [_order_id(_send(venue, "a", B, 18_600 - i, 10)) for i in range(2)]
+
+    for order_id in ids:
+        venue.submit(AgentId("a"), "F", Cancel(AgentId("a"), order_id))
+
+    # Two orders and two cancels is the whole allowance for this second.
+    assert _reason(_send(venue, "a", B, 18_400, 10)) is RejectReason.RATE_LIMITED
+
+
+# --------------------------------------------------------------------------
+# The kill switch believes the book
+# --------------------------------------------------------------------------
+
+
+def test_the_kill_switch_pulls_a_market_on_open_order():
+    """A kill switch that walks past an order is not a kill switch.
+
+    A market-on-open order names no price, so nothing was ever written into the
+    venue's record of what the participant is working -- and the record was the
+    only place the kill switch looked. Measured: ``kill`` reported the symbol
+    as pulled while a 40-lot market-on-open buy stayed standing, and the
+    stopped participant then took 40 lots in the very auction it had been
+    stopped before.
+    """
+    venue = _venue()
+    venue.begin_session("F")
+    _send(venue, "a", B, 18_600, 30)
+    _send(venue, "a", B, None, 40, tif=TimeInForce.IOC)
+    assert len(_resting(venue, "F", "a")) == 2
+
+    # The record, not only the outcome. An order that named no price is still
+    # an order this participant is working, and it is reserved against the far
+    # end of the contract's range because that is the worst price an order
+    # that named none could get.
+    working = venue._working[(AgentId("a"), "F")]
+    assert len(working) == 2
+    _low, high = venue.registry.require("F").bounds_in_minor
+    assert sorted(price for _s, _q, price in working.values())[-1] == int(high)
+
+    assert venue.kill(AgentId("a"), reason="runaway") == ["F"]
+    assert _resting(venue, "F", "a") == []
+
+    _send(venue, "c", S, 18_000, 100)
+    venue.uncross("F")
+    assert venue.account(AgentId("a")).positions.get("F") is None
+    assert venue.conservation_check() == 0
+
+
+def test_a_refused_amendment_does_not_hide_an_order_from_the_kill_switch():
+    """A refusal is not a removal, and treating it as one lost the order.
+
+    The engine refuses an amendment it dislikes and leaves the original exactly
+    where it was resting. The venue dropped its own record anyway, so
+    ``Replace(order, quantity=0)`` came back INVALID_QUANTITY, the order stayed
+    in the book for thirty lots, and ``kill`` then reported no symbols at all
+    and left it standing. One refused message was enough to make a participant
+    unstoppable.
+    """
+    venue = _venue()
+    order_id = _order_id(_send(venue, "a", B, 18_600, 30))
+    refused = venue.submit(
+        AgentId("a"), "F", Replace(AgentId("a"), order_id, Quantity(0), Price(18_650))
+    )
+    assert _reason(refused) is RejectReason.INVALID_QUANTITY
+    assert _resting(venue, "F", "a") == [30], "the refusal moved the order"
+    # The record has to survive the refusal, because collateral is reserved
+    # against it: forgetting a live order under-reserves the account as surely
+    # as it hides the order from the kill switch.
+    assert order_id in venue._working[(AgentId("a"), "F")]
+
+    assert venue.kill(AgentId("a")) == ["F"]
+    assert _resting(venue, "F", "a") == []
+    assert venue.conservation_check() == 0
+
+
+def test_the_kill_switch_pulls_an_order_the_venue_has_no_record_of():
+    """What the book is asked for, and the reason it is asked at all.
+
+    The venue's record and the engine's book are two accounts of the same
+    thing, and a kill switch that consults only the first is only as good as
+    the bookkeeping. It is the one control that has to work when something has
+    already gone wrong -- which is the situation in which the bookkeeping is
+    least trustworthy -- so it takes the union of both and pulls that.
+
+    The record is emptied here by hand rather than through a bug, because the
+    point is the property and not the route to it.
+    """
+    venue = _venue()
+    _send(venue, "a", B, 18_600, 30)
+    venue._working[(AgentId("a"), "F")].clear()
+
+    assert venue.kill(AgentId("a")) == ["F"]
+    assert _resting(venue, "F", "a") == []
+    assert venue.conservation_check() == 0
+
+
+def test_a_rejection_that_did_terminate_an_order_still_clears_the_reservation():
+    """The other direction, because believing the engine has to mean believing
+    it both ways.
+
+    A post-only order is acknowledged and then refused for crossing, so it is
+    tracked and then must be untracked -- otherwise the reservation outlives an
+    order that never existed, which is the same phantom by the opposite route.
+    """
+    venue = _venue()
+    _send(venue, "c", S, 18_600, 50)
+    refused = venue.submit(
+        AgentId("a"),
+        "F",
+        Submit(
+            AgentId("a"), B, Quantity(40), Price(18_700), OrderType.LIMIT,
+            TimeInForce.POST_ONLY,
+        ),
+    )
+    assert _reason(refused) is RejectReason.POST_ONLY_WOULD_CROSS
+    assert not venue._working.get((AgentId("a"), "F"))
+    assert venue.kill(AgentId("a")) == []
+    assert venue.conservation_check() == 0
+
+
+# --------------------------------------------------------------------------
+# What the venue thinks a participant is working
+# --------------------------------------------------------------------------
+
+
+def test_a_quote_that_gets_filled_stops_being_reserved_against():
+    """Collateral is reserved against working orders, so the venue's idea of
+    what is working has to survive somebody else's command.
+
+    A match produces a fill for the incoming order and one for the resting
+    order, and those belong to two different participants. The whole batch was
+    booked under whoever sent the command, so the passive side's fill was
+    looked up in the wrong agent's record, found nothing, and did nothing.
+
+    Measured on a maker quoting two lots a round and being lifted every round:
+    after 120 rounds the venue believed it was working **120 orders for 240
+    lots** while the engine's book held none. With a million in capital the
+    maker was refused for insufficient collateral at round 47, holding 497,100
+    of free cash and nothing at all in the book -- an account charged twice for
+    a risk it holds once.
+    """
+    venue = Venue("arena", starting_cash=1_000_000)
+    venue.list_instrument(_instrument())
+    maker = AgentId("mm")
+
+    for _ in range(60):
+        events = _send(venue, "mm", S, 18_600, 2)
+        assert RejectReason.INSUFFICIENT_COLLATERAL not in _reasons(events)
+        _send(venue, "taker", B, None, 2, tif=TimeInForce.IOC)
+
+    assert _resting(venue, "F", "mm") == []
+    assert venue._working[(maker, "F")] == {}, "reserved against orders that are gone"
+    assert venue.account(maker).positions["F"].quantity == -120
+    assert venue.conservation_check() == 0
+
+
+def test_a_partly_filled_quote_is_still_reserved_against_what_is_left():
+    """The passive side's record is updated, not simply discarded: an order
+    half taken is still an order, and the collateral behind the remainder has
+    to stay posted.
+    """
+    venue = _venue()
+    maker = AgentId("mm")
+    order_id = _order_id(_send(venue, "mm", S, 18_600, 50))
+    _send(venue, "taker", B, None, 20, tif=TimeInForce.IOC)
+
+    working = venue._working[(maker, "F")]
+    assert order_id in working
+    assert working[order_id][1] == 30
+    assert _resting(venue, "F", "mm") == [30]
+    assert venue.conservation_check() == 0
+
+
+def test_one_agents_command_cannot_book_another_agents_order_against_it():
+    """The same fix from the other side.
+
+    A command's event batch can carry events for people who never sent it: a
+    peg repricing is a ``Replaced`` for the peg's owner, produced inside
+    somebody else's order. Booking the whole batch under the sender wrote a
+    stranger's order into the sender's working book -- measured, a five-lot
+    order left its sender reserving collateral against **thirty** lots, its own
+    five and twenty-five of a peg it had never seen, while the peg's owner kept
+    a record at the price the peg had already left.
+    """
+    venue = _venue()
+    _send(venue, "seed", B, 18_000, 10)
+    _send(venue, "seed", S, 18_400, 10)
+    venue.submit(
+        AgentId("pegger"),
+        "F",
+        Submit(
+            AgentId("pegger"), B, Quantity(25), None, OrderType.PEGGED,
+            TimeInForce.GTC, peg_to=PegReference.BID, peg_offset=0,
+        ),
+    )
+
+    # A better bid from somebody else, which drags the peg with it.
+    _send(venue, "stranger", B, 18_100, 5)
+
+    stranger = venue._working[(AgentId("stranger"), "F")]
+    pegger = venue._working[(AgentId("pegger"), "F")]
+    assert sum(q for _s, q, _p in stranger.values()) == 5
+    assert sum(q for _s, q, _p in pegger.values()) == 25
+    assert not set(stranger) & set(pegger), "one order in two working books"
+    # And the peg's owner holds the price its order actually rests at.
+    priced = venue.registry.require("F").price_in_minor(Price(18_100))
+    assert [p for _s, _q, p in pegger.values()] == [int(priced)]
+    assert venue.conservation_check() == 0
+
+
+# --------------------------------------------------------------------------
+# What the order path charges collateral against
+# --------------------------------------------------------------------------
+
+
+def _priced(venue, price: str) -> int:
+    """A contract price as the integer ticks an order carries."""
+    from decimal import Decimal
+
+    return int(venue.registry.require("F").to_ticks(Decimal(price)))
+
+
+def test_an_order_is_charged_against_the_position_it_would_create():
+    """The scenario check has to price the position the fills would leave
+    behind, and that position's exposure comes from its basis rather than from
+    the price of the trade that finished it.
+
+    ``resulting * incoming_price`` simply omits what is already held, and it
+    omits it in the dangerous direction. Measured through this order path on an
+    account holding 50,500 against a contract bounded by [0, 10,000]: ten lots
+    long at 5,000, then ten more at 100. The check evaluated ``20 * 100 =
+    2,000``, accepted the order, and the position it produced carried a basis
+    of 51,000 -- collateral of 51,000,000,000 minor units against cash of
+    50,500,000,000, which is **free cash of -500,000,000**. An account owing
+    money it does not have is the one outcome full collateralisation exists to
+    make impossible.
+    """
+    venue = Venue(
+        "arena",
+        starting_cash=10_000_000_000,
+        balances={AgentId("buyer"): 50_500},
+    )
+    venue.list_instrument(_instrument())
+    buyer = venue.account(AgentId("buyer"))
+
+    _send(venue, "seller", S, _priced(venue, "5000"), 10)
+    _send(venue, "buyer", B, _priced(venue, "5000"), 10)
+    assert buyer.positions["F"].quantity == 10
+    assert int(buyer.free_cash) >= 0
+
+    _send(venue, "seller", S, _priced(venue, "100"), 10)
+    events = _send(venue, "buyer", B, _priced(venue, "100"), 10)
+
+    assert _reason(events) is RejectReason.INSUFFICIENT_COLLATERAL
+    assert buyer.positions["F"].quantity == 10, "the add went through anyway"
+    assert int(buyer.free_cash) >= 0, "the venue allowed a position it cannot cover"
+    assert venue.conservation_check() == 0
+
+
+def test_an_add_the_account_can_actually_cover_still_goes_through():
+    """The permissive half, and it matters as much as the refusal.
+
+    Charging against the basis is a correction, not a tightening: an account
+    that can carry the position the fills would produce must still be able to
+    open it, or the fix would simply be a smaller market wearing a safety
+    argument.
+    """
+    venue = Venue(
+        "arena",
+        starting_cash=10_000_000_000,
+        balances={AgentId("buyer"): 60_000},
+    )
+    venue.list_instrument(_instrument())
+    buyer = venue.account(AgentId("buyer"))
+
+    _send(venue, "seller", S, _priced(venue, "5000"), 10)
+    _send(venue, "buyer", B, _priced(venue, "5000"), 10)
+    _send(venue, "seller", S, _priced(venue, "100"), 10)
+    assert _reasons(_send(venue, "buyer", B, _priced(venue, "100"), 10)) == []
+
+    assert buyer.positions["F"].quantity == 20
+    assert int(buyer.positions["F"].cost_basis) == 51_000_000_000
+    assert int(buyer.free_cash) >= 0
+    assert venue.conservation_check() == 0
+
+
+def test_closing_a_position_stays_admissible_with_no_free_cash():
+    """A trade that reduces exposure must never be refused for collateral.
+
+    The scenario check prices the *resulting* position, so a sale that takes a
+    long back to flat is charged against nothing -- which is the property that
+    keeps an agent able to get out of a losing position at exactly the moment
+    it has no room left to get into anything.
+    """
+    venue = Venue(
+        "arena",
+        starting_cash=10_000_000_000,
+        balances={AgentId("buyer"): 50_000},
+    )
+    venue.list_instrument(_instrument())
+    buyer = venue.account(AgentId("buyer"))
+
+    _send(venue, "seller", S, _priced(venue, "5000"), 10)
+    _send(venue, "buyer", B, _priced(venue, "5000"), 10)
+    assert int(buyer.free_cash) == 0, "the account was not fully committed"
+
+    _send(venue, "bidder", B, _priced(venue, "4900"), 10)
+    assert _reasons(_send(venue, "buyer", S, _priced(venue, "4900"), 10)) == []
+    assert buyer.positions["F"].quantity == 0
+    assert venue.conservation_check() == 0
+
+
+def test_an_order_is_charged_against_the_cash_the_fill_would_leave():
+    """The scenario books a realised loss as well as posting collateral, and
+    the loss comes out of cash the instant the fill prints.
+
+    Comparing the requirement against the cash the account holds *now* compares
+    it with money the trade is about to take away. Measured through this order
+    path: short four lots at an average of 50, then buy eleven at 9,500. The
+    flip realises **-37,800,000,000** minor units, which the check never saw,
+    so 66,500,000,000 of collateral was approved against 100,000,000,000 of
+    cash that became 62,200,000,000 the moment it filled -- free cash of
+    **-4,300,000,000**.
+
+    Swept over four hundred fills across the whole settlement range, nine of
+    thirty random runs finished with some account underwater this way.
+    """
+    venue = Venue(
+        "arena",
+        starting_cash=10_000_000_000,
+        balances={AgentId("flipper"): 100_000},
+    )
+    venue.list_instrument(_instrument())
+    flipper = venue.account(AgentId("flipper"))
+
+    _send(venue, "deep", B, _priced(venue, "50"), 4)
+    _send(venue, "flipper", S, _priced(venue, "50"), 4)
+    assert flipper.positions["F"].quantity == -4
+
+    _send(venue, "deep", S, _priced(venue, "9500"), 11)
+    events = _send(venue, "flipper", B, _priced(venue, "9500"), 11)
+
+    assert _reason(events) is RejectReason.INSUFFICIENT_COLLATERAL
+    assert flipper.positions["F"].quantity == -4, "the flip went through anyway"
+    assert int(flipper.free_cash) >= 0
+    assert venue.conservation_check() == 0
+
+
+def test_a_flip_the_account_can_pay_for_still_goes_through():
+    """The permissive half again. An account with the cash to absorb the loss
+    and collateralise what it is left holding must still be able to turn its
+    position around -- a check that refused every flip would be a market where
+    nobody can change their mind.
+    """
+    venue = Venue(
+        "arena",
+        starting_cash=10_000_000_000,
+        balances={AgentId("flipper"): 200_000},
+    )
+    venue.list_instrument(_instrument())
+    flipper = venue.account(AgentId("flipper"))
+
+    _send(venue, "deep", B, _priced(venue, "50"), 4)
+    _send(venue, "flipper", S, _priced(venue, "50"), 4)
+    _send(venue, "deep", S, _priced(venue, "9500"), 11)
+    assert _reasons(_send(venue, "flipper", B, _priced(venue, "9500"), 11)) == []
+
+    assert flipper.positions["F"].quantity == 7
+    assert int(flipper.positions["F"].realized_pnl) == -37_800_000_000
+    assert int(flipper.free_cash) >= 0
+    assert venue.conservation_check() == 0
+

@@ -590,6 +590,25 @@ def test_a_distribution_leaves_no_account_short_of_collateral():
     less afterwards, so its requirement has to fall in the same instant. If the
     range it collateralises against did not narrow, meeting an obligation it
     always had would look like a margin breach.
+
+    There is one exception, and it is worth stating exactly rather than
+    exempting. A requirement cannot fall below zero. An account that sold the
+    share *above* the ceiling which survives the payment has nothing left to
+    give back: its requirement is already at the floor, the cash leaves anyway,
+    and its headroom falls by precisely the part of the payment the requirement
+    could not absorb.
+
+    Those accounts used to carry a *negative* requirement instead, and since
+    `posted_collateral` sums that dict, the credit was quietly funding
+    positions on other underlyings. That is cross-underlying netting arriving
+    through the back door, which is the one thing collateral here may never do
+    -- netting two different Brawlers assumes they move together, and a
+    correlation is an estimate. Flooring the requirement at zero is what closed
+    it, and this is the visible consequence.
+
+    Measured on seed 7 at t=40s: six shorts pinned to the floor, `fund-0` short
+    332 at an average near 3,800 against a ceiling of 3,533. Every long and
+    every short whose requirement stayed positive lost exactly nothing.
     """
     market = build(seed=7)
     market.kernel.start()
@@ -611,13 +630,41 @@ def test_a_distribution_leaves_no_account_short_of_collateral():
     # capital the fixture happens to hand out. What must hold is that meeting
     # an obligation does not make anyone worse off: the cash goes out and the
     # requirement falls by exactly as much.
-    before = {a: int(venue.accounts[a].free_cash) for a in holders}
-    venue.distribute("SPIKE_EQ", Money(467 * 1_000_000))
-    for agent in holders:
-        after = int(venue.accounts[agent].free_cash)
-        assert after >= before[agent] - 1, (
-            f"{agent} lost {before[agent] - after} of headroom by being paid"
+    payment = 467
+    before = {
+        agent: (
+            int(venue.accounts[agent].free_cash),
+            int(venue.accounts[agent].collateral.get("SPIKE_EQ", Money(0))),
+            venue.accounts[agent].positions["SPIKE_EQ"].quantity,
         )
+        for agent in holders
+    }
+    venue.distribute("SPIKE_EQ", Money(payment * 1_000_000))
+
+    floored = 0
+    for agent in holders:
+        account = venue.accounts[agent]
+        cash_before, required_before, quantity = before[agent]
+        lost = cash_before - int(account.free_cash)
+        if lost <= 1:
+            continue
+        # Headroom may only fall where the requirement had already run out of
+        # room to fall, and then by exactly the remainder. Anything else is the
+        # payment being charged twice.
+        floored += 1
+        assert int(account.collateral.get("SPIKE_EQ", Money(0))) == 0, (
+            f"{agent} lost {lost} of headroom while its requirement could "
+            "still have fallen"
+        )
+        assert lost == abs(quantity) * payment * 1_000_000 - required_before, (
+            f"{agent} lost {lost} of headroom, against a shortfall of "
+            f"{abs(quantity) * payment * 1_000_000 - required_before}"
+        )
+
+    assert floored, (
+        "nobody was pinned to the floor, so the exception went untested; "
+        "the fixture no longer sells the share above its surviving ceiling"
+    )
 
 
 def test_a_share_cannot_pay_more_than_it_promised():

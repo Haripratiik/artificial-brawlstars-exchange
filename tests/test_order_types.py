@@ -122,6 +122,77 @@ def test_an_iceberg_fills_completely_if_you_keep_taking():
     assert not engine.book.resting_orders
 
 
+def test_a_shrinking_replace_leaves_an_iceberg_exactly_where_it_was():
+    """The one modification that is promised to cost nothing, costing everything.
+
+    Reducing size at an unchanged price keeps queue position, and the shrink was
+    carried out by the same book operation that carries out a fill. On an
+    iceberg that is wrong twice. The lots come out of the reserve, which was
+    never in the level's published total, so the total was reduced by lots it
+    never held: an iceberg for twelve showing three, with four lots behind it,
+    shrunk to six left the level reporting **4** against **7** really resting,
+    and shrunk to one left it reporting **-3** with a published depth of **0**
+    over five live lots. And a spent slice refreshes to the back of its queue,
+    so the iceberg was moved behind the order that arrived after it -- while the
+    event it produced said ``kept_priority=True``.
+    """
+    engine = MatchingEngine()
+    _limit(engine, "berg", Side.SELL, 12, 96, display_size=3)
+    _limit(engine, "behind", Side.SELL, 4, 96)
+    assert int(engine.book.depth_at(Side.SELL, Price(96))) == 7
+
+    events = engine.apply(Replace(AgentId("berg"), _order_id(engine, "berg"), Quantity(6)))
+    replaced = next(e for e in events if isinstance(e, Replaced))
+    assert replaced.kept_priority is True
+
+    level = engine.book._levels[Side.SELL][Price(96)]
+    live = [o for o in level.orders if not o.status.terminal and o.remaining > 0]
+    assert [o.agent_id for o in live] == ["berg", "behind"], "the shrink cost it its place"
+    assert int(level.total) == sum(int(o.shown) for o in live) == 7
+    assert int(engine.book.depth_at(Side.SELL, Price(96))) == 7
+
+    # The promise, tested the only way it can be: the next taker meets it first.
+    assert _passive_fills(_market(engine, "taker", Side.BUY, 3)) == [("berg", 3)]
+
+
+def test_shrinking_an_iceberg_below_its_slice_keeps_the_level_honest():
+    """The same arithmetic where it went furthest negative.
+
+    Twelve showing three, shrunk to one: the level's running total was reduced
+    by eleven when only three of them were ever counted in it.
+    """
+    engine = MatchingEngine()
+    _limit(engine, "berg", Side.SELL, 12, 96, display_size=3)
+    _limit(engine, "behind", Side.SELL, 4, 96)
+    engine.apply(Replace(AgentId("berg"), _order_id(engine, "berg"), Quantity(1)))
+
+    level = engine.book._levels[Side.SELL][Price(96)]
+    live = [o for o in level.orders if not o.status.terminal and o.remaining > 0]
+    assert [(o.agent_id, int(o.remaining), int(o.shown)) for o in live] == [
+        ("berg", 1, 1),
+        ("behind", 4, 4),
+    ]
+    assert int(level.total) == 5
+    assert int(engine.book.depth_at(Side.SELL, Price(96))) == 5
+
+
+def test_a_fill_or_kill_reaches_an_iceberg_s_reserve():
+    """Published depth under-counts an iceberg, and fill-or-kill believed it.
+
+    A hundred-lot iceberg showing ten was published as ten, so a fill-or-kill
+    for a hundred was refused as unfillable -- while the identical order sent
+    good-till-cancelled filled all hundred against the same book, because each
+    exhausted slice refreshes and the walk arrives back at it.
+    """
+    engine = MatchingEngine()
+    _limit(engine, "berg", Side.SELL, 100, 50, display_size=10)
+    assert int(engine.book.depth_at(Side.SELL, Price(50))) == 10
+
+    events = _limit(engine, "f", Side.BUY, 100, 50, time_in_force=TimeInForce.FOK)
+    assert _reasons(events) == []
+    assert sum(q for q, _p in _prints(events)) == 100
+
+
 def test_an_order_with_no_price_cannot_hide():
     """It never rests, so there is no queue for a reserve to wait in."""
     engine = MatchingEngine()
@@ -207,6 +278,137 @@ def test_a_cascade_cannot_run_forever():
         _stop(engine, f"s{price}", Side.SELL, 5, trigger=price)
     _market(engine, "seller", Side.SELL, 5)
     assert engine.cascade_depth[-1] <= engine._max_cascade
+
+
+def test_the_cascade_bound_stops_the_chain_without_deleting_orders():
+    """The bound limits the chain. It must not be a way for orders to vanish.
+
+    A stop is taken out of the parked list at the moment it is handed to the
+    cascade, so anything still waiting when the bound bites had left the engine
+    entirely -- no order, no acknowledgement, no cancellation, and a later
+    cancel answered ``unknown_order``. Measured on a forty-deep ladder with the
+    bound at twenty-four: twenty-four released, fifteen still parked, and
+    **one** that simply ceased to exist with nothing in the stream to say so.
+    """
+    engine = MatchingEngine()
+    depth = engine._max_cascade + 16
+    for i in range(depth + 1):
+        _limit(engine, "mm", Side.BUY, 1, 1000 - i)
+    for i in range(depth):
+        _stop(engine, "s", Side.SELL, 1, trigger=1000 - i)
+    assert len(engine._stops) == depth
+
+    events = _limit(engine, "kick", Side.SELL, 1, 1000)
+    released = len([e for e in events if isinstance(e, Acknowledged)]) - 1
+
+    assert engine.cascade_depth[-1] == engine._max_cascade, "the bound did not bite"
+    assert released + len(engine._stops) == depth, "a triggered stop disappeared"
+    assert not [e for e in events if isinstance(e, Cancelled) and e.remaining == 1]
+
+    # Still live, so the next print that reaches one sets it off.
+    remaining = len(engine._stops)
+    _limit(engine, "mm", Side.BUY, 1, 1000 - depth)
+    _limit(engine, "again", Side.SELL, 1, 1000 - depth)
+    assert len(engine._stops) < remaining
+
+
+def test_a_triggered_stop_keeps_the_id_it_was_acknowledged_under():
+    """The agent's handle on its order, and the venue's, must survive the trigger.
+
+    A parked stop is acknowledged under an id: that id is what its owner cancels
+    with, and what the venue reserves collateral against. The order it became
+    was minted a fresh one, with nothing in the stream linking the two.
+    Measured: acknowledged as order **4**, traded as order **6**, and a cancel
+    of 4 rejected as ``unknown_order`` with the order neither parked nor in the
+    book. The reservation against 4 had nothing left to release it and 6 traded
+    under an id nobody had reserved for.
+    """
+    engine = MatchingEngine()
+    for price, quantity in ((100, 20), (99, 20), (98, 40)):
+        _limit(engine, "mm", Side.BUY, quantity, price)
+    parked = next(
+        e.order_id for e in _stop(engine, "a", Side.SELL, 10, trigger=99)
+        if isinstance(e, Acknowledged)
+    )
+
+    events = _market(engine, "seller", Side.SELL, 30)
+    released = [e.order_id for e in events if isinstance(e, Acknowledged)]
+
+    assert parked in released, "the released stop traded under a different id"
+    assert any(
+        isinstance(e, Filled) and e.order_id == parked and e.aggressor for e in events
+    )
+    assert engine.book.get(parked) is not None, "the id resolves to nothing"
+
+
+def test_a_stop_hears_every_print_of_a_walk_not_only_the_last():
+    """A walk that sweeps several levels prints at each of them.
+
+    Only the final price was offered to the parked stops, so any trigger the
+    walk passed through on the way was dropped. Offers of five at 100 and five
+    at 110, a sell stop parked at 100, and a buy for ten: the tape read
+    ``[(5, 100), (5, 110)]``, the market had plainly traded at 100, and the stop
+    was still parked afterwards. The rest of the cascade already checked every
+    print of every released order, so the first round was the odd one out.
+    """
+    engine = MatchingEngine()
+    _limit(engine, "mm", Side.SELL, 5, 100)
+    _limit(engine, "mm", Side.SELL, 5, 110)
+    _limit(engine, "bid", Side.BUY, 5, 95)
+    _stop(engine, "s", Side.SELL, 5, trigger=100)
+
+    events = _limit(engine, "t", Side.BUY, 10, 110)
+    assert _prints(events)[:2] == [(5, 100), (5, 110)]
+    assert not engine._stops, "the print at 100 was never offered to the stop"
+    assert (5, 95) in _prints(events), "the released stop did not trade"
+
+
+def test_a_stop_is_released_only_once_the_order_that_set_it_off_has_rested():
+    """Sequencing, and it decides whether the book ends crossed.
+
+    A triggered stop was released while the aggressor's own unfilled remainder
+    was still in flight, so it matched against a book missing liquidity that
+    logically preceded it and rested where that remainder was about to rest
+    through. Measured: a stop-limit sell for nineteen at 99 set off by a print
+    at 97, released before a taker's seven unfilled lots reached the book, left
+    **bid 101 against ask 99** -- a spread of minus two, crossed and stuck.
+    """
+    engine = MatchingEngine()
+    _stop(engine, "stopper", Side.SELL, 19, trigger=103, limit=99)
+    _limit(engine, "maker", Side.SELL, 5, 97)
+
+    events = _limit(engine, "taker", Side.BUY, 12, 101)
+
+    book = engine.book.snapshot()
+    if book.best_bid is not None and book.best_ask is not None:
+        assert int(book.best_bid) < int(book.best_ask), "the book ended crossed"
+    # The taker's remainder was on the book, so the stop traded against it
+    # rather than resting through it.
+    assert (7, 101) in _prints(events)
+
+
+def test_a_replace_that_crosses_sets_off_a_stop():
+    """A print is a print, whichever message produced it.
+
+    Stops were released after a submission and not after a modification, so a
+    resting offer moved down onto a bid traded ten lots at 100 while a stop
+    parked at 100 sat untouched -- and the identical print delivered as a new
+    order set the same stop off immediately. Whether a stop fires cannot depend
+    on which message the tape came from.
+    """
+    engine = MatchingEngine()
+    _limit(engine, "maker", Side.BUY, 10, 100)
+    _limit(engine, "maker", Side.BUY, 10, 95)
+    _limit(engine, "mover", Side.SELL, 10, 105)
+    _stop(engine, "stopper", Side.SELL, 5, trigger=100)
+
+    events = engine.apply(
+        Replace(AgentId("mover"), _order_id(engine, "mover"), Quantity(10), Price(100))
+    )
+
+    assert (10, 100) in _prints(events)
+    assert not engine._stops, "the replace's print did not reach the stop"
+    assert (5, 95) in _prints(events), "the released stop did not trade"
 
 
 def test_a_stop_limit_will_not_fill_below_its_limit():
@@ -325,6 +527,7 @@ from arena.exchange.events import (  # noqa: E402
     Filled,
     Rejected,
     Replace,
+    Replaced,
 )
 from arena.exchange.session import SessionState  # noqa: E402
 from arena.exchange.types import PegReference  # noqa: E402
@@ -555,6 +758,31 @@ def test_a_post_only_peg_declines_to_follow_a_reference_into_a_cross():
     assert engine.tape == ()
     assert engine.book.snapshot().bids == ((Price(100), Quantity(10)),)
     assert not engine._pegs[0].on_book
+
+
+def test_a_post_only_peg_keeps_its_promise_after_it_has_repriced():
+    """Repricing rebuilds the order, and a rebuild that drops something is a hole.
+
+    A peg is taken off the book and put back as a new order every time its
+    reference moves, and the new order was built without the post-only flag. So
+    the promise survived exactly as long as the peg never moved: after one
+    reprice, a replace no longer knew to refuse a crossing price, and a
+    post-only peg replaced to 102 **took a lot at 98**. The same lesson as the
+    display size a replace used to strip, in a third place.
+    """
+    engine = MatchingEngine()
+    _limit(engine, "mm", Side.SELL, 5, 98)
+    _limit(engine, "mm", Side.BUY, 5, 90)
+    _peg(engine, "p", Side.BUY, 2, PegReference.BID, tif=TimeInForce.POST_ONLY)
+
+    # Move the reference, so the peg is rebuilt at least once.
+    _limit(engine, "other", Side.BUY, 5, 92)
+    peg_order = engine._pegs[0].order
+    assert int(peg_order.price) == 92, "the peg did not follow the touch"
+
+    events = engine.apply(Replace(AgentId("p"), peg_order.order_id, Quantity(2), Price(98)))
+    assert _prints(events) == []
+    assert _reasons(events) == [RejectReason.POST_ONLY_WOULD_CROSS]
 
 
 def test_a_peg_takes_no_price_from_a_book_that_is_only_accumulating():
@@ -863,6 +1091,60 @@ def test_a_book_of_minimums_can_show_a_cross_it_will_not_execute():
 
     events = _limit(engine, "mm", Side.SELL, 5, 100)
     assert _prints(events) == [(5, 100)], "the cross did not clear once size arrived"
+
+
+def test_fill_or_kill_is_not_admitted_by_liquidity_a_minimum_protects():
+    """Conditional liquidity is not liquidity, and the check was counting it.
+
+    Fill-or-kill asked published depth, which does not know that an offer
+    refusing anything under twenty is unavailable to a buyer of ten. Twenty-five
+    lots were on offer at 100 and a fill-or-kill for ten was admitted -- and
+    then **printed five**, which is the one outcome fill-or-kill exists to make
+    impossible. What the walk could really take was five.
+    """
+    engine = MatchingEngine()
+    _limit(engine, "big", Side.SELL, 20, 100, min_quantity=20)
+    _limit(engine, "small", Side.SELL, 5, 100)
+    assert int(engine.book.depth_at(Side.SELL, Price(100))) == 25
+
+    events = _limit(engine, "f", Side.BUY, 10, 100, time_in_force=TimeInForce.FOK)
+    assert _prints(events) == []
+    assert _reasons(events) == [RejectReason.FOK_NOT_FILLABLE]
+    assert int(engine.book.depth_at(Side.SELL, Price(100))) == 25, "it traded anyway"
+
+
+def test_an_aggressor_s_minimum_counts_slices_rather_than_totals():
+    """How much a level yields depends on the order the executions happen in.
+
+    An iceberg's spent slice goes to the *back* of its queue, so an aggressor
+    meets whatever was behind it before it can reach the reserve -- and by then
+    it may be too small for a minimum that was satisfiable a moment earlier.
+    Counting the iceberg's remaining quantity as one lump said six lots were
+    reachable here. The walk took three from the slice, one from the lot behind
+    it, and found its last two below the iceberg's own minimum of three: an
+    order with a minimum of five **executed for four**.
+    """
+    engine = MatchingEngine()
+    _limit(engine, "berg", Side.BUY, 8, 96, display_size=3, min_quantity=3)
+    _limit(engine, "behind", Side.BUY, 1, 96)
+
+    events = _limit(engine, "a", Side.SELL, 6, 96, min_quantity=5)
+    assert _prints(events) == []
+    assert int(engine.book.total_resting_quantity) == 9 + 6, "it traded anyway"
+
+
+def test_an_aggressor_s_minimum_is_met_when_the_slices_really_reach_it():
+    """The same book, one lot larger behind the iceberg, and the trade happens.
+
+    The count has to be exact in both directions: refusing what a walk could
+    have done is as wrong as admitting what it could not.
+    """
+    engine = MatchingEngine()
+    _limit(engine, "berg", Side.BUY, 8, 96, display_size=3, min_quantity=3)
+    _limit(engine, "behind", Side.BUY, 2, 96)
+
+    events = _limit(engine, "a", Side.SELL, 5, 96, min_quantity=5)
+    assert sum(q for q, _p in _prints(events)) == 5
 
 
 def test_a_minimum_larger_than_the_order_is_refused():

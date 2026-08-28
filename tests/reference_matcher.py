@@ -148,6 +148,15 @@ class ReferenceMatcher:
         for resting in self._live(order.side.opposite):
             if not self._crosses(order.side, resting.price, order.price):
                 break
+            # The taker's own resting quantity is not liquidity it can have.
+            # `_match` cancels it under self-match prevention rather than
+            # printing against it, so counting it here admits a fill-or-kill
+            # that then partially fills -- the one outcome the term exists to
+            # make impossible. Modelled here as well as in the engine because
+            # a differential harness that agrees on the wrong answer reports
+            # nothing.
+            if resting.agent_id == order.agent_id:
+                continue
             available += resting.remaining
             if available >= order.remaining:
                 return True

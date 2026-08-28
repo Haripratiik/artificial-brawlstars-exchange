@@ -94,6 +94,38 @@ class Position:
     def equity(self, mark: Money) -> Money:
         return Money(int(self.realized_pnl) + int(self.unrealized_pnl(mark)))
 
+    def basis_after(self, quantity: int, price: Money) -> Money:
+        """What :meth:`apply_fill` would leave the basis at, without applying it.
+
+        Needed because a solvency check has to price the position the fill would
+        *create*, and that position's exposure comes from its basis rather than
+        from the price of the trade that finished it. Pricing the whole
+        resulting quantity at the incoming price understates an add: measured on
+        ten lots long at 5,000 followed by ten more at 100, the check saw
+        ``20 * 100 = 2,000`` where the position it produced carries a basis of
+        51,000. An account with 50,000 of cash passed that check and came out
+        holding a position that can lose 51,000 -- owing a thousand it does not
+        have, which is the one thing full collateralisation is supposed to make
+        impossible.
+
+        Every branch mirrors :meth:`apply_fill` line for line, and
+        ``test_the_projected_basis_matches_the_applied_one`` holds them
+        together over random fill sequences rather than trusting that they were
+        written to match.
+        """
+        if self.quantity == 0 or _same_sign(self.quantity, quantity):
+            return Money(int(self.cost_basis) + quantity * int(price))
+
+        remaining = self.quantity + quantity
+        if abs(quantity) > abs(self.quantity):
+            return Money(remaining * int(price))
+        if remaining == 0:
+            return Money(0)
+
+        closing = min(abs(quantity), abs(self.quantity))
+        closed_basis = int(self.cost_basis) * closing // abs(self.quantity)
+        return Money(int(self.cost_basis) - closed_basis)
+
     def apply_fill(
         self, quantity: int, price: Money, fee: Money = Money(0)
     ) -> FillRecord:

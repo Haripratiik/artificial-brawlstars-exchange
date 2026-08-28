@@ -58,6 +58,14 @@ REFERENCE_ID = "ref-2026S09-v1"
 # position in the futures, which settle around 4,700 a contract, and small
 # enough that a profit is a number you can see.
 HUMAN_STARTING_CASH = 250_000
+
+# The widest maker's mandate: how much it shows on each side of each book, and
+# how much of any one contract it will carry. The other makers are scaled down
+# from these, and `maker_capital` funds each one from its own pair -- so the
+# three numbers that decide what a maker is asked to do live in one place as
+# the number that decides whether it can afford to do it.
+MAKER_QUOTE_SIZE = 30
+MAKER_POSITION_LIMIT = 1_200
 UTC = timezone.utc
 
 POLICY = DataPolicy(
@@ -468,6 +476,43 @@ def true_values(listed: list[Instrument]) -> dict[str, float]:
     return values
 
 
+def maker_capital(
+    listed: list[Instrument], position_limit: int, quote_size: int
+) -> int:
+    """What it costs to be the market in every listed contract at once.
+
+    Read off the contracts and the maker's own mandate rather than named as a
+    figure, because a figure is right only for the list it was written against.
+    Every position here is collateralised against the whole range its contract
+    can settle in, so a maker that shows ``quote_size`` on both sides of a book
+    and will carry ``position_limit`` in it needs that many lots times that
+    range -- and it needs it in every book simultaneously, because that is what
+    quoting a market means.
+
+    The alternative is what was there before and what this replaces: forty
+    million, chosen when the exchange listed fewer contracts and never revised.
+    Listing the two dispersion futures took the requirement past it, and the
+    consequence was not that the makers quoted a little less. Measured on
+    seed 7 with the flat figure: **63,345 orders rejected for collateral**, the
+    makers out of the future's book entirely, `SPIKE_WR_FUT` carrying a spread
+    of 1,277 points where it had carried 6, and the option chain -- which is
+    priced off the midpoint of that spread -- swinging between 3,629 and 5,701
+    and inverting across strikes. Funded from the list instead: 245 rejects,
+    the spread back to 3, and the chain monotone at every sampled moment.
+
+    So this is not a softer limit. Collateral is still exact and still posted
+    in full; what changes is that the makers arrive with enough of it to do the
+    job they were given, and that listing a twenty-ninth contract funds itself
+    instead of quietly starving the twenty-eight already there.
+    """
+    lots = position_limit + quote_size
+    total = 0.0
+    for instrument in listed:
+        low, high = instrument.tick_bounds
+        total += float(instrument.from_ticks(int(high) - int(low))) * lots
+    return int(total)
+
+
 def build(
     seed: int = 7,
     speed: float = 1.0,
@@ -505,11 +550,22 @@ def build(
     by_symbol = {i.symbol: i for i in listed}
     levels = true_levels(listed)
 
-    # Sized for the contracts on offer, not picked round. A 10,000-scale future
-    # quoted 30 lots a side ties up ~300k per side per symbol, and full
-    # collateralisation means that capital is genuinely committed rather than
-    # notional. Too little and every agent spends the session rejected, which
-    # looks like a broken market rather than a poor one.
+    # Sized for the contracts on offer, not picked round -- and now computed
+    # from them rather than remembered. A maker is asked to be both sides of
+    # every book at once, full collateralisation means that capital is
+    # genuinely committed rather than notional, and too little of it means
+    # every agent spends the session rejected, which looks like a broken market
+    # rather than a poor one. See `maker_capital` for what that cost is and
+    # what it looked like when the figure stopped covering it.
+    # Floored at one, because the dashboard will run eight of these and the
+    # ladder ran out at four: the fifth maker was configured to show -2 lots
+    # and carry -50, which the quoting path silently turned back into 1 and
+    # which this function would have turned into a negative opening balance.
+    # The three the market is built with are unaffected.
+    maker_ids = [AgentId(f"mm-{n + 1}") for n in range(max(0, makers))]
+    maker_limits = [max(1, MAKER_POSITION_LIMIT - 250 * n) for n in range(len(maker_ids))]
+    maker_sizes = [max(1, MAKER_QUOTE_SIZE - 8 * n) for n in range(len(maker_ids))]
+
     # The breaker's three time constants, scaled from the rule they model.
     #
     # Limit up-limit down uses a fifteen-second limit state, a five-minute
@@ -533,16 +589,24 @@ def build(
         limit_state_ns=max(1, int(15 * scale * 1e9)),
         pause_ns=max(1, int(300 * scale * 1e9)),
         reference_window_ns=max(1, int(300 * scale * 1e9)),
-        # A person starts with an account they can actually read. The bots keep
-        # the large balance because a market maker quoting seven books at once
-        # genuinely needs it -- but a trader watching a gain of a hundred against
-        # forty million learns nothing about what their trade did.
-        balances={HUMAN_ID: human_cash},
+        # A person starts with an account they can actually read, and each
+        # maker with what its own mandate costs to collateralise. Everyone else
+        # keeps the default: the informed traders are bounded by their position
+        # limits rather than by their cash, so funding them from the listing
+        # would change how much informed capital the market has -- which is the
+        # quantity Experiment 1 is a measurement of, and not something to move
+        # as a side effect of paying the makers properly.
+        balances={
+            HUMAN_ID: human_cash,
+            **{
+                agent_id: maker_capital(listed, limit, size)
+                for agent_id, limit, size in zip(maker_ids, maker_limits, maker_sizes)
+            },
+        },
     )
     for instrument in listed:
         venue.list_instrument(instrument)
 
-    maker_ids = [AgentId(f"mm-{n + 1}") for n in range(max(0, makers))]
     maker_id = maker_ids[0] if maker_ids else AgentId("mm-none")
     operator_id = AgentId("exchange")
     arb_id = AgentId("arb-1")
@@ -601,9 +665,9 @@ def build(
             by_symbol,
             wake_interval=millis(300 + 90 * n),
             half_spread=5 + 3 * n,
-            quote_size=30 - 8 * n,
+            quote_size=maker_sizes[n],
             max_skew_fraction=0.10,
-            position_limit=1_200 - 250 * n,
+            position_limit=maker_limits[n],
             # The middle of each contract's range, never its true value: if a
             # maker started on the answer there would be nothing to discover.
             #

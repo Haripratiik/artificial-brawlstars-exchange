@@ -15,9 +15,21 @@ from decimal import Decimal
 import pytest
 
 from arena.contracts.payoff import Binary, Linear
-from arena.contracts.spec import ContractSpec, DataPolicy, ObservationWindow
+from arena.contracts.spec import (
+    ContractSpec,
+    DataPolicy,
+    DistributionSchedule,
+    ObservationWindow,
+)
 from arena.contracts.underlying import Basket, Difference, MetricRef, Single
-from arena.settlement.engine import ReferenceLookahead, ReferenceMismatch, settle
+from arena.settlement.engine import (
+    ReferenceLookahead,
+    ReferenceMismatch,
+    SettlementOutOfBounds,
+    distributions,
+    settle,
+)
+from arena.settlement.oracle import MetricResolution
 from arena.settlement.result import SettlementStatus
 from arena.worlds.brawl.oracle import BrawlOracle
 
@@ -298,6 +310,88 @@ def test_basket_leg_order_does_not_change_the_settlement_value(
 
     assert a.underlying_level == b.underlying_level
     assert a.settlement_value == b.settlement_value
+
+
+# --------------------------------------------------------------------------
+# Payments, which cannot be walked back
+# --------------------------------------------------------------------------
+
+
+class _FixedOracle:
+    """Returns one level for every reference and window, whatever was asked.
+
+    Enough to drive the distribution path past the point where a real oracle
+    would have refused, which is the only way to reach the guard below: the
+    fixture never produces an out-of-range rate, and a guard that has never
+    fired is a guard nobody has checked.
+    """
+
+    def __init__(self, value, as_of, reference_id="ref-2026S09-v1"):
+        self._value = value
+        self._as_of = as_of
+        self._reference_id = reference_id
+
+    @property
+    def reference_id(self):
+        return self._reference_id
+
+    @property
+    def reference_as_of(self):
+        return self._as_of
+
+    def resolve(self, ref, window, policy_overrides=None):
+        return MetricResolution(
+            ref=ref, value=self._value, sample_size=10_000, sources=()
+        )
+
+
+def _share(window, published_at, periods=4):
+    span = (window.end - window.start) / periods
+    return make_spec(
+        window,
+        published_at,
+        contract_id="SPIKE_EQ",
+        payoff=Linear(scale=0.0),
+        distribution=DistributionSchedule(
+            windows=tuple(
+                ObservationWindow(
+                    window.start + span * n, window.start + span * (n + 1)
+                )
+                for n in range(periods)
+            ),
+            payoff=Linear(scale=1_000.0),
+        ),
+    )
+
+
+def test_each_period_is_measured_on_its_own_evidence(oracle, window, published_at):
+    """A share is worth the stream, and the stream is only interesting if it moves."""
+    paid = distributions(_share(window, published_at), oracle)
+    assert len(paid) == 4
+    assert len(set(paid)) > 1
+    assert all(Decimal(0) <= amount <= Decimal(1_000) for amount in paid)
+
+
+def test_a_payment_outside_the_schedules_range_is_a_hard_error(window, published_at):
+    """The one guard a share never had, on the one contract whose cash moves early.
+
+    A share's terminal payoff is Linear(0), so its settlement bounds are [0, 0]
+    and the out-of-range check in `settle` can never fire on it -- yet the
+    payments happen *before* settlement and `Venue.distribute` lowers the range
+    every short is collateralised against by whatever was paid. So a payment
+    computed from a level the contract never contemplated would silently move
+    the bounds that back the whole contract, and nothing downstream would
+    notice. A rate of 1.5 against a declared [0, 1] pays 1,500 on a schedule
+    whose range is [0, 1000].
+    """
+    spec = _share(window, published_at)
+    fabulist = _FixedOracle(1.5, published_at)
+    with pytest.raises(SettlementOutOfBounds, match="outside the range"):
+        distributions(spec, fabulist)
+
+    # And the honest end of the same range still passes, so the guard is not
+    # simply refusing everything.
+    assert distributions(spec, _FixedOracle(1.0, published_at)) == (Decimal(1_000),) * 4
 
 
 def test_repeated_leg_is_resolved_once(oracle, window, published_at):

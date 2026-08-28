@@ -330,11 +330,22 @@ class ContractSpec:
         Positive quantity is long, negative is short. This is the amount that
         must be posted for the position to be fully collateralised in the sense
         Kalshi uses: the holder can lose it all, and can never owe more.
+
+        Floored at zero. A position opened outside the range the claim can
+        settle in cannot lose anything at all -- a short above the top of the
+        range makes money whatever happens -- and the arithmetic ran negative
+        there rather than stopping at nothing. Measured: a short of one lot at
+        12,000 on a contract bounded by [0, 10000] returned -2,000. That figure
+        is summed with the rest of a portfolio's requirement, so a negative one
+        does not merely misreport, it *funds* another position. It also let the
+        netted requirement exceed the gross, which is arithmetically impossible
+        for correct inputs and was the reason the netting test carried a
+        tolerance.
         """
         low, high = self.value_bounds
         if quantity >= 0:
-            return Decimal(quantity) * (price - low)
-        return Decimal(-quantity) * (high - price)
+            return max(Decimal(0), Decimal(quantity) * (price - low))
+        return max(Decimal(0), Decimal(-quantity) * (high - price))
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -20,13 +20,18 @@ import shutil
 import subprocess
 import sys
 import time
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from arena.portfolio.account import Account
+from arena.portfolio.money import from_money, to_money
+from arena.sim.time import seconds
+
 from dashboard.server import app, runner
-from dashboard.state import FEE_SCHEDULES, MarketConfig
+from dashboard.state import FEE_SCHEDULES, MarketConfig, MarketRunner
 
 REPO = Path(__file__).resolve().parents[1]
 SYMBOL = "SPIKE_WR_FUT"
@@ -101,6 +106,128 @@ def test_the_session_endpoint_describes_the_venue(client):
     assert set(payload["config"]) >= {"seed", "fees", "flow_traders", "arbitrageur"}
     assert "maker-taker" in payload["fee_schedules"]
     assert payload["sessions"][SYMBOL]
+
+
+def test_the_roster_reports_equity_as_a_price_not_as_minor_units(client):
+    """The same failure as the settlement bug, a million times over.
+
+    ``Account.equity`` answers in the integer minor units the ledger is kept
+    in -- 1e-6 of a price unit -- and the roster published that straight into
+    a column the page renders with the money formatter. A maker worth
+    113,125,513.21 was drawn as "113125513.21M", and a *person's own seat*
+    appeared on the same table as "143745.00M" while the header two panels
+    away read "143.7k". Nothing looked broken. It looked like a big number.
+    """
+    # Against a market nobody is pumping, so the marks cannot move between the
+    # reading and the recomputation. A live one is checked below by magnitude,
+    # which is all a factor of a million ever needed.
+    still = MarketRunner()
+    still.start()
+    still.market.kernel.advance(until=seconds(90))
+    venue = still.market.venue
+    marks = venue.marks()
+
+    checked = 0
+    for entry in still.agents():
+        account = venue.accounts.get(entry["id"])
+        if entry["equity"] is None or account is None:
+            continue
+        assert Decimal(entry["equity"]) == from_money(account.equity(marks)), (
+            f"{entry['id']} is published as {entry['equity']} against a real "
+            "equity of "
+            f"{from_money(account.equity(marks))} -- which is what the ledger's "
+            "own integer unit looks like when it is read as a price"
+        )
+        checked += 1
+    assert checked > 5, "too few accounts had an equity to check"
+
+
+def test_the_served_roster_reports_equity_at_a_believable_size(client):
+    """The same check against the market that is actually running.
+
+    Exactness is not available here -- a mark that moved between the reading
+    and the recomputation is the market working. Magnitude is, and magnitude is
+    the whole of the bug: trading moves value between participants rather than
+    creating it, so an account cannot drift a thousandfold from the capital it
+    opened with, and the figure that was being published was off by a million.
+    """
+    roster = client.get("/api/agents").json()["agents"]
+    checked = 0
+    for entry in roster:
+        account = runner.market.venue.accounts.get(entry["id"])
+        if entry["equity"] is None or account is None:
+            continue
+        opened = from_money(account.starting_cash)
+        assert abs(Decimal(entry["equity"])) <= opened * 1000, (
+            f"{entry['id']} shows {entry['equity']} against opening capital of "
+            f"{opened}"
+        )
+        checked += 1
+    assert checked > 5, "too few accounts had an equity to check"
+
+
+def test_a_halt_record_reports_prices_not_ticks():
+    """The Lab draws `price` and `reference` into columns headed as such.
+
+    The venue records both in the unit it matches in, which is ticks, and that
+    is right for the venue. Published unconverted, a band break on a contract
+    quoted on a 0.25 grid printed 1,989 in a price column against a real price
+    of 497.25 -- on a claim whose entire settlement range is 0 to 1,000. A
+    number four times outside the range the same page publishes reads as a
+    number, not as a bug.
+
+    Run with a band tight enough that the breaker trips within the first few
+    simulated seconds, and from a fixed seed, so it is the conversion under
+    test rather than the weather.
+    """
+    tight = MarketRunner(MarketConfig(seed=7, price_band=0.004))
+    tight.start()
+    for moment in range(5, 120, 5):
+        tight.market.kernel.advance(until=seconds(moment))
+        if any("price" in halt for halt in tight.market.venue.halts):
+            break
+
+    published = [h for h in tight.session_state()["halts"] if "price" in h]
+    assert published, "the breaker never tripped, so nothing is being checked"
+
+    for halt in published:
+        instrument = tight.market.venue.registry.require(halt["symbol"])
+        low, high = instrument.value_bounds
+        for field in ("price", "reference"):
+            value = Decimal(str(halt[field]))
+            assert low <= value <= high, (
+                f"{halt['symbol']} halted at {field}={value}, outside its own "
+                f"settlement range {low}..{high} -- which is what a tick count "
+                "looks like when it is drawn under a price heading"
+            )
+
+
+def test_the_indicative_price_means_the_same_thing_on_both_endpoints():
+    """One name, two units, four times apart.
+
+    The socket converts the auction's clearing price and the ladder endpoint
+    did not, so the same auction on the same contract at the same instant was
+    published as "5003.00" in one place and 20012 in the other. Nothing draws
+    the ladder's copy yet, which is the only reason it never reached a screen
+    -- and is exactly the position the settlement figure was in before someone
+    drew it.
+    """
+    opening = MarketRunner()
+    opening.start()
+    opening.market.kernel.advance(until=seconds(3))
+
+    checked = 0
+    snapshot = opening.market.snapshot()
+    for symbol, book in snapshot["books"].items():
+        ladder = opening.indicative(symbol)
+        if book["indicative"] is None or ladder is None:
+            continue
+        assert Decimal(str(ladder["price"])) == Decimal(book["indicative"]), (
+            f"{symbol}: the ladder says {ladder['price']} and the socket says "
+            f"{book['indicative']} about the same auction"
+        )
+        checked += 1
+    assert checked, "no symbol was in a call phase, so nothing was compared"
 
 
 def test_the_agent_roster_is_published(client):
@@ -264,6 +391,129 @@ def test_an_unknown_time_in_force_is_rejected(client):
     pytest.fail("no acknowledgement returned")
 
 
+# --------------------------------------------------------------------------
+# Order entry, as a stranger gets it wrong
+# --------------------------------------------------------------------------
+
+
+def _ack(socket, message, tries=60):
+    """Send one action and return the acknowledgement, ignoring snapshots."""
+    socket.send_json(message)
+    for _ in range(tries):
+        payload = socket.receive_json()
+        if "ack" in payload:
+            return payload["ack"]
+    raise AssertionError("no acknowledgement returned")
+
+
+# Every one of these is reachable from the ticket: the size box is a number
+# input that reports "" when what was typed is not one, and the limit price
+# box is free text because a price is not an integer.
+MISTAKES = [
+    ("a blank size", {"quantity": None, "price": "4600"}),
+    ("a size that is not a number", {"quantity": "many", "price": "4600"}),
+    ("a fractional size", {"quantity": 2.5, "price": "4600"}),
+    ("a price with the ladder's comma in it", {"quantity": 5, "price": "9,233.75"}),
+    ("a price with a currency symbol", {"quantity": 5, "price": "$4600"}),
+    ("a price that is a word", {"quantity": 5, "price": "cheap"}),
+    ("a stop that is not a number", {"quantity": 5, "price": "4600", "stop": "soon"}),
+]
+
+# What "a clear message" excludes. Each of these was actually shown in a toast.
+INTERNALS = ("int()", "<class", "decimal.", "Traceback", "NoneType", "literal for")
+
+
+@pytest.mark.parametrize("what,fields", MISTAKES, ids=[m[0] for m in MISTAKES])
+def test_a_mistyped_order_is_answered_in_the_terms_of_the_box(client, what, fields):
+    """The toast used to carry the interpreter's opinion of the failure.
+
+    A blank size came back as "int() argument must be a string, a bytes-like
+    object or a real number, not 'NoneType'". A price copied off the ladder --
+    with the thousands separator the ladder itself drew -- came back as
+    "[<class 'decimal.ConversionSyntax'>]". Both are Python talking to itself,
+    on a screen someone is trying to trade from.
+    """
+    with client.websocket_connect("/ws") as socket:
+        socket.receive_json()
+        ack = _ack(socket, {"action": "submit", "symbol": SYMBOL, "side": "buy", **fields})
+
+    assert ack["ok"] is False, f"{what} was accepted"
+    message = ack["error"]
+    assert message and message[0] != "[", message
+    for internal in INTERNALS:
+        assert internal not in message, f"{what} answered with {message!r}"
+
+
+def test_a_price_the_contract_cannot_settle_at_is_refused(client):
+    """Nothing checked this, and the collateral model cannot.
+
+    Collateral is sized from the settlement range, so a bid *below* the floor
+    scores as less risky than one inside it and passes every check the venue
+    makes. A limit buy at -100 on a contract bounded at zero was accepted,
+    rested, and was eventually filled -- crediting the account for having been
+    paid to take delivery of something that cannot be worth less than nothing.
+    """
+    with client.websocket_connect("/ws") as socket:
+        first = socket.receive_json()
+        low, high = (Decimal(b) for b in first["books"][SYMBOL]["bounds"])
+
+        below = _ack(socket, {"action": "submit", "symbol": SYMBOL, "side": "buy",
+                              "quantity": 5, "price": str(low - 100)})
+        above = _ack(socket, {"action": "submit", "symbol": SYMBOL, "side": "sell",
+                              "quantity": 5, "price": str(high * 4)})
+        inside = _ack(socket, {"action": "submit", "symbol": SYMBOL, "side": "buy",
+                               "quantity": 1, "price": str((low + high) / 4)})
+
+    assert below["ok"] is False and "settlement range" in below["error"]
+    assert above["ok"] is False and "settlement range" in above["error"]
+    assert inside["ok"] is True, "a price inside the range must still be accepted"
+
+
+def test_a_misspelled_side_is_refused_rather_than_sold(client):
+    """Anything that was not exactly "buy" became a SELL, silently.
+
+    One character wrong in a client and the order went the other way, with
+    nothing anywhere saying so -- and it filled.
+    """
+    with client.websocket_connect("/ws") as socket:
+        socket.receive_json()
+        ack = _ack(socket, {"action": "submit", "symbol": SYMBOL, "side": "byu",
+                            "quantity": 5, "price": "4600"})
+    assert ack["ok"] is False
+    assert "buy or sell" in ack["error"]
+
+
+def test_an_order_with_no_market_says_which_field_is_missing(client):
+    with client.websocket_connect("/ws") as socket:
+        socket.receive_json()
+        ack = _ack(socket, {"action": "submit", "side": "buy", "quantity": 5, "price": "1"})
+    assert ack["ok"] is False
+    assert ack["error"] == "choose a market before sending an order"
+
+
+def test_the_ticket_can_reach_a_stop_and_an_iceberg(client):
+    """Both were supported end to end and unreachable from the page.
+
+    Checked here at the socket because that is where the ticket's fields
+    arrive; that the ticket now actually sends them is checked under node.
+    """
+    with client.websocket_connect("/ws") as socket:
+        first = socket.receive_json()
+        mark = Decimal(first["books"][SYMBOL]["mark"])
+        tick = Decimal(first["books"][SYMBOL]["tick"])
+        trigger = (mark / tick).to_integral_value() * tick
+        ack = _ack(socket, {"action": "submit", "symbol": SYMBOL, "side": "buy",
+                            "quantity": 5, "price": None, "stop": str(trigger),
+                            "display": 2})
+    assert ack["ok"] is True, ack
+
+
+def test_renaming_with_no_body_is_a_bad_request_not_a_traceback(client):
+    response = client.post("/api/me", content=b"", headers={"Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert response.json()["ok"] is False
+
+
 def test_a_nonsense_action_is_reported_not_ignored(client):
     with client.websocket_connect("/ws") as socket:
         socket.receive_json()
@@ -425,6 +675,259 @@ def test_the_controller_loads_and_throttles_its_rendering(client, tmp_path):
         cwd=REPO,
         timeout=120,
     )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _snapshot_fixture() -> dict:
+    """A real snapshot, dressed the way the socket dresses one."""
+    snapshot = runner.market.snapshot()
+    snapshot["generation"] = runner.generation
+    snapshot["sessions"] = {
+        s: runner.market.venue.session(s).value
+        for s in runner.market.venue.registry.symbols
+    }
+    snapshot["speed"] = runner.market.speed
+    return snapshot
+
+
+# The handful of DOM APIs main.js touches, same shape as tests/frontend, with
+# one addition: nodes here remember their listeners, so a click can be fired.
+_STUB_DOM = """
+function makeNode(id = '') {
+  const listeners = {};
+  return {
+    id, dataset: {}, style: {},
+    classList: { toggle() {}, add() {}, remove() {}, contains: () => false },
+    children: [], childNodes: [], scrollTop: 0, textContent: '',
+    get innerHTML() { return ''; }, set innerHTML(_v) {},
+    setAttribute() {}, removeAttribute() {}, getAttribute: () => null,
+    addEventListener(kind, fn) { (listeners[kind] ||= []).push(fn); },
+    fire(kind) { (listeners[kind] || []).forEach((fn) => fn({ stopPropagation() {} })); },
+    removeEventListener() {},
+    append() {}, replaceChildren() {}, replaceWith() {}, remove() {},
+    focus() {}, closest: () => null,
+    querySelector: () => null, querySelectorAll: () => [],
+    contains: () => false, value: '', checked: false,
+  };
+}
+const nodes = new Map();
+for (const id of ['main', 'nav', 'watchlist', 'clock', 'events', 'equity', 'pnl',
+                  'health', 'health-text', 'speed', 'speed-label', 'toaster',
+                  't-send', 't-qty', 't-px', 't-stop', 't-show', 't-tif', 't-preview']) {
+  nodes.set(id, makeNode(id));
+}
+globalThis.document = {
+  getElementById: (id) => nodes.get(id) ?? makeNode(id),
+  querySelector: () => null, querySelectorAll: () => [],
+  createElement: () => makeNode(), addEventListener() {},
+  activeElement: null, body: makeNode('body'),
+};
+globalThis.CSS = { escape: (s) => String(s) };
+globalThis.history = { replaceState() {} };
+globalThis.confirm = () => true;
+globalThis.fetch = async () => ({ ok: true, json: async () => ({ instruments: [], agents: [] }) });
+const sockets = [];
+let sent = [];
+globalThis.WebSocket = class {
+  static OPEN = 1;
+  constructor() { this.readyState = 1; sockets.push(this); }
+  send(text) { sent.push(JSON.parse(text)); }
+  close() {}
+};
+let clockMs = 0;
+const pending = [];
+globalThis.requestAnimationFrame = (fn) => { pending.push(fn); return pending.length; };
+const runFrame = (ms) => { clockMs += ms; pending.splice(0).forEach((fn) => fn(clockMs)); };
+globalThis.setInterval = () => 0;
+globalThis.setTimeout = (fn) => { void fn; return 0; };
+globalThis.clearTimeout = () => {};
+"""
+
+
+def _run_node(script: str, tmp_path: Path) -> subprocess.CompletedProcess:
+    harness = tmp_path / "harness.mjs"
+    harness.write_text(script, encoding="utf-8")
+    return subprocess.run(
+        ["node", str(harness)],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        timeout=120,
+    )
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_ticket_reserves_what_the_venue_reserves(tmp_path):
+    """"Reserved now" was the notional, not the reservation.
+
+    They agree only for a long on a claim whose floor is zero, which most of
+    the board happens to be -- so it looked right until you sold, or touched
+    the spread. A sell of ten futures stopped at 4,600 announced 46,000 held
+    against the 54,000 the venue actually took; a spread stopped at zero
+    announced *nothing* held against 100,000. Understating every time, which
+    is the direction that leaves a trader believing in free cash they do not
+    have and their next order refused without explanation.
+
+    The expected figures come from ``Account.collateral_required`` itself, so
+    this is the page checked against the venue rather than against a second
+    opinion about the venue.
+    """
+    still = MarketRunner()
+    venue = still.market.venue
+    cases = []
+    for symbol in venue.registry.symbols:
+        instrument = venue.registry.require(symbol)
+        low, high = (from_money(b) for b in venue.bounds_in_minor(instrument))
+        for buying in (True, False):
+            for fraction in (Decimal("0.1"), Decimal("0.5"), Decimal("0.9")):
+                at = (low + (high - low) * fraction).quantize(Decimal("0.01"))
+                quantity = 10
+                held = Account.collateral_required(
+                    quantity if buying else -quantity,
+                    to_money(at),
+                    venue.bounds_in_minor(instrument),
+                )
+                cases.append(
+                    {
+                        "symbol": symbol,
+                        "buying": buying,
+                        "quantity": quantity,
+                        "at": str(at),
+                        "bounds": [str(low), str(high)],
+                        "expected": str(from_money(held)),
+                    }
+                )
+    assert len(cases) > 50
+
+    fixture = tmp_path / "collateral.json"
+    fixture.write_text(json.dumps(cases), encoding="utf-8")
+    format_js = (REPO / "dashboard" / "static" / "js" / "format.js").as_uri()
+
+    script = f"""
+import {{ readFileSync }} from 'node:fs';
+import {{ worstCase }} from {json.dumps(format_js)};
+const cases = JSON.parse(readFileSync({json.dumps(str(fixture))}, 'utf8'));
+const problems = [];
+for (const c of cases) {{
+  const shown = worstCase(c.quantity, c.at, c.bounds, c.buying);
+  if (shown == null) {{ problems.push(`${{c.symbol}}: nothing computed`); continue; }}
+  if (Math.abs(shown - Number(c.expected)) > 1e-6)
+    problems.push(`${{c.symbol}} ${{c.buying ? 'buy' : 'sell'}} ${{c.quantity}} at `
+      + `${{c.at}}: the ticket shows ${{shown}}, the venue holds ${{c.expected}}`);
+}}
+if (problems.length) {{
+  problems.slice(0, 8).forEach((p) => console.error('  - ' + p));
+  console.error(`(${{problems.length}} of ${{cases.length}} disagree)`);
+  process.exit(1);
+}}
+console.log(`${{cases.length}} reservations match the venue`);
+"""
+    result = _run_node(script, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_ticket_sends_the_stop_and_the_iceberg_it_collected(client, tmp_path):
+    """The Advanced panel collected two fields and threw them away.
+
+    A trader typed a stop trigger and an iceberg size, watched the preview
+    describe a stop -- "Waits until 8,900.00", "Reserved now ..." -- pressed
+    Place Order, and got a plain limit that rested in full, visible,
+    immediately. Both fields were supported by the server and by the venue the
+    whole time; the submitter simply never read them.
+
+    Driven through the real controller rather than asserted about the source,
+    because what matters is the message that leaves the browser.
+    """
+    fixture = tmp_path / "snapshot.json"
+    fixture.write_text(json.dumps(_snapshot_fixture()), encoding="utf-8")
+    main_js = (REPO / "dashboard" / "static" / "js" / "main.js").as_uri()
+
+    script = f"""
+import {{ readFileSync }} from 'node:fs';
+const snapshot = JSON.parse(readFileSync({json.dumps(str(fixture))}, 'utf8'));
+const symbol = {json.dumps(SYMBOL)};
+globalThis.location = {{ protocol: 'http:', host: 'localhost:8000',
+  href: 'http://localhost:8000/?view=trade&symbol=' + symbol,
+  search: '?view=trade&symbol=' + symbol }};
+{_STUB_DOM}
+await import({json.dumps(main_js)});
+const socket = sockets[0];
+socket.onmessage({{ data: JSON.stringify(snapshot) }});
+runFrame(600);                       // past the panel interval, so bind() runs
+
+nodes.get('t-qty').value = '10';
+nodes.get('t-px').value = '4600';
+nodes.get('t-stop').value = '4500';
+nodes.get('t-show').value = '2';
+nodes.get('t-tif').value = 'gtc';
+
+sent = [];
+nodes.get('t-send').fire('click');
+const order = sent.find((m) => m.action === 'submit');
+const problems = [];
+if (!order) problems.push('the send button sent nothing at all');
+else {{
+  if (order.stop == null || String(order.stop) !== '4500')
+    problems.push(`stop trigger 4500 was dropped: ${{JSON.stringify(order)}}`);
+  if (order.display == null || String(order.display) !== '2')
+    problems.push(`iceberg size 2 was dropped: ${{JSON.stringify(order)}}`);
+  if (String(order.quantity) !== '10') problems.push('size did not survive');
+  if (String(order.price) !== '4600') problems.push('limit price did not survive');
+}}
+if (problems.length) {{ problems.forEach((p) => console.error('  - ' + p)); process.exit(1); }}
+console.log('the ticket sent ' + JSON.stringify(order));
+"""
+    result = _run_node(script, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_the_send_button_is_live_wherever_the_venue_takes_orders(client, tmp_path):
+    """The first thing a stranger meets is a phase they could not trade in.
+
+    The exchange opens with a call auction, so every contract is in `pre_open`
+    on the first page load. Orders in a call phase are accepted, do rest, and
+    are what sets the opening price -- and the button was disabled, under a
+    label reading "pre open -- orders will rest". `closed` is the only phase
+    that refuses orders, and there the same label was a lie the other way.
+    """
+    fixture = tmp_path / "snapshot.json"
+    fixture.write_text(json.dumps(_snapshot_fixture()), encoding="utf-8")
+    views_js = (REPO / "dashboard" / "static" / "js" / "views.js").as_uri()
+
+    script = f"""
+import {{ readFileSync }} from 'node:fs';
+import {{ trade }} from {json.dumps(views_js)};
+const snapshot = JSON.parse(readFileSync({json.dumps(str(fixture))}, 'utf8'));
+const symbol = {json.dumps(SYMBOL)};
+
+// Whether the venue takes orders in a phase is SessionState.accepts_orders:
+// everything but `closed`.
+const expected = {{ pre_open: true, auction: true, continuous: true, closed: false }};
+const problems = [];
+for (const [session, takesOrders] of Object.entries(expected)) {{
+  const store = {{
+    snapshot: {{ ...snapshot, sessions: {{ ...snapshot.sessions, [symbol]: session }} }},
+    instruments: [], symbol, history: {{}}, depth: null, side: 'buy', reveal: false,
+  }};
+  const html = trade(store);
+  const button = html.match(/<button[^>]*id="t-send"[^>]*>([\\s\\S]*?)<\\/button>/);
+  if (!button) {{ problems.push(`${{session}}: no send button rendered`); continue; }}
+  const disabled = /\\bdisabled\\b/.test(button[0]);
+  if (disabled === takesOrders)
+    problems.push(`${{session}}: button disabled=${{disabled}} but the venue `
+      + `${{takesOrders ? 'accepts' : 'refuses'}} orders in it`);
+  const label = button[1].trim();
+  if (takesOrders && !/Place Order/.test(label))
+    problems.push(`${{session}}: label ${{JSON.stringify(label)}} does not offer to place one`);
+  if (!takesOrders && /will rest/.test(label))
+    problems.push(`${{session}}: label ${{JSON.stringify(label)}} promises a rest that cannot happen`);
+}}
+if (problems.length) {{ problems.forEach((p) => console.error('  - ' + p)); process.exit(1); }}
+console.log('the send button matches every phase');
+"""
+    result = _run_node(script, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

@@ -18,6 +18,7 @@ import random
 import pytest
 
 from arena.exchange.engine import MatchingEngine
+from arena.exchange.session import SessionState
 from arena.exchange.events import (
     Acknowledged,
     Cancel,
@@ -31,7 +32,10 @@ from arena.exchange.events import (
 )
 from arena.exchange.types import (
     AgentId,
+    OrderId,
+    OrderStatus,
     OrderType,
+    PegReference,
     Price,
     Quantity,
     RejectReason,
@@ -271,6 +275,38 @@ def test_fill_or_kill_is_not_fooled_by_dead_liquidity(engine):
     assert int(engine.book.depth_at(Side.SELL, Price(100))) == 5
 
 
+def test_fill_or_kill_is_not_admitted_by_the_taker_s_own_liquidity(engine):
+    """Quantity you own is not quantity you can take.
+
+    Self-trade prevention cancels the taker's own resting lots rather than
+    printing against them, so counting them when deciding whether the whole
+    order can fill admits an order that then partially fills. Measured before
+    the fix: against its own five lots at 100 and somebody else's five at 101,
+    a fill-or-kill buy for ten printed **five** at 101 while prevention
+    cancelled the rest of what the check had counted.
+
+    Both the engine and ``tests/reference_matcher.py`` counted it, so both had
+    to move in the same step. Correcting one alone made twelve differential
+    tests disagree, and a harness that disagrees is a worse failure than the
+    one it reports -- while a harness that agrees on the wrong answer reports
+    nothing at all.
+    """
+    engine.apply(limit(A, Side.SELL, 100, 5))
+    engine.apply(limit(B, Side.SELL, 101, 5))
+
+    events = engine.apply(limit(A, Side.BUY, 101, 10, TimeInForce.FOK))
+
+    assert trades(events) == [], "FOK filled against quantity prevention would cancel"
+    assert any(
+        isinstance(e, Rejected) and e.reason is RejectReason.FOK_NOT_FILLABLE
+        for e in events
+    )
+    # Rejected before any walk, so nothing was disturbed on the way out: the
+    # taker keeps its own resting lots and the genuine liquidity is untouched.
+    assert int(engine.book.depth_at(Side.SELL, Price(100))) == 5
+    assert int(engine.book.depth_at(Side.SELL, Price(101))) == 5
+
+
 @pytest.mark.parametrize("quantity", [0, -5])
 def test_non_positive_quantity_is_rejected(engine, quantity):
     events = engine.apply(Submit(A, Side.BUY, Quantity(quantity), Price(100)))
@@ -312,8 +348,6 @@ def test_cancelling_someone_elses_order_is_rejected(engine):
 
 
 def test_cancelling_an_unknown_order_is_rejected(engine):
-    from arena.exchange.types import OrderId
-
     events = engine.apply(Cancel(A, OrderId(999)))
     assert events[0].reason is RejectReason.UNKNOWN_ORDER
 
@@ -364,6 +398,73 @@ def test_replacing_into_a_crossing_price_trades_immediately(engine):
 
     events = engine.apply(Replace(B, bid.order_id, Quantity(10), Price(100)))
     assert trades(events)[0].price == 100
+
+
+def test_shrinking_is_not_a_fill(engine):
+    """Nothing traded, so nothing may claim to have traded.
+
+    The shrink used to be routed through the same book operation as a fill,
+    which reduces ``remaining`` and leaves ``quantity`` alone. On an order for a
+    hundred shrunk to sixty that read as forty lots filled and a status of
+    partially-filled, against an empty tape -- and every reconciliation
+    downstream computes what an order traded from exactly those two numbers.
+    """
+    ack = acked(engine.apply(limit(A, Side.SELL, 50, 100)))
+    engine.apply(Replace(A, ack.order_id, Quantity(60)))
+
+    order = engine.book.get(ack.order_id)
+    assert engine.tape == ()
+    assert int(order.filled) == 0
+    assert order.status is OrderStatus.NEW
+    assert (int(order.quantity), int(order.remaining)) == (60, 60)
+    assert int(engine.book.depth_at(Side.SELL, Price(50))) == 60
+
+
+def test_a_shrink_after_a_partial_fill_keeps_what_really_traded(engine):
+    """The same arithmetic, on an order that has genuinely traded some of itself.
+
+    Shrinking must take the same amount off the quantity as off the remainder,
+    or the fills already printed are counted twice.
+    """
+    ack = acked(engine.apply(limit(A, Side.SELL, 50, 30)))
+    engine.apply(limit(B, Side.BUY, 50, 20))
+    order = engine.book.get(ack.order_id)
+    assert (int(order.filled), int(order.remaining)) == (20, 10)
+
+    engine.apply(Replace(A, ack.order_id, Quantity(4)))
+    assert int(order.filled) == 20, "the shrink was counted as a fill"
+    assert int(order.remaining) == 4
+    assert order.status is OrderStatus.PARTIALLY_FILLED
+
+
+def test_a_post_only_order_stays_post_only_through_a_replace(engine):
+    """A replace is the same order at a new price, and the promise travels with it.
+
+    Post-only exists so that an order can never pay the taker fee, and the
+    promise lived only in the time-in-force of the command that created it --
+    which has been processed and thrown away by the time a replace arrives. A
+    post-only offer resting at 105 over a bid of 100, replaced to 100, printed
+    ten lots as the aggressor: exactly the thing the order type forbids.
+    """
+    engine.apply(limit(A, Side.BUY, 100, 10))
+    ask = acked(engine.apply(limit(B, Side.SELL, 105, 10, TimeInForce.POST_ONLY)))
+
+    events = engine.apply(Replace(B, ask.order_id, Quantity(10), Price(100)))
+
+    assert trades(events) == []
+    assert events[0].reason is RejectReason.POST_ONLY_WOULD_CROSS
+    assert engine.book.snapshot().best_ask == 105, "the refused replace moved it anyway"
+    assert engine.book.snapshot().best_bid == 100
+
+
+def test_a_post_only_order_may_still_be_replaced_where_it_cannot_cross(engine):
+    """The refusal is about crossing, not about post-only orders being frozen."""
+    engine.apply(limit(A, Side.BUY, 100, 10))
+    ask = acked(engine.apply(limit(B, Side.SELL, 105, 10, TimeInForce.POST_ONLY)))
+
+    events = engine.apply(Replace(B, ask.order_id, Quantity(10), Price(101)))
+    assert isinstance(events[0], Replaced)
+    assert engine.book.snapshot().best_ask == 101
 
 
 # --------------------------------------------------------------------------
@@ -444,6 +545,234 @@ def test_depth_matches_the_sum_of_resting_orders(seed):
                 if o.side is side and o.price == price
             )
             assert int(quantity) == actual
+
+
+def rich_commands(seed: int, count: int = 250) -> list:
+    """Random flow that uses the whole order-type surface rather than a corner.
+
+    ``random_commands`` above sends limits, markets and immediate-or-cancels,
+    which is the matching core and none of the machinery layered on top of it.
+    Every defect this file's newest tests were written for was found by adding
+    the rest -- icebergs, stops, pegs, minimum quantities, post-only, and
+    cancels and replaces against whatever happens to be resting -- and then
+    asserting the same structural invariants after every single command. A
+    generator that only sends the easy order types is a generator that only
+    finds bugs in the easy paths.
+    """
+    rng = random.Random(seed)
+    agents = [A, B, C]
+    commands: list = []
+    resting: list = []
+    for _ in range(count):
+        agent = rng.choice(agents)
+        side = rng.choice([Side.BUY, Side.SELL])
+        quantity = Quantity(rng.randint(1, 20))
+        price = Price(rng.randint(95, 105))
+        roll = rng.random()
+
+        if roll < 0.08 and resting:
+            order_id, owner = rng.choice(resting)
+            commands.append(Cancel(owner, order_id))
+        elif roll < 0.18 and resting:
+            order_id, owner = rng.choice(resting)
+            commands.append(
+                Replace(
+                    owner,
+                    order_id,
+                    Quantity(rng.randint(1, 25)),
+                    price if rng.random() < 0.5 else None,
+                )
+            )
+        elif roll < 0.26:
+            commands.append(market(agent, side, rng.randint(1, 10)))
+        elif roll < 0.36:
+            trigger = Price(rng.randint(95, 105))
+            commands.append(
+                Submit(
+                    agent,
+                    side,
+                    quantity,
+                    price if rng.random() < 0.5 else None,
+                    OrderType.STOP_LIMIT if rng.random() < 0.5 else OrderType.STOP,
+                    TimeInForce.GTC,
+                    stop_price=trigger,
+                )
+            )
+        elif roll < 0.46:
+            commands.append(
+                Submit(
+                    agent,
+                    side,
+                    quantity,
+                    None,
+                    OrderType.PEGGED,
+                    rng.choice([TimeInForce.GTC, TimeInForce.POST_ONLY]),
+                    peg_to=rng.choice(list(PegReference)),
+                    peg_offset=rng.randint(-2, 2),
+                    display_size=rng.choice([0, 0, 3]),
+                )
+            )
+        else:
+            display = rng.choice([0, 0, 0, 3, 5])
+            minimum = rng.choice([0, 0, 0, 0, min(3, quantity), min(5, quantity)])
+            if display and minimum > display:
+                minimum = 0
+            commands.append(
+                Submit(
+                    agent,
+                    side,
+                    quantity,
+                    price,
+                    OrderType.LIMIT,
+                    rng.choice(
+                        [TimeInForce.GTC] * 3
+                        + [TimeInForce.IOC, TimeInForce.FOK, TimeInForce.POST_ONLY]
+                    ),
+                    display_size=display,
+                    min_quantity=minimum,
+                )
+            )
+        # A plausible id to aim a later cancel or replace at. Ids are assigned
+        # in order, so this is the id the command just built will be given if
+        # the engine accepts it.
+        resting.append((OrderId(len(commands)), agent))
+    return commands
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 7, 11, 35, 42, 68])
+def test_every_level_reports_exactly_what_is_resting_on_it(seed):
+    """A level's running total must equal the slices really queued at it.
+
+    Maintained incrementally, so any operation that changes a queue without
+    changing the total by the same amount corrupts it silently and permanently.
+    A shrinking replace routed through the fill path did exactly that: it
+    reduced a level by lots taken out of an iceberg's hidden reserve, which the
+    level had never counted, and drove one to **-3** while five lots rested on
+    it and the published depth read **0**.
+    """
+    engine = MatchingEngine()
+    for command in rich_commands(seed):
+        engine.apply(command)
+        for side in (Side.BUY, Side.SELL):
+            for price, level in engine.book._levels[side].items():
+                live = [
+                    o for o in level.orders if not o.status.terminal and o.remaining > 0
+                ]
+                assert int(level.total) == sum(int(o.shown) for o in live), (
+                    f"level {side.value}@{int(price)} desynchronised"
+                )
+                for order in live:
+                    assert 0 < int(order.shown) <= int(order.remaining)
+                    assert int(order.price) == int(price)
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 7, 11, 23, 29, 38, 42, 55, 66])
+def test_nothing_rests_crossed_without_a_minimum_to_explain_it(seed):
+    """A cross is allowed only where the liquidity is conditional.
+
+    Minimum-quantity orders can sit on top of each other while neither is
+    allowed to trade, which is measured and deliberate. A cross between two
+    orders that carry no minimum has no such excuse, and one was reachable: a
+    stop released before its aggressor's own remainder had reached the book
+    matched a book that was missing it, and rested where it was about to rest
+    through. Bid 101 against ask 99, with nothing to clear it.
+    """
+    engine = MatchingEngine()
+    for command in rich_commands(seed):
+        engine.apply(command)
+        live = [
+            o
+            for o in engine.book.resting_orders
+            if not o.min_quantity and abs(int(o.price)) < (1 << 61)
+        ]
+        best_bid = max(
+            (int(o.price) for o in live if o.side is Side.BUY), default=None
+        )
+        best_ask = min(
+            (int(o.price) for o in live if o.side is Side.SELL), default=None
+        )
+        if best_bid is not None and best_ask is not None:
+            assert best_bid < best_ask, f"crossed at {best_bid}/{best_ask}"
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 7, 11, 42])
+def test_no_order_leaves_the_engine_without_saying_so(seed):
+    """Every order is working, or something in the stream says it is not.
+
+    Two ways out were found by asking. A stop is taken off the parked list the
+    moment a cascade claims it, so when the cascade hit its depth bound the
+    stops it had claimed and not yet run were simply dropped -- no order, no
+    cancellation, and a later cancel answered ``unknown_order``. And a stop that
+    *did* run was minted a fresh order id on the way through, so the id it was
+    acknowledged under, the one its owner holds and the venue reserves against,
+    referred to nothing: acknowledged as **4**, traded as **6**, and a cancel of
+    4 rejected as unknown.
+
+    Working here means one of the four places an order can legitimately be: in
+    the book, parked as a stop, waiting as a peg with no price yet, or finished
+    with an event that says so.
+    """
+    engine = MatchingEngine()
+    events = engine.apply_all(rich_commands(seed))
+
+    ended = {
+        e.order_id
+        for e in events
+        if isinstance(e, (Cancelled, Rejected)) and e.order_id is not None
+    }
+    working = {o.order_id for o in engine.book.resting_orders}
+    parked = {stop.order_id for stop in engine._stops}
+    # A peg whose reference has gone is live and has no price, so it is in no
+    # level and no book query can find it. Not lost -- waiting.
+    waiting = {peg.order.order_id for peg in engine._pegs}
+    for event in events:
+        if not isinstance(event, Acknowledged):
+            continue
+        order = engine.book.get(event.order_id)
+        filled = order is not None and order.status is OrderStatus.FILLED
+        assert (
+            event.order_id in working
+            or event.order_id in parked
+            or event.order_id in waiting
+            or event.order_id in ended
+            or filled
+        ), f"order {int(event.order_id)} vanished"
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 7, 9, 11, 12, 19, 42])
+def test_the_conditional_order_types_keep_their_conditions(seed):
+    """Post-only never takes; an aggressor's minimum is never undercut.
+
+    Both are checked per command, because both are statements about one pass of
+    the matcher: post-only about every execution in it, a minimum about the
+    total of them. A minimum for five that came away with four is not a small
+    error, it is the field not working.
+
+    This once carried an exception. A fill-or-kill order could be admitted on
+    the strength of quantity its own owner was resting and then prevented from
+    taking it, so the assertion allowed a partial fill whenever prevention had
+    cancelled something in the same pass. That over-count is fixed on both the
+    engine and the reference matcher, which had to move together, so the
+    exception is gone and the term now means what it says: nothing, or all of
+    it.
+    """
+    engine = MatchingEngine()
+    for command in rich_commands(seed):
+        events = engine.apply(command)
+        ack = next((e for e in events if isinstance(e, Acknowledged)), None)
+        if not isinstance(command, Submit) or ack is None:
+            continue
+        mine = [e for e in events if isinstance(e, Filled) and e.order_id == ack.order_id]
+        took = sum(int(e.quantity) for e in mine if e.aggressor)
+
+        if command.time_in_force is TimeInForce.POST_ONLY:
+            assert took == 0, "a post-only order took"
+        if command.min_quantity:
+            assert took == 0 or took >= command.min_quantity
+        if command.time_in_force is TimeInForce.FOK:
+            assert took in (0, int(command.quantity)), (
+                f"a fill-or-kill order for {int(command.quantity)} took {took}"
+            )
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3, 7, 11, 42])
@@ -527,3 +856,78 @@ def test_prevention_can_be_disabled_for_study(engine):
     permissive = MatchingEngine("X", self_trade_prevention=SelfTradePrevention.ALLOW)
     permissive.apply(limit(A, Side.SELL, 100, 10))
     assert len(trades(permissive.apply(limit(A, Side.BUY, 100, 10)))) == 1
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [SelfTradePrevention.CANCEL_NEWEST, SelfTradePrevention.CANCEL_BOTH],
+)
+def test_a_prevented_order_is_cancelled_rather_than_filled(policy):
+    """An order that traded nothing must not report that it traded everything.
+
+    Prevention finishes the incoming order mid-walk, and the arithmetic that
+    settles an order afterwards read "nothing left" as "completely filled". The
+    tape was empty, a ``Cancelled`` event had gone out for all ten lots, and the
+    order's own record said status **filled** with ``filled`` of **10** -- the
+    two numbers every position reconciliation is built on, both describing a
+    trade that never printed.
+    """
+    engine = MatchingEngine("X", self_trade_prevention=policy)
+    engine.apply(limit(A, Side.SELL, 100, 10))
+    ack = acked(engine.apply(limit(A, Side.BUY, 100, 10)))
+
+    order = engine.book.get(ack.order_id)
+    assert engine.tape == ()
+    assert order.status is OrderStatus.CANCELLED
+    assert int(order.filled) == 0
+    assert int(order.remaining) == 10
+
+
+def test_prevention_still_runs_when_the_taker_carries_a_minimum(engine):
+    """The minimum decides whether to print, not whether to walk.
+
+    Checking it before the walk started meant the walk never happened, and the
+    walk is where an agent meets its own resting orders. A maker that bid
+    fourteen at 99 and then offered seven at 98 with a minimum of three kept
+    both: the same agent on both sides of a book crossed 99 against 98, which
+    neither of them could ever clear. Without the minimum, on the identical
+    book, the stale bid is withdrawn and the offer rests alone.
+    """
+    engine.apply(limit(A, Side.BUY, 99, 14))
+    events = engine.apply(
+        Submit(A, Side.SELL, Quantity(7), Price(98), min_quantity=3)
+    )
+
+    assert trades(events) == []
+    assert any(isinstance(e, Cancelled) for e in events), "the stale bid survived"
+    book = engine.book.snapshot()
+    assert book.best_bid is None
+    assert book.best_ask == 98
+
+
+# --------------------------------------------------------------------------
+# The auction
+# --------------------------------------------------------------------------
+
+
+def test_a_wash_dropped_by_the_auction_is_really_gone(engine):
+    """Reported cancelled, and cancelled.
+
+    The uncross drops the older side of an agent's own cross, and it took the
+    order's quantity out of its level without marking the order terminal. It
+    stayed live in the queue: the book published **no bid at all** while a
+    continuous sell arriving afterwards filled **ten lots** against an order the
+    tape had already cancelled. Invisible and tradeable is the worst of both.
+    """
+    engine.phase = SessionState.PRE_OPEN
+    bid = acked(engine.apply(limit(A, Side.BUY, 100, 10)))
+    engine.apply(limit(A, Side.SELL, 100, 10))
+    engine.apply(limit(B, Side.SELL, 100, 4))
+
+    events = engine.uncross(Price(100))
+    assert [e.order_id for e in events if isinstance(e, Cancelled)] == [bid.order_id]
+
+    engine.phase = SessionState.CONTINUOUS
+    assert engine.book.get(bid.order_id).status is OrderStatus.CANCELLED
+    assert bid.order_id not in [o.order_id for o in engine.book.resting_orders]
+    assert trades(engine.apply(limit(C, Side.SELL, 100, 10))) == []

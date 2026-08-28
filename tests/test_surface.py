@@ -266,10 +266,28 @@ def test_the_live_chain_carries_no_tradeable_arbitrage_worth_the_name():
     Monotonicity is the exception and is asserted flat. A call struck higher
     marking above one struck lower is not a small pricing error, it is a free
     lunch of any size, and it was the original symptom: 72.7 against 59.1.
+
+    **The arbitrageur has to be in the market for this to be a fair question.**
+    It was not, and the test was quietly asserting that a chain stays
+    consistent with nobody in the population whose job is to keep it that way.
+    The maker's own ladder is coherent by construction -- one forward, one
+    volatility, one width across every strike -- but a *mark* is the mid of the
+    touch, and the touch belongs to whoever is at it. Measured at t=540 on seed
+    7: the 4,600 call's offer was set by a **noise trader** sitting inside the
+    maker's quote, which dragged that strike's mid down and left the three
+    marks at 120.38 / 71.12 / 10.12. That is concave by 11.74, and a butterfly
+    costs 6.00 to put on, so 5.74 of it was free to anyone who would take it --
+    and nobody in that market would.
+
+    With the arbitrageur listed the same measurement gives **0.00**. So this
+    now tests the thing its name claims, and tests something that had no
+    coverage at all: that the vertical and butterfly relations derived in
+    `arena.agents.arbitrageur` actually get enforced on a live chain, rather
+    than merely being derived correctly in a unit test.
     """
     from arena.exchange.session import SessionState
 
-    market = build(seed=7, surface=True)
+    market = build(seed=7, surface=True, arbitrageur=True)
     market.kernel.start()
     instrument = market.venue.registry.require("SPIKE_C4600")
 

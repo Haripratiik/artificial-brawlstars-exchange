@@ -34,6 +34,8 @@ import asyncio
 import contextlib
 import secrets
 import mimetypes
+import threading
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -43,6 +45,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from arena.exchange.types import AgentId
+from arena.portfolio.money import from_money
 from dashboard.identity import COOKIE, display_name, sign, verify
 from dashboard.state import FEE_SCHEDULES, MarketConfig, MarketRunner
 
@@ -68,9 +71,48 @@ STATIC = HERE / "static"
 # an eye resolves and cheap enough that the simulation never waits on a socket.
 TICK_SECONDS = 0.05
 
+
+@dataclass
+class _Seat:
+    """Which account a session id is sitting in, and what it calls itself.
+
+    Stamped with the market that issued it, because an account id only means
+    anything inside that market. Ids are handed out as `you-1`, `you-2`, ... and
+    a rebuild starts counting again, so the *same* id names a different person
+    in the next generation. Matching on the id alone, one visitor's remembered
+    `you-1` found the `you-1` another visitor had just been given and settled
+    into it: two people, one account, from the far side of the fix for two
+    people sharing one account.
+
+    It is the same argument the module docstring makes about a cookie from a
+    previous run, one level down -- a seat from a previous generation names
+    something that is gone.
+    """
+
+    agent_id: AgentId
+    name: str
+    generation: int
+
+
 # Sessions this process has seated, by cookie session id. Not a database: the
-# accounts they name live in the running market, so both go away together.
-_SEATS: dict[str, AgentId] = {}
+# accounts they name live in the running market, so both go away together. The
+# chosen name is kept beside the account id because the id does not survive a
+# rebuild and the name has to.
+_SEATS: dict[str, _Seat] = {}
+
+# Handing out a seat is a read-modify-write on the market's roster, and it is
+# not atomic: `LiveMarket.seat` picks the next free id, opens an account under
+# it and then registers the agent, and `Venue.open_account` checks for an
+# existing account a few statements before it creates one. Two threads through
+# that window both pick `you-1`, both pass the check, and the second overwrites
+# the first -- so two people end up sharing one account, which is the failure
+# this whole module exists to prevent, arrived at from the other direction.
+#
+# It matters because a rebuild makes every open connection re-seat at the same
+# instant. One event loop would serialise them (nothing here awaits), but the
+# server is reachable from more than one, and "it happens to be single-threaded
+# today" is not a property worth resting an account boundary on.
+_SEAT_LOCK = threading.Lock()
 
 
 app = FastAPI(title="Artificial Brawl Stars Exchange")
@@ -123,18 +165,48 @@ async def index(request: Request) -> FileResponse:
     return response
 
 
-def _seat_for(request_or_socket: Any) -> AgentId | None:
-    """The account this connection is signed in as, if any.
+def _session_id(request_or_socket: Any) -> str:
+    """The signed session id this connection carries, or ``""``."""
+    payload = verify(request_or_socket.cookies.get(COOKIE))
+    if payload is None:
+        return ""
+    return str(payload.get("sid", ""))
+
+
+def _seat_now(sid: str) -> AgentId | None:
+    """The account a session id holds *in the market that is running now*.
+
+    Re-seated when the market has been rebuilt underneath it, which is the
+    whole reason this is a function rather than a dictionary lookup.
+    ``reconfigure`` discards the old :class:`LiveMarket` and every account in
+    it, so a remembered id names a trader the new market has never heard of --
+    and ``LiveMarket.trader`` answers an id it does not know with the *shared*
+    account. Every signed-in visitor therefore collapsed onto one seat the
+    moment anybody pressed Rebuild in the Lab: one balance, one blotter, and
+    each of them able to cancel the others' orders. That is precisely the
+    failure the session cookie exists to prevent, and a page reload did not
+    clear it, because the stale entry was still in this table.
+
+    Re-seating keeps the cookie and the chosen name, so from the visitor's side
+    a rebuild looks like what it is: a new session in a new market.
 
     Returns ``None`` for a connection with no valid cookie, and the caller
     falls back to the shared account -- which is what every test and every
     direct API user gets, unchanged.
     """
-    payload = verify(request_or_socket.cookies.get(COOKIE))
-    if payload is None:
-        return None
-    seat = _SEATS.get(str(payload.get("sid", "")))
-    return seat
+    with _SEAT_LOCK:
+        seat = _SEATS.get(sid)
+        if seat is None:
+            return None
+        if seat.generation != runner.generation:
+            seat = _Seat(runner.market.seat(seat.name), seat.name, runner.generation)
+            _SEATS[sid] = seat
+        return seat.agent_id
+
+
+def _seat_for(request_or_socket: Any) -> AgentId | None:
+    """The account this connection is signed in as, if any."""
+    return _seat_now(_session_id(request_or_socket))
 
 
 def _ensure_session(request: Request, response: Response) -> AgentId:
@@ -150,11 +222,12 @@ def _ensure_session(request: Request, response: Response) -> AgentId:
     sid = str(payload.get("sid", ""))
     name = display_name(payload.get("name"))
 
-    seat = _SEATS.get(sid)
+    seat = _seat_now(sid)
     if seat is None:
-        sid = secrets.token_urlsafe(12)
-        seat = runner.market.seat(name)
-        _SEATS[sid] = seat
+        with _SEAT_LOCK:
+            sid = secrets.token_urlsafe(12)
+            seat = runner.market.seat(name)
+            _SEATS[sid] = _Seat(seat, name, runner.generation)
         response.set_cookie(
             COOKIE,
             sign({"sid": sid, "name": name}),
@@ -168,16 +241,27 @@ def _ensure_session(request: Request, response: Response) -> AgentId:
 @app.post("/api/me")
 async def api_rename(request: Request, response: Response) -> dict[str, Any]:
     """Change the name other traders see. There is nothing else to change."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        # A rename with no JSON body is a client's mistake, and answering it
+        # with a 500 and a traceback tells whoever wrote that client nothing.
+        response.status_code = 400
+        return {"ok": False, "error": 'expected a JSON body of {"name": ...}'}
     seat = _ensure_session(request, response)
     name = display_name(str(body.get("name", "")))
     agent = runner.market.traders.get(seat)
     if agent is not None:
         agent.display_name = name
-    payload = verify(request.cookies.get(COOKIE)) or {}
-    sid = str(payload.get("sid", "")) or next(
-        (k for k, v in _SEATS.items() if v == seat), ""
+    sid = _session_id(request) or next(
+        (k for k, v in _SEATS.items() if v.agent_id == seat), ""
     )
+    # Remembered here as well as in the cookie, so a rebuild re-seats this
+    # person under the name they chose rather than a fresh random one.
+    if sid in _SEATS:
+        _SEATS[sid] = _Seat(seat, name, runner.generation)
     response.set_cookie(
         COOKIE,
         sign({"sid": sid, "name": name}),
@@ -298,10 +382,17 @@ async def stream(socket: WebSocket) -> None:
     # Read before accepting would be tidier, but the cookie is set by the page
     # load that preceded this, so by here it is there or the visitor never
     # loaded the page.
-    seat = _seat_for(socket)
-    receiver = asyncio.create_task(_receive(socket, seat))
+    #
+    # The *session id* is what is held, not the account. A rebuild replaces
+    # every account in the market, so a connection that captured an account id
+    # once would spend the rest of its life reading someone else's -- the
+    # shared one. Resolving per tick means a socket open across a rebuild
+    # follows its own person into the new market.
+    sid = _session_id(socket)
+    receiver = asyncio.create_task(_receive(socket, sid))
     try:
         while True:
+            seat = _seat_now(sid)
             payload = runner.market.snapshot(seat)
             payload["generation"] = runner.generation
             payload["sessions"] = {
@@ -319,40 +410,154 @@ async def stream(socket: WebSocket) -> None:
             await receiver
 
 
-async def _receive(socket: WebSocket, seat: AgentId | None = None) -> None:
+class _BadOrder(ValueError):
+    """Something a person typed, described back to them in their own terms."""
+
+
+def _whole(value: Any, field: str) -> int:
+    """A whole number out of a text box, or a sentence saying why not.
+
+    ``int(...)`` on the raw field answered a blank size box with "int()
+    argument must be a string, a bytes-like object or a real number, not
+    'NoneType'" and a mistyped one with "invalid literal for int() with base
+    10: 'many'". Both are the interpreter talking to itself, and both were
+    shown verbatim in a toast on a screen people trade from.
+    """
+    if isinstance(value, bool) or value is None or value == "":
+        raise _BadOrder(f"{field} is required -- type a whole number")
+    try:
+        number = Decimal(str(value).strip())
+    except (ArithmeticError, ValueError):
+        raise _BadOrder(f"{value!r} is not a {field} -- type a whole number") from None
+    if number != number.to_integral_value():
+        raise _BadOrder(f"{field} must be a whole number, not {value}")
+    return int(number)
+
+
+def _decimal(value: Any, field: str) -> Decimal:
+    """A price out of a text box.
+
+    The limit-price box is free text, so what arrives is whatever somebody
+    typed -- and a price copied off the ladder carries the thousands separator
+    the ladder drew it with. ``Decimal("9,233.75")`` raises
+    ``InvalidOperation``, whose ``str`` is "[<class
+    'decimal.ConversionSyntax'>]": a Python class repr, offered to a stranger
+    as advice.
+
+    The comma is *not* stripped and retried. Quietly reinterpreting a number
+    somebody typed is how an order ends up resting at a price they did not
+    choose, which is the same argument ``Instrument.to_ticks`` makes about
+    rounding onto the tick grid.
+    """
+    try:
+        return Decimal(str(value).strip())
+    except (ArithmeticError, ValueError):
+        raise _BadOrder(
+            f"{value!r} is not a {field} -- digits and a decimal point only, "
+            "with no commas or currency symbols"
+        ) from None
+
+
+def _in_range(price: Decimal, instrument: Any, field: str) -> Decimal:
+    """Refuse a price the contract cannot possibly settle at.
+
+    Nothing checked this, and the collateral model cannot: it sizes the worst
+    case from the settlement range, so a bid *below* the floor looks safer than
+    one inside it and passes every test the venue applies. A limit buy at -100
+    on a contract bounded at 0 was accepted, rested, and was eventually filled
+    -- handing the account a hundred and thirty thousand of profit for having
+    been paid to take delivery of something that cannot be worth less than
+    nothing.
+    """
+    low, high = (
+        from_money(bound)
+        for bound in runner.market.venue.bounds_in_minor(instrument)
+    )
+    if not low <= price <= high:
+        raise _BadOrder(
+            f"{price} is outside {instrument.symbol}'s settlement range "
+            f"{low} to {high} -- it cannot settle there, so no {field} may rest there"
+        )
+    return price
+
+
+def _order_from(message: dict[str, Any]) -> dict[str, Any]:
+    """The arguments a submit needs, out of what a browser sent.
+
+    Everything here came from a text box or a select, so it is checked the way
+    :meth:`MarketConfig.from_dict` checks configuration: in the terms of the
+    control it came from, refusing rather than guessing.
+    """
+    symbol = str(message.get("symbol") or "")
+    instrument = runner.market.venue.registry.get(symbol)
+    if instrument is None:
+        raise _BadOrder(
+            "choose a market before sending an order"
+            if not symbol
+            else f"unknown symbol {symbol}"
+        )
+
+    # Anything that was not exactly "buy" used to become a SELL, silently, so a
+    # typo in a client sold instead of bought and nothing anywhere said so.
+    side = str(message.get("side", "")).strip().lower()
+    if side not in ("buy", "sell"):
+        raise _BadOrder(f"side must be buy or sell, not {message.get('side')!r}")
+
+    raw_price = message.get("price")
+    price = (
+        None
+        if raw_price in (None, "", "market")
+        else _in_range(_decimal(raw_price, "price"), instrument, "order")
+    )
+    raw_stop = message.get("stop")
+    stop = (
+        None
+        if raw_stop in (None, "", "none")
+        else _in_range(_decimal(raw_stop, "stop trigger"), instrument, "stop")
+    )
+    raw_display = message.get("display")
+    return {
+        "symbol": symbol,
+        "side": side,
+        "quantity": _whole(message.get("quantity"), "size"),
+        "price": price,
+        "tif": str(message.get("tif", "")),
+        "stop": stop,
+        "display": 0 if raw_display in (None, "", 0) else _whole(raw_display, "show size"),
+    }
+
+
+async def _receive(socket: WebSocket, sid: str = "") -> None:
     """Handle actions from the browser.
 
     Orders are queued onto the human agent rather than applied directly, so a
     person's click enters the same event queue as an algorithm's decision and is
     subject to the same latency.
+
+    The seat is resolved per message rather than captured once, for the reason
+    given in :func:`_seat_now`: a rebuild replaces every account, and a
+    connection holding the old id would be trading the shared one.
     """
     while True:
         try:
             message = await socket.receive_json()
         except (WebSocketDisconnect, RuntimeError):
             return
+        if not isinstance(message, dict):
+            with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+                await socket.send_json(
+                    {"ack": {"ok": False, "error": "expected a JSON object"}}
+                )
+            continue
 
+        seat = _seat_now(sid)
         action = message.get("action")
         try:
             if action == "submit":
-                price = message.get("price")
-                result = runner.market.submit(
-                    symbol=message["symbol"],
-                    side=message["side"],
-                    quantity=int(message["quantity"]),
-                    price=None if price in (None, "", "market") else Decimal(str(price)),
-                    tif=str(message.get("tif", "")),
-                    trader=seat,
-                    stop=(
-                        None
-                        if message.get("stop") in (None, "", "none")
-                        else Decimal(str(message["stop"]))
-                    ),
-                    display=int(message.get("display") or 0),
-                )
+                result = runner.market.submit(trader=seat, **_order_from(message))
             elif action == "cancel":
                 result = runner.market.cancel(
-                    int(message["order_id"]),
+                    _whole(message.get("order_id"), "order number"),
                     trader=seat,
                     symbol=message.get("symbol"),
                 )
@@ -364,6 +569,8 @@ async def _receive(socket: WebSocket, seat: AgentId | None = None) -> None:
                 result = runner.set_speed(float(message["value"]))
             else:
                 result = {"ok": False, "error": f"unknown action {action!r}"}
+        except _BadOrder as bad:
+            result = {"ok": False, "error": str(bad)}
         except (KeyError, ValueError, TypeError, InvalidOperation) as bad:
             result = {"ok": False, "error": str(bad)}
 

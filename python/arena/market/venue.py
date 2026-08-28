@@ -185,6 +185,17 @@ class Venue:
         self._balances: dict[AgentId, Money] = {
             agent_id: to_money(amount) for agent_id, amount in (balances or {}).items()
         }
+        # The venue's own account opens empty, because it is not a participant
+        # and nobody funded it. Falling through to the default opening balance
+        # gave it capital it never received and hid the one thing it exists to
+        # show: on a schedule that pays out more than it takes, the venue lost
+        # **930,000,000** minor units over two hundred fills and its own
+        # account still read 39,999,070,000,000 -- comfortably solvent, and a
+        # measurement of nothing. Starting at zero makes the balance equal to
+        # what was collected, so a venue paying people to trade with each other
+        # shows up as a negative number rather than a slow drain on capital
+        # that was never there.
+        self._balances.setdefault(FEE_ACCOUNT_ID, Money(0))
         self._engines: dict[str, MatchingEngine] = {}
         self._accounts: dict[AgentId, Account] = {}
         self._phase: dict[str, SessionState] = {}
@@ -464,8 +475,82 @@ class Venue:
                         getattr(command, "order_id", None),
                     )
                 ]
+            # And inside the range the contract can settle in, which nothing
+            # checked at all. Measured: a bid at -400 ticks on a contract
+            # bounded by [0, 40,000] was acknowledged and rested, and a bid at
+            # 40,400 was acknowledged and *traded* -- printing at 10,100 on a
+            # claim that can be worth at most 10,000, and dragging the mark of
+            # every position in the symbol to 10,100,000,000 with it.
+            #
+            # Collateral structurally cannot catch this, which is why it needs
+            # a listing rule of its own. The requirement is the worst case over
+            # the settlement range, so a bid *below* the floor scores as the
+            # safest order on the book -- it can only gain. The venue's central
+            # safety mechanism rates the impossible order as the safe one.
+            #
+            # Checked against the range as it stands now, in the same minor
+            # units the collateral is computed in, rather than against the
+            # range the contract was written with. A share that has paid out
+            # part of its value is worth less by exactly what it paid, and
+            # quoting the un-narrowed range would let an order be entered above
+            # what the claim can still deliver.
+            #
+            # Inclusive at both ends: a settlement value can legitimately land
+            # on a bound, so a price there is a price the contract can pay.
+            #
+            # It governs entry and nothing else. An order already resting when
+            # a distribution narrows the range underneath it stays exactly
+            # where it is: the venue does not reprice an order whose owner
+            # named a price -- the same argument that keeps a limit order out
+            # of the circuit breaker's collar -- and pulling it would close a
+            # position its owner never asked to close. What follows the range
+            # down instead is the collateral, which `distribute` re-posts
+            # against the new bounds in the same instant it pays.
+            low, high = self.bounds_in_minor(instrument)
+            if not int(low) <= int(instrument.price_in_minor(priced)) <= int(high):
+                return [
+                    Rejected(
+                        SequenceNumber(0),
+                        agent_id,
+                        RejectReason.INVALID_PRICE,
+                        getattr(command, "order_id", None),
+                    )
+                ]
 
-        if self._rate_limited(agent_id):
+        # Sized on the lot the contract is listed in, which is the other half
+        # of the same listing rule and was the half nobody enforced. The
+        # instrument declares "tick / lot -- the grid the exchange enforces"
+        # and only the tick was ever checked: measured on a contract listed in
+        # lots of ten, an order for **seven** was acknowledged and rested, and
+        # would have traded. A quantity that cannot exist is exactly as
+        # unquotable as a price that cannot exist, and a rule the venue does
+        # not enforce is documentation rather than a listing rule.
+        sized = getattr(command, "quantity", None)
+        if isinstance(command, Replace):
+            sized = command.new_quantity
+        if isinstance(command, (Submit, Replace)) and sized is not None:
+            if int(sized) % instrument.lot_size:
+                return [
+                    Rejected(
+                        SequenceNumber(0),
+                        agent_id,
+                        RejectReason.INVALID_QUANTITY,
+                        getattr(command, "order_id", None),
+                    )
+                ]
+
+        # A cancel is counted against the allowance but is never refused for
+        # it. Refusing one traps the participant in the orders it already has
+        # -- unable to place, unable to withdraw, holding exposure nobody is
+        # permitted to manage -- which is exactly the outcome the kill switch
+        # thirty lines above goes out of its way to avoid, arriving by the
+        # other control. Measured before this: a participant at a cap of five
+        # sent five orders, then every attempt to pull one came back
+        # RATE_LIMITED, and fifty lots stayed standing in the book through
+        # five retries. A cancel also only ever *reduces* the venue's work and
+        # the participant's risk, so refusing it is the one refusal that makes
+        # both sides worse.
+        if self._rate_limited(agent_id, reducing=isinstance(command, Cancel)):
             return [
                 Rejected(
                     SequenceNumber(0),
@@ -479,8 +564,7 @@ class Venue:
         # documentation while the book carried on past it. Once the observation
         # window has closed the outcome is determined, so anyone still trading
         # is trading against an answer that already exists.
-        if self._clock is not None and self._clock() >= instrument.expiry:
-            self._set_phase(symbol, SessionState.CLOSED)
+        self._enforce_lifecycle(symbol)
 
         if not self.session(symbol).accepts_orders and isinstance(
             command, (Submit, Replace)
@@ -488,6 +572,35 @@ class Venue:
             # Cancels stay legal after the close so an agent can tidy up; new
             # risk cannot be taken once the outcome is determined.
             return [Rejected(SequenceNumber(0), agent_id, RejectReason.ALREADY_TERMINAL)]
+
+        # A call phase is defined by the fact that nothing matches in it, and a
+        # replace is the one command that breaks that definition. The engine's
+        # replace pulls the old order and re-runs the match on the replacement,
+        # unconditionally -- it never consults the phase -- so a halted book
+        # traded: measured, a replace during a halt printed 20 lots at 17,000
+        # against an order that was only resting there because the auction had
+        # not run yet.
+        #
+        # Worse, market-on-open orders rest at the sentinel price so that they
+        # cross every candidate the auction considers. A replace during a call
+        # phase matches against those in continuous fashion, so it printed
+        # trades at **-4,611,686,018,427,387,904** -- the same catastrophe the
+        # engine's unfilled-market-order sweep was written to prevent, reached
+        # through a door that sweep does not cover.
+        #
+        # Refused rather than accumulated, which is what the engine already
+        # does with the other instructions that mean "right now" in a phase
+        # that has no right now. A participant that wants different terms in an
+        # auction cancels and re-enters.
+        if isinstance(command, Replace) and not self.session(symbol).matches_continuously:
+            return [
+                Rejected(
+                    SequenceNumber(0),
+                    agent_id,
+                    RejectReason.NOT_ACCEPTED_IN_AUCTION,
+                    command.order_id,
+                )
+            ]
 
         # Replace is checked as well as Submit. Guarding only new orders leaves
         # a hole wide enough to drive through: an agent could work ten lots,
@@ -510,7 +623,21 @@ class Venue:
         events = self._engines[symbol].apply(command)
         self._check_limit_state(symbol)
         self._book_fills(symbol, instrument, events)
-        self._track_working(agent_id, symbol, events)
+        # Delivered to everyone the events belong to, not only to the agent who
+        # sent the command. A trade has two sides, and the resting one is
+        # somebody else's: booking the batch under the sender alone meant the
+        # passive side's fill was looked up in the wrong agent's record, found
+        # nothing, and did nothing -- so a maker's order stayed in the venue's
+        # working book forever after the engine had removed it.
+        #
+        # Measured on a maker quoting two lots a round and getting lifted every
+        # round: after 120 rounds the venue believed it was working **120
+        # orders for 240 lots** while the engine's book held none, and
+        # collateral was reserved against every one of them. With a million in
+        # capital the maker was refused for insufficient collateral at round
+        # 47, holding 497,100 of free cash and nothing at all in the book --
+        # the account charged twice for a risk it holds once.
+        self._track_all_working(symbol, events, default_owner=agent_id)
         return events
 
     def _affordable(
@@ -571,7 +698,7 @@ class Venue:
             side = command.side
             price = instrument.price_in_minor(command.price)
             quantity = int(command.quantity)
-        else:
+        elif self.session(symbol).matches_continuously:
             side = command.side
             # A market order can only ever trade against resting liquidity, so
             # its exposure is bounded by the book rather than by the contract's
@@ -586,6 +713,28 @@ class Venue:
                 # No liquidity to hit. The order will cancel unfilled and can
                 # create no position, so there is nothing to collateralise.
                 return True
+        else:
+            # In a call phase the book says nothing about what this will fill
+            # against, and the bound above is only sound because the engine
+            # walks the same levels in the same instant. A market-on-open order
+            # does not trade on arrival at all: it rests until the uncross and
+            # then trades against liquidity that had not arrived yet, at a
+            # price the auction picks. So the honest assumption is the one the
+            # rest of this method makes about an order that named no price --
+            # the far end of the contract's range.
+            #
+            # Measured before this: an account holding 10,000 sent a
+            # market-on-open buy for 100,000 lots into an empty ask side. The
+            # book walk found nothing to hit, concluded there was nothing to
+            # collateralise, and let it rest. Sellers then arrived, the auction
+            # cleared it in full, and the account came out of its own opening
+            # auction 45,000 times underwater: 450,000,000 of collateral
+            # required against free cash of **-449,990,000,000,000** minor
+            # units. A venue that discovers insolvency after the trade has
+            # printed cannot unprint it.
+            side = command.side
+            quantity = int(command.quantity)
+            price = Money(int(bounds[1]) if side is Side.BUY else int(bounds[0]))
 
         position = account.positions.get(symbol)
         current = position.quantity if position else 0
@@ -606,12 +755,32 @@ class Venue:
         worst_buy = Money(max(prices))
         worst_sell = Money(min(prices))
 
-        required = max(
-            int(account.collateral_required(current + buys, worst_buy, bounds)),
-            int(account.collateral_required(current - sells, worst_sell, bounds)),
-        )
+        # Each scenario is charged against the *basis* the position would end
+        # up holding, not against its quantity priced at the trade that
+        # finished it. The two differ whenever a fill adds to a position at a
+        # different price, and they differ in the dangerous direction: the
+        # cost of what is already held is simply missing from
+        # ``resulting * incoming_price``.
+        #
+        # Measured through this order path, on an account holding 50,500 with
+        # bounds of [0, 10,000]: ten lots long at 5,000, then ten more at 100.
+        # The scenario was evaluated as ``20 * 100 = 2,000`` against a position
+        # whose basis came out at 51,000, the order was accepted, and the
+        # account finished with collateral of 51,000,000,000 minor units
+        # against 50,500,000,000 of cash -- **free cash of -500,000,000**,
+        # which is an account owing money it does not have on a venue whose
+        # whole claim is that it cannot.
+        #
+        # `basis_after` is a pure projection of `Position.apply_fill`, held to
+        # it by a property test over random fill sequences, so the figure
+        # checked here is the figure the fill will produce rather than a second
+        # implementation of it.
         released = int(account.collateral.get(symbol, Money(0)))
-        if int(account.free_cash) + released >= required:
+        if self._survives(
+            account, position, buys, worst_buy, current + buys, released, bounds
+        ) and self._survives(
+            account, position, -sells, worst_sell, current - sells, released, bounds
+        ):
             return True
         if not self.netting:
             return False
@@ -627,6 +796,63 @@ class Venue:
         #
         # This is exact rather than a model. See `arena/portfolio/netting.py`.
         return self._portfolio_affords(agent_id, instrument, side, quantity, price)
+
+    @classmethod
+    def _survives(
+        cls,
+        account: Account,
+        position: Any,
+        quantity: int,
+        price: Money,
+        resulting: int,
+        released: int,
+        bounds: tuple[Money, Money],
+    ) -> bool:
+        """Whether the account still covers itself after one scenario fills.
+
+        Two things move, and only one of them was being counted. The scenario
+        posts collateral against the position it creates -- that was counted --
+        and it *realises* whatever the closing part of it made or lost, which
+        comes straight out of cash the moment the fill books. Checking the
+        requirement against the cash the account has now compares it with money
+        the trade is about to take away.
+
+        Measured over four hundred fills sweeping the whole settlement range:
+        an account short four lots at an average of 50 bought eleven at 9,500.
+        The flip realised a loss of **37,800,000,000** minor units, which the
+        check never saw, so 66,500,000,000 of collateral was approved against
+        104,130,530,000 of cash that became 66,309,630,000 the instant it
+        filled -- free cash of **-190,370,000**. Nine of thirty random runs
+        finished with some account underwater.
+
+        The realised figure is derived from ``basis_after`` rather than
+        computed alongside it, and the derivation is an identity that holds in
+        every branch of ``apply_fill`` -- opening, reducing and flipping alike:
+
+            basis_after  =  basis_before  +  quantity * price  +  realised
+
+        Reading it the other way round gives the line below. So there is still
+        exactly one projection of the fill here, and it is the one the
+        portfolio layer pins to ``apply_fill`` with a property test.
+        """
+        projected = cls._basis_after(position, quantity, price)
+        basis_now = int(position.cost_basis) if position is not None else 0
+        realised = int(projected) - quantity * int(price) - basis_now
+        required = int(account.collateral_for_basis(resulting, projected, bounds))
+        return int(account.free_cash) + released + realised >= required
+
+    @staticmethod
+    def _basis_after(position: Any, quantity: int, price: Money) -> Money:
+        """The basis a scenario would leave behind, from flat or from a holding.
+
+        A thin wrapper so the two scenarios read as one line each, and so an
+        account with nothing in the symbol yet takes the same path as one that
+        already holds something. From flat the answer is just what the fill
+        pays, which is what the old figure assumed was always true.
+        """
+        if position is None:
+            return Money(quantity * int(price))
+        return position.basis_after(quantity, price)
 
     def _portfolio_affords(
         self,
@@ -690,6 +916,29 @@ class Venue:
             return 0, Money(0)
         return filled, instrument.price_in_minor(worst)
 
+    def _track_all_working(
+        self,
+        symbol: str,
+        events: list[Event],
+        default_owner: AgentId | None = None,
+    ) -> None:
+        """Book a batch of events into the working record of whoever owns them.
+
+        An event batch belongs to everybody who was in it, which is obvious for
+        an auction and was missed for continuous trading: a match produces a
+        fill for the incoming order and one for the resting order, and those
+        are two different participants.
+        """
+        by_owner: dict[AgentId, list[Event]] = (
+            {default_owner: []} if default_owner is not None else {}
+        )
+        for event in events:
+            owner = getattr(event, "agent_id", None)
+            if owner is not None:
+                by_owner.setdefault(owner, []).append(event)
+        for owner, owned in by_owner.items():
+            self._track_working(owner, symbol, owned)
+
     def _track_working(
         self, agent_id: AgentId, symbol: str, events: list[Event]
     ) -> None:
@@ -700,12 +949,14 @@ class Venue:
         """
         book = self._working.setdefault((agent_id, symbol), {})
         for event in events:
-            if isinstance(event, Acknowledged) and event.price is not None:
-                book[event.order_id] = (
-                    event.side,
-                    int(event.quantity),
-                    int(self.registry.require(symbol).price_in_minor(event.price)),
-                )
+            if isinstance(event, Acknowledged):
+                priced = self._working_price(symbol, event)
+                if priced is not None:
+                    book[event.order_id] = (
+                        event.side,
+                        int(event.quantity),
+                        priced,
+                    )
             elif isinstance(event, Filled):
                 existing = book.get(event.order_id)
                 if existing is not None:
@@ -731,8 +982,49 @@ class Venue:
                     int(event.quantity),
                     int(self.registry.require(symbol).price_in_minor(event.price)),
                 )
-            elif isinstance(event, (Cancelled, Rejected)):
+            elif isinstance(event, Cancelled):
                 book.pop(getattr(event, "order_id", None), None)
+            elif isinstance(event, Rejected):
+                # A refusal is not a removal, and treating it as one lost the
+                # venue's only record of a live order. The engine refuses a
+                # replace it dislikes and leaves the original exactly where it
+                # was -- so `Replace(order, quantity=0)` came back
+                # INVALID_QUANTITY, the order stayed resting for 30 lots, and
+                # the venue forgot it existed. `kill` then reported no symbols
+                # and left the order standing in the book, which is the one
+                # control that is meant to always work doing nothing at all.
+                #
+                # The engine is the authority on whether anything went away, so
+                # ask it. A rejection that *did* terminate an order -- post-only
+                # that would have crossed, fill-or-kill that could not, an
+                # immediate order refused by a call phase -- is acknowledged
+                # before it is refused, so the record must still be dropped for
+                # those or it becomes a phantom.
+                order_id = getattr(event, "order_id", None)
+                if order_id is not None and order_id in book:
+                    order = self._engines[symbol].book.get(order_id)
+                    if order is not None and not order.is_resting:
+                        book.pop(order_id, None)
+
+    def _working_price(self, symbol: str, event: Acknowledged) -> int | None:
+        """What to reserve an acknowledged order against, in minor units.
+
+        Its own price when it named one. An order that named none is either
+        parked with no price yet -- a peg with no reference, which is not in
+        any book and can create no position until it is -- or a market-on-open
+        order, which is resting right now and will trade at whatever the
+        auction clears at. The book tells the two apart, and the second is
+        reserved against the far end of the contract's range because that is
+        the worst price an order that named none could get.
+        """
+        instrument = self.registry.require(symbol)
+        if event.price is not None:
+            return int(instrument.price_in_minor(event.price))
+        order = self._engines[symbol].book.get(event.order_id)
+        if order is None or not order.is_resting:
+            return None
+        low, high = self.bounds_in_minor(instrument)
+        return int(high) if event.side is Side.BUY else int(low)
 
     def _side_of(self, symbol: str, order_id: OrderId, book: dict) -> Side:
         """Which side a replaced order is on, asked of whoever still knows.
@@ -841,9 +1133,57 @@ class Venue:
         if engine is not None:
             engine.phase = state
 
+    def _enforce_lifecycle(self, symbol: str) -> bool:
+        """Close a symbol the contract no longer permits trading in.
+
+        The rule itself is old -- once the observation window has closed the
+        outcome is determined, so anyone still trading is trading against an
+        answer that already exists -- but it was enforced on exactly one path,
+        the arrival of an order. Every other way the venue acts on a symbol
+        skipped it, and a halted symbol is precisely the one nobody sends
+        orders to.
+
+        Measured: a symbol paused by the circuit breaker whose window closed
+        while it was paused was still reported by `reopen_due`, and the reopen
+        auction printed 40 lots at 18,800 on a contract whose outcome was
+        already known, then put it back into continuous trading.
+
+        A settled symbol is the same statement made by the other clock. Nothing
+        may trade in a contract that has already paid out: it can never settle
+        again, so the position would be marked forever and realised never.
+        """
+        if self.session(symbol) is SessionState.CLOSED:
+            return True
+        if symbol in self._settled:
+            self._set_phase(symbol, SessionState.CLOSED)
+            return True
+        instrument = self.registry.get(symbol)
+        if (
+            instrument is not None
+            and self._clock is not None
+            and self._clock() >= instrument.expiry
+        ):
+            self._set_phase(symbol, SessionState.CLOSED)
+            return True
+        return False
+
     def begin_session(self, symbol: str) -> None:
         """Put a symbol into its opening call phase. Orders rest, nothing trades."""
         self.registry.require(symbol)
+        if symbol in self._settled:
+            # Loud, because this one can only be a mistake. Opening a call
+            # phase on a contract that has already paid out let orders
+            # accumulate and the next uncross crossed them: measured, a
+            # participant came out of it holding 10 lots of a contract that can
+            # never settle again, because `settle` refuses to fire twice.
+            raise ValueError(
+                f"{symbol} has already settled; opening a session on it would "
+                "let positions be taken in a contract that can never pay them out"
+            )
+        if self._enforce_lifecycle(symbol):
+            # Expired rather than mistaken. The calendar closed it, and a call
+            # phase cannot reopen what the calendar closed.
+            return
         self._set_phase(symbol, SessionState.PRE_OPEN)
 
     def indicative(self, symbol: str) -> AuctionResult | None:
@@ -879,6 +1219,12 @@ class Venue:
         place for a leak to hide.
         """
         instrument = self.registry.require(symbol)
+        if self._enforce_lifecycle(symbol):
+            # Nothing to cross. A contract past its window or already settled
+            # has an answer, and an auction is a mechanism for discovering a
+            # price -- running one here would print trades against a number
+            # everybody could already look up.
+            return None, []
         engine = self._engines[symbol]
         result = indicative_auction(engine.book, self._reference.get(symbol))
         events = engine.uncross(self._reference.get(symbol))
@@ -886,20 +1232,62 @@ class Venue:
         # Grouped by owner, because an auction's events belong to everyone who
         # was in it. Skipping this left collateral reserved against orders the
         # uncross had already filled or cancelled.
-        by_owner: dict[AgentId, list[Event]] = {}
-        for event in events:
-            owner = getattr(event, "agent_id", None)
-            if owner is not None:
-                by_owner.setdefault(owner, []).append(event)
-        for owner, owned in by_owner.items():
-            self._track_working(owner, symbol, owned)
+        self._track_all_working(symbol, events)
         if result is not None and result.volume > 0:
+            # The reference moves to the cleared price, but the *window* is
+            # already carrying it: `_book_fills` records every `Traded` the
+            # uncross produced, and an auction that clears has to produce at
+            # least one. Appending here as well counted a single auction print
+            # twice -- measured, one print at 18,600 and two entries at 18,600
+            # in the window -- which double-weights the auction in the trailing
+            # mean and inflates the count the halting rule waits for.
             self._reference[symbol] = result.price
-            self._recent.setdefault(symbol, deque()).append((self._now(), result.price))
         self._reopen_at.pop(symbol, None)
         self._limit_since.pop(symbol, None)
         self._set_phase(symbol, SessionState.CONTINUOUS)
-        return result, events
+        return result, events + self._release_stops_after(symbol, instrument, events)
+
+    def _release_stops_after(
+        self, symbol: str, instrument: Instrument, events: list[Event]
+    ) -> list[Event]:
+        """Fire the stops the auction's own prints set off.
+
+        An uncross prints, and a print is a print whoever made it. Measured on
+        the same book twice: a sell stop parked at 18,000 with a bid of 20 at
+        17,900 behind it. Traded continuously the tape read
+        ``[(10, 18000), (10, 17900)]`` and the stop was gone; cleared by an
+        auction the tape read ``[(10, 18000)]`` and the stop was still parked.
+        So an auction jumped straight over a stop -- and an auction is the event
+        most likely to gap through one, which is exactly why the stop was there.
+
+        **After the phase flip, and that is the whole reason this lives here
+        rather than in the engine.** `MatchingEngine.uncross` runs while the
+        symbol is still in its call phase, so a stop released inside it becomes
+        a market order arriving at a book that does not match: it would be
+        accumulated at the sentinel price instead. That is the order that once
+        printed trades at -4,611,686,018,427,387,904 and billed 4.8e22 in fees.
+        The venue owns the phase, so the venue is the only place the sequence
+        can be got right -- uncross, reopen, then release into a continuous
+        book.
+
+        The band is recomputed first, because a cascade is a market order and
+        market orders are collared. The reference has just moved to the cleared
+        price, and collaring the cascade against the price the auction *left*
+        is the whole point of having a band at all.
+        """
+        engine = self._engines[symbol]
+        self._apply_band(symbol)
+        released = engine._release_after(events)
+        if not released:
+            return []
+        # Booked at the taker rate, not the auction rate: these orders crossed
+        # a spread in continuous trading, which is what an aggressor is. Billing
+        # them as part of the auction would charge a cascade at whatever the
+        # cross costs, and the cascade is not part of the cross.
+        self._book_fills(symbol, instrument, released)
+        self._track_all_working(symbol, released)
+        self._check_limit_state(symbol)
+        return released
 
     def halt(self, symbol: str, reason: str = "manual") -> None:
         """Suspend trading. Orders keep arriving; the reopen is an auction.
@@ -909,8 +1297,17 @@ class Venue:
         halt exists to prevent.
         """
         self.registry.require(symbol)
-        if self.session(symbol) is SessionState.CLOSED:
+        if self._enforce_lifecycle(symbol):
             return
+        # A manual halt has no timer, so it drops whatever timer was running.
+        # Without this the breaker's stale reopen time survived an operator's
+        # halt and reopened it: a symbol paused by the band and then halted for
+        # news was still listed by `reopen_due` the moment the *band's* pause
+        # ran out, so the operator's halt quietly expired on a schedule the
+        # operator never set. A halt somebody decided on ends when somebody
+        # decides it ends.
+        self._reopen_at.pop(symbol, None)
+        self._limit_since.pop(symbol, None)
         self._set_phase(symbol, SessionState.AUCTION)
         self.halts.append({"symbol": symbol, "reason": reason})
 
@@ -971,23 +1368,21 @@ class Venue:
         symbol is in a limit state when the best bid or offer is *at* a band,
         not when a trade has already happened beyond it.
         """
+        self._reference.setdefault(symbol, price)
+        if self.price_band is None:
+            # The window exists to serve the band and nothing else, and it is
+            # only ever trimmed by the two methods the band calls -- both of
+            # which return immediately when there is no band. So a venue with
+            # the breaker switched off appended a print per trade and dropped
+            # none: measured, 400 prints retained inside a window five minutes
+            # wide that nothing was ever going to look at. This venue bounds
+            # its trade log and its public log for exactly this reason.
+            return
         window = self._recent.setdefault(symbol, deque())
         window.append((self._now(), price))
-        self._reference.setdefault(symbol, price)
-
-    def _check_price_band(self, symbol: str, price: Price) -> None:
-        """Record a print in the reference window. Nothing else.
-
-        Prints cannot leave the band any more -- the engine refuses to match
-        outside it -- so a print is no longer evidence of anything except where
-        the market is. The limit state is judged from the *quote* instead, in
-        :meth:`_check_limit_state`, which is what the rule actually says: a
-        symbol is in a limit state when the best bid or offer is *at* a band,
-        not when a trade has already happened beyond it.
-        """
-        window = self._recent.setdefault(symbol, deque())
-        window.append((self._now(), price))
-        self._reference.setdefault(symbol, price)
+        cutoff = self._now() - self.reference_window_ns
+        while window and window[0][0] < cutoff:
+            window.popleft()
 
     def _check_limit_state(self, symbol: str) -> None:
         """Enter a limit state while the quote presses against a band, and pause
@@ -1115,11 +1510,33 @@ class Venue:
         # were still standing in the book.
         self._internal = True
         try:
-            for (owner, symbol), working in list(self._working.items()):
-                if owner != agent_id or not working:
+            for symbol in self.registry.symbols:
+                engine = self._engines.get(symbol)
+                if engine is None:
+                    continue
+                # The book first, and the venue's own record second. Asking
+                # only the record was asking the wrong authority: a
+                # market-on-open order acknowledges no price, so nothing was
+                # ever recorded for it, and the kill switch walked straight
+                # past one. Measured, `kill` reported the symbol as pulled
+                # while a 40-lot market-on-open buy stayed standing -- and the
+                # stopped participant then took 40 lots in the very auction it
+                # had been stopped before.
+                #
+                # A parked stop is the case the book cannot answer: it is
+                # deliberately off the book so that nobody can see where the
+                # cascade starts, and it is still an order this participant is
+                # working. So both are asked, and the union is pulled.
+                order_ids = {
+                    order.order_id
+                    for order in engine.book.resting_orders
+                    if order.agent_id == agent_id
+                }
+                order_ids |= set(self._working.get((agent_id, symbol), {}))
+                if not order_ids:
                     continue
                 touched.append(symbol)
-                for order_id in list(working):
+                for order_id in sorted(order_ids):
                     self.submit(agent_id, symbol, Cancel(agent_id, order_id))
         finally:
             self._internal = False
@@ -1129,11 +1546,17 @@ class Venue:
         """Let a stopped participant back in. It starts with nothing working."""
         self.halted_participants.pop(agent_id, None)
 
-    def _rate_limited(self, agent_id: AgentId) -> bool:
+    def _rate_limited(self, agent_id: AgentId, reducing: bool = False) -> bool:
         """Whether this participant has already used its second's allowance.
 
         A rolling second rather than a fixed one, so a burst cannot be split
         across a boundary and counted as two quiet windows.
+
+        ``reducing`` marks a command that can only take risk *out* of the
+        market. It is still counted -- a burst of them is still traffic, and
+        still costs the sender its ability to add anything -- but it is never
+        refused, because a participant that cannot withdraw is a participant
+        holding exposure nobody is permitted to manage.
         """
         if self.message_rate is None or self._internal:
             return False
@@ -1142,7 +1565,10 @@ class Venue:
         cutoff = now - 1_000_000_000
         while window and window[0] < cutoff:
             window.popleft()
-        if len(window) >= self.message_rate:
+        if len(window) >= self.message_rate and not reducing:
+            # Not appended, so a refusal cannot lengthen the lockout: a client
+            # that retries would otherwise keep its own lockout alive by trying
+            # to get out of it.
             return True
         window.append(now)
         return False
@@ -1186,13 +1612,21 @@ class Venue:
         ledger's -- so this reports and the caller uncrosses.
         """
         now = self._now()
-        return tuple(
-            sorted(
-                symbol
-                for symbol, at in self._reopen_at.items()
-                if now >= at and self.session(symbol) is SessionState.AUCTION
-            )
-        )
+        due: list[str] = []
+        for symbol, at in sorted(self._reopen_at.items()):
+            if now < at:
+                continue
+            # The calendar is asked here too, because this is the one path that
+            # reaches a symbol nobody is sending orders to -- which is what a
+            # paused symbol is. A contract whose window closed while it was
+            # paused has an answer, and reopening it would cross resting orders
+            # against a number that already exists.
+            if self._enforce_lifecycle(symbol):
+                self._reopen_at.pop(symbol, None)
+                continue
+            if self.session(symbol) is SessionState.AUCTION:
+                due.append(symbol)
+        return tuple(due)
 
     def close(self, symbol: str) -> None:
         """Stop trading. The outcome is determined; only settlement remains."""

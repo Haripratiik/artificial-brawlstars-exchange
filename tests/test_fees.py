@@ -250,3 +250,99 @@ def test_post_only_guarantees_the_rebate_rather_than_the_fee():
         Submit(TAKER, Side.SELL, Quantity(50), None, OrderType.MARKET, TimeInForce.IOC),
     )
     assert int(venue.account(MAKER).cash) > opening
+
+
+# --------------------------------------------------------------------------
+# The venue's own account, as a measurement
+# --------------------------------------------------------------------------
+
+
+def test_the_venue_starts_with_nothing_so_its_balance_is_its_revenue():
+    """The venue is not a participant and nobody funded it.
+
+    Its account fell through to the same opening balance as everybody else, so
+    it began with capital it had never received -- and that hid the single
+    thing this account exists to show. Measured on a schedule that pays out
+    more than it takes: two hundred fills took the venue **930,000,000** minor
+    units into the red and its own account still read 39,999,070,000,000, which
+    is comfortably solvent and a measurement of nothing.
+    """
+    generous = FeeSchedule(taker_bps=1.0, maker_bps=-3.0)
+    venue = Venue("arena", starting_cash=40_000_000, fees=generous)
+    venue.list_instrument(_instrument())
+    for _ in range(50):
+        _rest(venue, Side.SELL, 18_600, 5)
+        _cross(venue, Side.BUY, 5)
+
+    treasury = venue.account(FEE_ACCOUNT_ID)
+    assert int(treasury.starting_cash) == 0
+    assert int(treasury.cash) == int(venue.fees_collected)
+    assert int(treasury.cash) < 0, "a venue paying rebates on both sides looked solvent"
+    assert venue.conservation_check() == 0
+
+
+def test_a_venue_that_takes_more_than_it_pays_banks_exactly_that():
+    """The same account read the other way round, so the change above cannot be
+    a sign error that happens to look right only when the venue is losing.
+    """
+    venue = _venue()
+    _rest(venue, Side.SELL, 18_800, 500)
+    _cross(venue, Side.BUY, 300)
+    treasury = venue.account(FEE_ACCOUNT_ID)
+    assert int(treasury.cash) == int(venue.fees_collected) > 0
+    assert venue.conservation_check() == 0
+
+
+def test_the_venues_own_capital_is_not_counted_as_capital_in_the_market():
+    """Total equity is what the participants brought, wherever it has since
+    moved to.
+
+    An opening balance for an account nobody funded added itself to that figure
+    the moment the first fee was charged, so the market appeared to gain a
+    venue's worth of capital because somebody paid a fee.
+    """
+    venue = _venue()
+    _rest(venue, Side.SELL, 18_800, 200)
+    _cross(venue, Side.BUY, 100)
+    assert FEE_ACCOUNT_ID in venue.accounts, "no fee was charged, so nothing was tested"
+
+    brought = int(venue.account(MAKER).starting_cash) + int(
+        venue.account(TAKER).starting_cash
+    )
+    assert Decimal(venue.summary()["total_equity"]) == Decimal(brought) / 1_000_000
+    assert venue.conservation_check() == 0
+
+
+# --------------------------------------------------------------------------
+# Where the rounding rule stops being exact
+# --------------------------------------------------------------------------
+
+
+def test_the_rounding_rule_is_exact_at_every_notional_this_venue_can_reach():
+    """The rule is stated absolutely -- a charge rounds up, a rebate rounds down
+    in magnitude -- and it is computed in floating point, so it has a ceiling.
+
+    Measured, that ceiling is around 8e16 minor units of notional: at
+    79,310,569,539,990,007 the taker fee came out one unit *below* the exact
+    answer, which is the venue short by one. Reaching it needs roughly ten
+    million lots at the top of a contract's range, against accounts that open
+    with 40,000,000 -- so it is four orders of magnitude out of reach, and it
+    is not a leak in any case, because the treasury receives exactly what the
+    participants were charged whatever the rounding does.
+
+    This pins the reachable half of that statement. If capital here ever grows
+    by four orders of magnitude, this is the assertion that says the fee
+    arithmetic has to come off floats first.
+    """
+    reachable = 10**15
+    for schedule in (MAKER_TAKER, FeeSchedule(taker_bps=2.5, maker_bps=-1.5)):
+        for aggressor in (True, False):
+            bps = Decimal(str(schedule.rate(aggressor)))
+            for notional in (1, 7, 999, 333_333, 10**9, 10**12, reachable):
+                got = Decimal(int(schedule.charge(notional, aggressor)))
+                exact = Decimal(notional) * bps / Decimal(10_000)
+                # Toward the venue, and never by a whole unit: a charge lands
+                # at or above the exact figure, a rebate at or above it too,
+                # which for a negative number means smaller in magnitude.
+                assert got >= exact
+                assert got - exact < 1

@@ -27,7 +27,7 @@ from arena.exchange.types import AgentId, OrderType, Price, Quantity, RejectReas
 from arena.market.instrument import Instrument, InstrumentClass
 from arena.market.venue import Venue
 from arena.portfolio.account import Account
-from arena.portfolio.money import from_money, to_money as M
+from arena.portfolio.money import Money, from_money, to_money as M
 from arena.portfolio.position import Position
 from arena.settlement.result import SettlementResult, SettlementStatus
 
@@ -97,6 +97,29 @@ def test_collateral_is_the_exact_worst_case():
     spec = make_spec()
     assert spec.collateral_for(10, D("5100")) == D("51000")   # long: loses all of it
     assert spec.collateral_for(-10, D("5100")) == D("49000")  # short: to the top
+
+
+def test_collateral_is_never_negative():
+    """A position that cannot lose is charged nothing, not a credit.
+
+    A short above the top of a claim's range makes money whatever happens, and
+    the arithmetic ran straight past zero into negative territory: measured, a
+    short of one lot at 12,000 on a contract bounded by [0, 10000] returned
+    -2,000. That figure is *summed* with the rest of a portfolio's requirement,
+    so a negative one does not merely misreport, it funds another position.
+    """
+    spec = make_spec()
+    assert spec.collateral_for(-1, D("12000")) == D(0)
+    assert spec.collateral_for(1, D("-500")) == D(0)
+
+    bounds = (M("0"), M("10000"))
+    assert Account.collateral_required(-1, M("12000"), bounds) == M("0")
+    assert Account.collateral_required(1, M("-500"), bounds) == M("0")
+
+    account = Account("a", M("100000"))
+    account.apply_fill("X", -1, M("12000"), bounds)
+    assert account.posted_collateral == M("0")
+    assert account.free_cash == account.cash
 
 
 # --------------------------------------------------------------------------
@@ -190,6 +213,58 @@ def test_notional_is_not_debited_from_cash():
     assert account.free_cash == M("50000")
 
 
+def test_collateral_is_charged_against_the_basis_not_a_floored_average():
+    """The average is a division and the basis is not.
+
+    Two fills at different prices leave a basis that is not divisible by the
+    quantity, and `apply_fill` used to derive ``cost_basis // quantity`` and
+    charge against that. Floor division rounds a long's average *down*, so the
+    requirement came out under the loss by whatever the basis left over.
+    Measured on seven lots bought as three at 10.25 and four at 11.50: a basis
+    of 76,750,000 minor units against 76,749,995 posted -- five short. Under a
+    minor unit a lot, and not zero, and the claim on this module is that its
+    figures are exact rather than close.
+    """
+    account = Account("a", M("1000000"))
+    bounds = (M("0"), M("10000"))
+    account.apply_fill("X", 3, M("10.25"), bounds)
+    account.apply_fill("X", 4, M("11.50"), bounds)
+
+    position = account.position("X")
+    # A long can lose everything it paid, down to the bottom of the range.
+    assert int(account.collateral["X"]) == int(position.cost_basis)
+    assert int(position.cost_basis) % position.quantity != 0  # the case that rounded
+
+    # And the mirror: a short's exposure is the top of the range less its basis.
+    short = Account("b", M("1000000"))
+    short.apply_fill("Y", -3, M("10.25"), bounds)
+    short.apply_fill("Y", -4, M("11.50"), bounds)
+    seven_to_the_top = 7 * int(M("10000")) + int(short.position("Y").cost_basis)
+    assert int(short.collateral["Y"]) == seven_to_the_top
+
+
+def test_a_partial_close_recharges_the_remainder_exactly():
+    """Collateral has to follow the basis left behind, remainder included.
+
+    A proportional close leaves an integer remainder inside the position on
+    purpose -- that is what keeps the ledger conserving -- and the requirement
+    on what is left must be computed from that basis rather than reconstructed
+    from an average, or the two disagree by the remainder.
+    """
+    account = Account("a", M("1000000"))
+    bounds = (M("0"), M("10000"))
+    account.apply_fill("X", 7, M("10.25"), bounds)
+    account.apply_fill("X", -2, M("11.00"), bounds)
+
+    position = account.position("X")
+    assert position.quantity == 5
+    assert int(account.collateral["X"]) == int(position.cost_basis)
+
+    account.apply_fill("X", -5, M("11.00"), bounds)
+    assert "X" not in account.collateral
+    assert account.posted_collateral == M("0")
+
+
 def test_collateral_is_released_when_a_position_closes():
     account = Account("a", M("100000"))
     bounds = (M("0"), M("10000"))
@@ -206,6 +281,50 @@ def test_an_account_cannot_exceed_its_collateral():
     bounds = (M("0"), M("10000"))
     assert account.can_afford("X", 2, M("5000"), bounds) is True
     assert account.can_afford("X", 3, M("5000"), bounds) is False
+
+
+def test_adding_at_a_lower_price_cannot_outrun_the_cash():
+    """The check has to price the position the fill creates, from its basis.
+
+    Ten lots long at 5,000 is 50,000 of exposure. Ten more at 100 was checked as
+    ``20 * 100 = 2,000``, because the resulting quantity was priced at the
+    incoming trade rather than at what the position had actually paid. An
+    account holding exactly 50,000 passed that check, came out with a basis of
+    51,000, posted more collateral than it owned -- `free_cash` at -1,000 -- and
+    stood to owe a thousand it did not have if the contract settled at zero.
+    """
+    account = Account("a", M("50000"))
+    bounds = (M("0"), M("10000"))
+    account.apply_fill("X", 10, M("5000"), bounds)
+    assert account.free_cash == M("0")
+
+    assert account.can_afford("X", 10, M("100"), bounds) is False
+
+    # The invariant the check exists to hold: whatever gets through, posted
+    # collateral never exceeds the cash backing it.
+    for quantity, price in ((1, M("100")), (4, M("2")), (10, M("100"))):
+        if account.can_afford("X", quantity, price, bounds):
+            account.apply_fill("X", quantity, price, bounds)
+    assert int(account.free_cash) >= 0
+    assert int(account.cash) + int(account.position("X").unrealized_pnl(M("0"))) >= 0
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 5, 8])
+def test_the_projected_basis_matches_the_applied_one(seed):
+    """`basis_after` duplicates `apply_fill`'s branches, so pin them together.
+
+    Opening, adding, partial closes that leave an integer remainder, exact
+    closes and flips -- the projection has to agree on all five or the solvency
+    check is answering about a position the ledger will not produce.
+    """
+    rng = random.Random(seed)
+    position = Position("X")
+    for _ in range(200):
+        quantity = rng.choice([-9, -7, -3, -1, 1, 2, 5, 11])
+        price = M(D(rng.randrange(1, 400)) * D("0.25"))
+        projected = position.basis_after(quantity, price)
+        position.apply_fill(quantity, price)
+        assert int(position.cost_basis) == int(projected)
 
 
 def test_reducing_a_position_is_always_affordable():
@@ -236,6 +355,55 @@ def test_settling_twice_is_refused():
     account.settle("X", M("5500"))
     with pytest.raises(ValueError, match="already settled"):
         account.settle("X", M("5500"))
+
+
+def test_a_share_pays_down_its_range_and_closes_out_to_nothing():
+    """The newest class, and the only one whose cash moves before settlement.
+
+    Four payments of 467 against a claim that settles at nothing: the long
+    receives, the short pays, and neither books a profit for it. What the two
+    sides hold has to sum to exactly zero at every step -- after each payment
+    and after settlement -- and both positions must end flat with no collateral
+    and no residual basis. A share's terminal payoff is Linear(0), so its
+    settlement bounds are [0, 0] and every guard downstream of settlement is
+    vacuous on it; this is the check that it closes out anyway.
+    """
+    long, short = Account("l", M("1000000")), Account("s", M("1000000"))
+    bounds = (M("0"), M("4000"))
+    for account, quantity in ((long, 10), (short, -10)):
+        account.apply_fill("EQ", quantity, M("1869"), bounds)
+
+    paid = 0
+    for _ in range(4):
+        free_before = (int(long.free_cash), int(short.free_cash))
+        paid += int(M("467"))
+        remaining = (Money(int(bounds[0]) - paid), Money(int(bounds[1]) - paid))
+        received = long.distribute("EQ", M("467"), remaining)
+        owed = short.distribute("EQ", M("467"), remaining)
+        assert int(received) + int(owed) == 0
+        # A payment cannot make either side insolvent, and now exactly so: the
+        # long's requirement rises by precisely the cash it received and the
+        # short's falls by precisely the cash it paid, so free cash does not
+        # move at all. Charged against a floored average this held only to
+        # within the remainder the division threw away.
+        assert (int(long.free_cash), int(short.free_cash)) == free_before
+        # A payment moves cash and lowers the claim by the same amount, so the
+        # short's requirement falls by exactly what it just handed over.
+        assert int(short.collateral["EQ"]) == 10 * (4_000_000_000 - paid) - int(
+            M("18690")
+        )
+        assert int(long.cash) + int(short.cash) == 2 * int(M("1000000"))
+
+    # Nothing is left: it has all been paid out.
+    for account in (long, short):
+        account.settle("EQ", Money(int(M("0")) - paid))
+        position = account.position("EQ")
+        assert position.is_flat
+        assert int(position.cost_basis) == 0
+        assert account.posted_collateral == M("0")
+
+    assert int(long.cash) + int(short.cash) == 2 * int(M("1000000"))
+    assert int(long.equity({})) + int(short.equity({})) == 2 * int(M("1000000"))
 
 
 def test_a_void_returns_collateral_without_realising():

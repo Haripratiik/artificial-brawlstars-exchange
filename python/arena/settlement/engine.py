@@ -82,13 +82,37 @@ def distributions(spec: ContractSpec, oracle: Oracle) -> tuple[Decimal, ...]:
     if spec.distribution is None:
         return ()
 
+    # The same out-of-range guard `settle` applies, for the same reason, and the
+    # only place a share ever gets one. A share's terminal payoff is Linear(0),
+    # so its settlement bounds are [0, 0] and the check below `settle` can never
+    # fire on it -- yet a share is the one instrument whose cash moves *before*
+    # settlement, and `Venue.distribute` lowers the range collateral is charged
+    # against by whatever was paid. So a payment outside the range the schedule
+    # declared would silently move the bounds every short in the contract is
+    # collateralised against, and nothing downstream would notice. On the
+    # fixture the four SPIKE_EQ payments come out at 468.5, 464.75, 468.75 and
+    # 467.25 against a declared range of [0, 1000], so this is a guard rather
+    # than a change of behaviour.
+    floor, ceiling = spec.distribution.payoff.bounds(spec.underlying.bounds())
+    lowest = quantize_to_tick(floor, spec.tick_size)
+    highest = quantize_to_tick(ceiling, spec.tick_size)
+
     paid: list[Decimal] = []
     for window in spec.distribution.windows:
         values = {ref: oracle.resolve(ref, window).value for ref in spec.atoms()}
         level = spec.underlying.evaluate(values)
-        paid.append(
-            quantize_to_tick(spec.distribution.payoff.apply(level), spec.tick_size)
+        amount = quantize_to_tick(
+            spec.distribution.payoff.apply(level), spec.tick_size
         )
+        if not lowest <= amount <= highest:
+            raise SettlementOutOfBounds(
+                f"{spec.contract_id} would pay {amount} for the period beginning "
+                f"{window.start.isoformat()}, outside the range [{lowest}, {highest}] "
+                "its schedule declared. Either the oracle returned a metric outside "
+                "its stated bounds or those bounds are wrong -- and unlike a "
+                "settlement, a payment cannot be walked back once it has moved cash."
+            )
+        paid.append(amount)
     return tuple(paid)
 
 

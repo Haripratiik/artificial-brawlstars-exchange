@@ -36,7 +36,7 @@ from arena.agents.base import _on_grid
 from arena.contracts.payoff import Linear
 from arena.contracts.spec import ContractSpec, DataPolicy, ObservationWindow
 from arena.contracts.underlying import Difference, MetricRef, Single
-from arena.exchange.events import Submit
+from arena.exchange.events import Acknowledged, Replace, Submit
 from arena.exchange.types import (
     AgentId,
     OrderType,
@@ -47,6 +47,7 @@ from arena.exchange.types import (
     TimeInForce,
 )
 from arena.market.instrument import Instrument
+from arena.portfolio.money import from_money
 from arena.market.venue import Venue
 from arena.sim.time import seconds
 
@@ -540,3 +541,219 @@ def test_the_uniform_contract_still_quotes_quarters(live_market):
     assert any(price % 1 != 0 for price in prices), (
         "no fractional price rested, so the uniform tick was not exercised"
     )
+
+
+# --------------------------------------------------------------------------
+# The other half of the same listing rule: the lot
+# --------------------------------------------------------------------------
+
+
+def test_the_venue_refuses_a_quantity_off_the_contracts_lot():
+    """An instrument declares "tick / lot -- the grid the exchange enforces",
+    and only the tick was ever enforced.
+
+    A quantity that cannot exist is exactly as unquotable as a price that
+    cannot exist, and the argument the price case already makes applies word
+    for word: a rule the venue does not enforce is documentation rather than a
+    listing rule. Measured on a contract listed in lots of ten, an order for
+    **seven** was acknowledged, rested, and would have traded.
+    """
+    piper = Instrument(SYM, spec(), lot_size=10)
+    venue = venue_with(piper)
+    events = venue.submit(
+        MAKER, SYM, limit(MAKER, Side.BUY, piper.to_ticks(D("4000.00")), quantity=7)
+    )
+    assert reasons(events) == [RejectReason.INVALID_QUANTITY]
+    assert venue.engine(SYM).book.total_resting_quantity == 0
+
+
+def test_the_venue_accepts_a_whole_number_of_lots():
+    """The permissive half. A check that refused every size, or that compared
+    against the wrong number, would take the contract off the market entirely
+    -- and an agent told no for a size the contract does allow has no way to
+    comply.
+    """
+    piper = Instrument(SYM, spec(), lot_size=10)
+    venue = venue_with(piper)
+    events = venue.submit(
+        MAKER, SYM, limit(MAKER, Side.BUY, piper.to_ticks(D("4000.00")), quantity=30)
+    )
+    assert reasons(events) == []
+    assert venue.engine(SYM).book.total_resting_quantity == 30
+
+
+def test_an_amendment_cannot_resize_an_order_off_the_lot():
+    """The same hole the price check already closed on the same command.
+
+    Guarding only new orders leaves the way in wide open: an accepted 30-lot
+    order is amended to 7 and rests at a size the contract does not list, with
+    nothing rejected. A modification is a request for a size exactly as it is a
+    request for a price.
+    """
+    piper = Instrument(SYM, spec(), lot_size=10)
+    venue = venue_with(piper)
+    accepted = venue.submit(
+        MAKER, SYM, limit(MAKER, Side.BUY, piper.to_ticks(D("4000.00")), quantity=30)
+    )
+    order_id = next(e.order_id for e in accepted if isinstance(e, Acknowledged))
+
+    events = venue.submit(
+        MAKER, SYM, Replace(MAKER, order_id, Quantity(7), piper.to_ticks(D("3999.00")))
+    )
+    assert reasons(events) == [RejectReason.INVALID_QUANTITY]
+    assert venue.engine(SYM).book.total_resting_quantity == 30
+
+
+def test_a_contract_listed_in_single_lots_is_unaffected():
+    """Every contract on this venue but a deliberately-listed one has a lot
+    size of one, where every quantity is a whole number of lots. The rule has
+    to be silent there or it would be a change to the whole market rather than
+    a fact about one listing.
+    """
+    plain = future()
+    venue = venue_with(plain)
+    for quantity in (1, 7, 33):
+        events = venue.submit(
+            MAKER,
+            SYM,
+            limit(MAKER, Side.BUY, plain.to_ticks(D("4000.00")), quantity=quantity),
+        )
+        assert reasons(events) == []
+    assert venue.engine(SYM).book.total_resting_quantity == 41
+
+
+# --------------------------------------------------------------------------
+# And inside the range the contract can settle in
+# --------------------------------------------------------------------------
+
+
+def _at(venue, instrument, price: str, side=Side.BUY, quantity: int = 5, who=MAKER):
+    return venue.submit(
+        who, SYM, limit(who, side, instrument.to_ticks(D(price)), quantity)
+    )
+
+
+def test_the_venue_refuses_a_price_the_contract_can_never_settle_at():
+    """A listing rule of the same kind as the grid, and the one nobody wrote.
+
+    Measured on a contract bounded by [0, 10,000]: a bid at -100 was
+    acknowledged and rested, and a bid at 10,100 was acknowledged and *traded*
+    -- a print above everything the claim can ever be worth, which dragged the
+    mark of every position in the symbol up with it.
+
+    Collateral structurally cannot catch this, which is exactly why it needs a
+    rule of its own. The requirement is the worst case over the settlement
+    range, so a bid *below* the floor scores as the safest order on the book:
+    it can only gain. The venue's central safety mechanism rates the impossible
+    order as the safe one.
+    """
+    piper = future()
+    venue = venue_with(piper)
+    low, high = piper.value_bounds
+
+    below = _at(venue, piper, str(low - D("100")))
+    above = _at(venue, piper, str(high + D("100")))
+    assert reasons(below) == [RejectReason.INVALID_PRICE]
+    assert reasons(above) == [RejectReason.INVALID_PRICE]
+    assert venue.engine(SYM).book.total_resting_quantity == 0
+    assert venue.engine(SYM).tape == ()
+    assert venue.conservation_check() == 0
+
+
+def test_a_price_on_either_bound_is_still_a_price_the_contract_can_pay():
+    """The permissive half, and the bounds are inclusive because a settlement
+    value can legitimately land on one. A check written with strict
+    inequalities would forbid the two prices a binary spends its whole life
+    converging on.
+    """
+    piper = future()
+    venue = venue_with(piper)
+    low, high = piper.value_bounds
+
+    assert reasons(_at(venue, piper, str(low))) == []
+    assert reasons(_at(venue, piper, str(high), side=Side.SELL, who=TAKER)) == []
+    assert resting(venue.engine(SYM).book.snapshot(), piper) == [low, high]
+    assert venue.conservation_check() == 0
+
+
+def test_an_amendment_cannot_move_an_order_outside_the_range():
+    """Both paths, because the grid check was once bypassed on exactly this one:
+    it read ``price`` where a replace carries ``new_price``, so an accepted bid
+    could be amended onto a price the listing forbids and rest there with
+    nothing rejected.
+    """
+    piper = future()
+    venue = venue_with(piper)
+    _low, high = piper.value_bounds
+    accepted = _at(venue, piper, "4000.00")
+    order_id = next(e.order_id for e in accepted if isinstance(e, Acknowledged))
+
+    outside = venue.submit(
+        MAKER,
+        SYM,
+        Replace(MAKER, order_id, Quantity(5), piper.to_ticks(high + D("100"))),
+    )
+    assert reasons(outside) == [RejectReason.INVALID_PRICE]
+    assert resting(venue.engine(SYM).book.snapshot(), piper) == [D("4000.00")]
+
+    inside = venue.submit(
+        MAKER, SYM, Replace(MAKER, order_id, Quantity(5), piper.to_ticks(high))
+    )
+    assert reasons(inside) == []
+    assert venue.conservation_check() == 0
+
+
+def test_a_payout_narrows_the_rule_without_touching_what_is_resting():
+    """A share is worth less after it pays by exactly what it paid, and the
+    range the venue polices follows it down -- because that is the same range
+    the collateral is computed from, and quoting a wider one would let an order
+    be entered above what the claim can still deliver.
+
+    What does *not* move is anything already standing. The venue does not
+    reprice an order whose owner named a price, and pulling one would close a
+    position its owner never asked to close. Measured: a bid resting at the
+    pre-payout ceiling of 11,000 is untouched by a payout of 500, a fresh order
+    at that same price is refused, and one at the surviving ceiling of 10,500
+    is accepted.
+    """
+    from arena.contracts.spec import DistributionSchedule
+    from arena.portfolio.money import to_money
+
+    week = ObservationWindow(WINDOW.start, WINDOW.start + timedelta(days=7))
+    share = Instrument(
+        SYM,
+        ContractSpec(
+            contract_id=SYM,
+            underlying=_wr("A"),
+            payoff=Linear(10_000.0),
+            window=WINDOW,
+            policy=DataPolicy(min_sample_size=1),
+            reference_id="ref-1",
+            published_at=WINDOW.start - timedelta(days=1),
+            tick_size="0.25",
+            distribution=DistributionSchedule(windows=(week,), payoff=Linear(1_000.0)),
+        ),
+    )
+    venue = Venue(starting_cash=800_000_000)
+    venue.list_instrument(share)
+    ceiling = share.value_bounds[1]
+
+    # Somebody long and somebody short, so the payout has both sides to move.
+    _at(venue, share, "5000.00", quantity=4)
+    _at(venue, share, "5000.00", side=Side.SELL, quantity=4, who=TAKER)
+    stranded = _at(venue, share, str(ceiling), quantity=2)
+    assert reasons(stranded) == []
+
+    venue.distribute(SYM, to_money(D("500")))
+    surviving = venue.bounds_in_minor(share)[1]
+
+    assert resting(venue.engine(SYM).book.snapshot(), share) == [ceiling], (
+        "a payout disturbed an order that was already working"
+    )
+    assert reasons(_at(venue, share, str(ceiling), quantity=1)) == [
+        RejectReason.INVALID_PRICE
+    ]
+    assert reasons(
+        _at(venue, share, str(from_money(surviving)), quantity=1)
+    ) == []
+    assert venue.conservation_check() == 0

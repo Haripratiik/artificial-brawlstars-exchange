@@ -169,6 +169,36 @@ export function percent(fraction, dp = 1) {
  * Returns null when the book cannot fill the whole order, because a partial
  * average would understate the cost of the part that does not fill.
  */
+/**
+ * What a position of this size opened at this price can lose, which is also
+ * exactly what the venue will hold against it.
+ *
+ * The same expression as `Account.collateral_for_basis`: the position will be
+ * worth `quantity * value` and it paid `quantity * price` for that, so the
+ * worst it can do is the distance from its price to the far edge of the
+ * claim's range -- the bottom of the range for a long, the top for a short.
+ * Clamped at zero for the venue's reason: a long opened below the least the
+ * claim can settle for cannot lose anything, and a negative requirement would
+ * read as a credit.
+ *
+ * One function for both rows on the ticket, because "Max loss" and "Reserved
+ * now" are one number. They were two formulas, and the second one -- the stop
+ * ticket's -- was the notional instead: a sell of ten futures stopped at
+ * 4,600 announced 46,000 reserved against the 54,000 the venue held, and a
+ * spread stopped at zero announced nothing reserved against 100,000. It
+ * understated every time, which is the direction that gets the next order
+ * refused for a reason the screen never showed.
+ *
+ * Returns null when the range is not known, rather than a plausible zero.
+ */
+export function worstCase(quantity, priceValue, bounds, buying) {
+  const size = Number(quantity);
+  const at = Number(priceValue);
+  const [low, high] = (bounds ?? []).map(Number);
+  if (![size, at, low, high].every(Number.isFinite) || size <= 0) return null;
+  return Math.max(0, size * (buying ? at - low : high - at));
+}
+
 export function walkBook(levels, quantity) {
   let remaining = Number(quantity);
   if (!Number.isFinite(remaining) || remaining <= 0) return null;

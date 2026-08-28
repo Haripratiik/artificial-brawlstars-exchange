@@ -346,7 +346,21 @@ class TradingAgent:
         them and most of the cancels were never sent: the bug was quietly
         acting as a rate limiter.
         """
-        wanted = (int(price), int(size))
+        # Compared on the price that will actually be SENT, not the one that
+        # was asked for. :meth:`quote` clamps into the settlement range and
+        # snaps to the tick grid, so two different requested prices routinely
+        # become the same resting price -- and comparing the requests instead
+        # reads that as a change, cancels a perfectly good order and reposts it
+        # at the price it was already at. Measured on seed 7 over five minutes:
+        # 2,463 of 62,424 quotes, 3.9%, were exactly that. Clamping and
+        # snapping here first costs one extra call and is idempotent, since
+        # `quote` repeats both on a price that already satisfies them.
+        instrument = self.instruments[symbol]
+        low, high = instrument.tick_bounds
+        final = _on_grid(
+            instrument, side, Price(max(int(low), min(int(high), int(price))))
+        )
+        wanted = (int(final), int(size))
         working = any(
             order_symbol == symbol and self.order_side.get(key) is side
             for key, order_symbol in self.live_orders.items()
@@ -355,7 +369,7 @@ class TradingAgent:
             return
         self.cancel_side(ctx, symbol, side)
         self._intent[(symbol, side)] = wanted
-        self.quote(ctx, symbol, side, price, size, tif)
+        self.quote(ctx, symbol, side, final, size, tif)
 
     def withdraw(self, ctx: SimulationContext, symbol: str, side: Side) -> None:
         """Pull this agent's quote on one side, if it has one."""

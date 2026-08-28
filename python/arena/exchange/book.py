@@ -71,6 +71,16 @@ class Order:
     # queue gets the fill instead. Attaching a minimum is therefore giving up
     # unconditional time priority, not adding a guarantee on top of it.
     min_quantity: int = 0
+    # Whether this order promised never to take.
+    #
+    # Carried on the order rather than left in the time-in-force of the command
+    # that created it, for the same reason ``display_size`` is: a replace builds
+    # a new order out of the old one, and anything the old one did not carry is
+    # silently dropped. Measured before this field existed -- a post-only sell
+    # resting at 105 over a bid of 100, replaced to 100, printed ten lots as the
+    # aggressor. The order had promised that could never happen, and the promise
+    # lived only in a command that had already been processed.
+    post_only: bool = False
 
     def __post_init__(self) -> None:
         if self.display_size < 0:
@@ -444,16 +454,67 @@ class OrderBook:
             level.reduce(order.shown)
             level.refresh(order)
 
+    def shrink(self, order: Order, amount: Quantity) -> None:
+        """Take ``amount`` off a resting order without it having traded.
+
+        Not ``consume``, and the difference is the whole reason this exists. A
+        shrinking replace used to be routed through ``consume`` on the grounds
+        that both make ``remaining`` smaller, and it was wrong twice over.
+
+        ``consume`` reduces the level's total by the amount it removes, which is
+        right for a fill -- every lot a fill takes came off the visible slice.
+        A shrink takes its lots out of the *reserve*, which was never in the
+        total. Measured on an iceberg for twelve showing three, with four lots
+        resting behind it: shrinking to one left the level reporting **-3** and
+        the published depth **0**, while five lots sat there live.
+
+        ``consume`` also refreshes an exhausted iceberg to the back of its
+        queue, which is exactly the priority loss the replace had just promised
+        did not happen. The same shrink moved the iceberg behind the order that
+        arrived after it while the ``Replaced`` event said ``kept_priority``.
+
+        So: reduce the visible slice only by what actually came off it, leave
+        the order where it is in the queue, and take the same amount off
+        ``quantity`` as off ``remaining`` -- otherwise ``filled`` reports lots
+        that never traded, which on a plain order for a hundred shrunk to sixty
+        read as **40 filled** against an empty tape.
+        """
+        removed = Quantity(min(int(amount), int(order.remaining)))
+        order.remaining = Quantity(order.remaining - removed)
+        order.quantity = Quantity(order.quantity - removed)
+        slice_now = Quantity(min(int(order.shown), int(order.remaining)))
+        level = self._levels[order.side].get(order.price)
+        if level is not None:
+            level.reduce(Quantity(order.shown - slice_now))
+        order.shown = slice_now
+
     def remove(self, order: Order) -> None:
         """Tombstone an order. The level skips it on the way past.
 
         Deliberately not O(queue): cancellation is the most common operation in
         an electronic market, and scanning a deque to splice one out would make
         the common case the expensive one.
+
+        Marking the order terminal is *part of* removing it rather than
+        something each caller remembers to do afterwards. Every caller but one
+        did remember; the one that did not was the auction's wash-trade
+        handler, which printed a ``Cancelled`` event, took the order's quantity
+        out of its level, and left the order live in the queue. Measured: a
+        ten-lot bid reported cancelled, the book publishing no bid at all, and a
+        continuous sell arriving afterwards filling all ten lots against it.
+        Invisible and tradeable is the worst of both, and the only way to stop
+        it recurring is for the two halves not to be separable.
+
+        Idempotent for the same reason: a second removal would subtract the
+        order's slice from its level again, and a peg that comes off the book
+        twice would take somebody else's quantity with it.
         """
+        if order.status.terminal:
+            return
         level = self._levels[order.side].get(order.price)
         if level is not None and order.shown > 0:
             # By what it was showing, because that is what was added. Reducing
             # by the whole remaining would take an iceberg's hidden reserve out
             # of a total it was never in.
             level.reduce(order.shown)
+        order.status = OrderStatus.CANCELLED

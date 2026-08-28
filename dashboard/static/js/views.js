@@ -470,6 +470,31 @@ function ladder(book, depth) {
     .join('')}</div>`;
 }
 
+/*
+ * What the send button says, and whether it does anything.
+ *
+ * It used to be disabled in every phase but `continuous`, under a label
+ * reading "pre open -- orders will rest". Both halves were wrong at once, and
+ * they were wrong on the screen a stranger meets first: the exchange opens
+ * with a call auction, so every contract is in `pre_open` on the first page
+ * load. Orders in a call phase *are* accepted, they *do* rest, and they set
+ * the price the market opens at -- the venue takes them, publishes an
+ * indicative price off them and clears them at the uncross. The one thing a
+ * visitor could not do was place one.
+ *
+ * `closed` is the only phase that refuses orders (SessionState.accepts_orders),
+ * and there "orders will rest" was a lie in the other direction.
+ */
+const PHASE = {
+  pre_open: { open: true, label: 'Place Order &mdash; joins the opening call' },
+  auction: { open: true, label: 'Place Order &mdash; joins the reopening call' },
+  closed: { open: false, label: 'Closed &mdash; no new orders' },
+};
+
+export function sendButton(session) {
+  return PHASE[session] ?? { open: true, label: 'Place Order' };
+}
+
 /**
  * The ticket, in two layers.
  *
@@ -479,7 +504,7 @@ function ladder(book, depth) {
  * on "time in force" has already lost most of the people looking at it.
  */
 function ticket(symbol, book, session) {
-  const halted = session !== 'continuous';
+  const phase = sendButton(session);
   const binary = book.contract?.payoff?.kind === 'binary';
   return `<div class="sides">
       <button type="button" data-side="buy" aria-pressed="true">
@@ -501,8 +526,8 @@ function ticket(symbol, book, session) {
 
     <div class="preview" id="t-preview" aria-live="polite"></div>
 
-    <button type="button" class="send" id="t-send" ${halted ? 'disabled' : ''}>
-      ${halted ? `${esc(session.replace('_', ' '))} &mdash; orders will rest` : 'Place Order'}
+    <button type="button" class="send" id="t-send" ${phase.open ? '' : 'disabled'}>
+      ${phase.label}
     </button>
 
     <details class="advanced">
@@ -597,14 +622,31 @@ function counterparties(snapshot, symbol) {
       .join('')}</tbody></table>`;
 }
 
+/*
+ * A closed position is not the same thing as never having traded.
+ *
+ * Anything with a quantity of zero was answered with "No position in this
+ * contract", which threw away the only number that survives closing a trade:
+ * what it made. Someone who bought, sold and came out ahead was told, on the
+ * screen they traded from, that there was nothing here -- and had to go to
+ * another screen to find out whether they had won or lost. The server already
+ * keeps the row alive for exactly this reason (it filters on quantity *and*
+ * volume), so the information was arriving and being discarded on the way to
+ * the page.
+ */
 function positionCard(position) {
-  if (!position || position.quantity === 0) {
+  if (!position) {
+    return `<div class="empty">No position in this contract.</div>`;
+  }
+  const flat = position.quantity === 0;
+  if (flat && !Number(position.realized)) {
     return `<div class="empty">No position in this contract.</div>`;
   }
   return `<div class="pos">
+    ${flat ? `<p class="note">Closed. What is left is what it made.</p>` : ''}
     <div><span>Contracts</span><b class="mono ${cls(position.quantity)}">${signed(position.quantity, 0)}</b></div>
-    <div><span>Average price</span><b class="mono">${price(position.average_price)}</b></div>
-    <div><span>Unrealised</span><b class="mono ${cls(Number(position.unrealized))}">${money(position.unrealized)}</b></div>
+    ${flat ? '' : `<div><span>Average price</span><b class="mono">${price(position.average_price)}</b></div>`}
+    ${flat ? '' : `<div><span>Unrealised</span><b class="mono ${cls(Number(position.unrealized))}">${money(position.unrealized)}</b></div>`}
     <div><span>Realised</span><b class="mono ${cls(Number(position.realized))}">${money(position.realized)}</b></div>
   </div>`;
 }

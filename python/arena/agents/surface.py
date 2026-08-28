@@ -369,15 +369,19 @@ class SurfaceMarketMaker(MarketMaker):
         # Inventory moves the underlying, and the whole ladder follows. Skewing
         # each strike on its own would be the defect this class exists to fix,
         # only arriving through a different door.
+        pull = max(
+            -1.0,
+            min(
+                1.0,
+                self._net_delta(member.underlying_symbol, forward, int(ctx.now))
+                / self.delta_limit,
+            ),
+        )
         sigma = self.dispersion_for(member.underlying_symbol, int(ctx.now))
         if sigma is None:
             shifted = forward
         else:
-            pull = (
-                self._net_delta(member.underlying_symbol, forward, int(ctx.now))
-                / self.delta_limit
-            )
-            shifted = forward - max(-1.0, min(1.0, pull)) * self.skew_sigmas * sigma
+            shifted = forward - pull * self.skew_sigmas * sigma
 
         instrument = self.instruments[symbol]
         if concentration is None:
@@ -396,21 +400,46 @@ class SurfaceMarketMaker(MarketMaker):
             fair = option_value(
                 shifted, member.strike, member.scale, concentration, member.is_call
             )
-        self._quote_around(ctx, symbol, fair / float(instrument.tick_size))
+        self._quote_around(ctx, symbol, fair / float(instrument.tick_size), abs(pull))
 
-    def _quote_around(self, ctx: SimulationContext, symbol: str, fair_ticks: float) -> None:
+    def _quote_around(
+        self, ctx: SimulationContext, symbol: str, fair_ticks: float, pressure: float
+    ) -> None:
         """Post a two-sided quote around a fair value already in ticks.
 
-        Split out of the plain maker's requote so the two share the widening
-        rule and the position-limit handling. What differs between them is only
-        where the middle comes from.
+        ``pressure`` is how much risk the maker is already carrying, on a scale
+        where one is a full book, and it decides how wide the quote is. It is
+        supplied by the caller rather than read off this contract's own
+        position, and that is the same argument the skew makes one level up.
+
+        The plain maker widens on ``inventory / position_limit`` in the book it
+        is quoting, and copying that here reintroduced per-strike inventory into
+        an option price by a route the skew had already been moved to avoid. It
+        is invisible while the fair values differ and unmistakable once they do
+        not. Every quote is clamped into its contract's settlement range, so
+        when the fair value sits at or under the floor the bid pins to the floor
+        while the ask stays at ``fair + half`` -- and the mid is then half the
+        spread, which is to say a pure function of the position. Measured on
+        seed 7 with the future at 4,264, all three SPIKE calls were worth
+        nothing and marked 1.88, 2.00 and 2.50 in ascending strike: a chain of
+        worthless options getting *more* valuable the further out of the money
+        they were, and free money to anyone who read it as a price.
+
+        Driving the width from the chain's net delta instead gives one width to
+        the whole ladder at each requote, so the quotes stay monotone in strike
+        whatever the maker is holding, and the widening still means what it is
+        supposed to mean: a desk deep in risk is more likely to be on the wrong
+        side of whatever is moving the market, and charges for it. It measures
+        the risk in the units that risk is actually denominated in -- a maker
+        long calls and long puts is short nothing in particular and quotes
+        tight, which is right, and the per-strike position limit is still there
+        to stop it accumulating an unbounded amount of either.
         """
         from arena.exchange.types import Price, Side
 
         inventory = self.position.get(symbol, 0)
 
         low, high = self.instruments[symbol].tick_bounds
-        pressure = abs(inventory) / max(1, self.position_limit)
         half = self.half_spread * (1.0 + 2.0 * pressure)
 
         # Clamped into the contract's own range, one side at a time. A quote

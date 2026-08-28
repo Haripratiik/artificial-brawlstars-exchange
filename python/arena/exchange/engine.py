@@ -121,6 +121,34 @@ class _PendingStop:
         )
 
 
+@dataclass(slots=True, eq=False)
+class _DryOrder:
+    """One resting order as a dry run of the walk sees it.
+
+    Compared by identity rather than by value, because the dry run takes entries
+    out of its queue by name and two copies holding the same numbers are not the
+    same order.
+
+    A copy of the three numbers a walk changes, so that asking "how much would
+    this trade" can consume slices, refresh icebergs and drop filled orders
+    exactly as the real walk does without any of it reaching the book. Anything
+    else about the order is read through ``order``, which is not modified.
+    """
+
+    order: Order
+    shown: int
+    remaining: int
+
+    @property
+    def available(self) -> int:
+        """What one execution against this order could take.
+
+        An iceberg offers its slice and no more; everything else offers all of
+        itself. The same rule the matching loop applies, for the same reason.
+        """
+        return self.shown if self.order.is_iceberg else self.remaining
+
+
 @dataclass(slots=True)
 class _Peg:
     """A pegged order and whatever order it currently is.
@@ -249,12 +277,26 @@ class MatchingEngine:
 
     # -- submit ------------------------------------------------------------
 
-    def _submit(self, command: Submit) -> list[Event]:
+    def _submit(self, command: Submit, order_id: OrderId | None = None) -> list[Event]:
+        """Place an order. ``order_id`` reuses an id already acknowledged.
+
+        Only a released stop passes one, and it has to. A stop is acknowledged
+        under an id while it is parked -- that id is the agent's handle on it,
+        and it is what the venue reserves collateral against -- and the order
+        it becomes was being minted a *fresh* id, with nothing in the stream
+        linking the two. Measured: a stop acknowledged as order **4** traded as
+        order **6**, and a cancel of 4 came back ``unknown_order`` with the
+        order neither parked nor in the book. The reservation against 4 had
+        nothing left to release it, and 6 traded under an id nobody had reserved
+        for. An order that changes identity mid-life is an order nobody can
+        follow.
+        """
         reason = _validate(command)
         if reason is not None:
             return [Rejected(self._seq(), command.agent_id, reason)]
 
-        order_id = self._order_id()
+        if order_id is None:
+            order_id = self._order_id()
         self._arrival += 1
         # A market order is priced at the extreme so it crosses everything; the
         # limit-price comparison then needs no special case for it.
@@ -269,6 +311,11 @@ class MatchingEngine:
             priority=self._arrival,
             display_size=command.display_size,
             min_quantity=command.min_quantity,
+            # Recorded on the order, not left behind in the command. A replace
+            # builds a new order out of the resting one, and a promise that
+            # lives only in a processed command is a promise the replace cannot
+            # keep.
+            post_only=command.time_in_force is TimeInForce.POST_ONLY,
         )
 
         # A stop acknowledges at the price it is contingent on: its limit if it
@@ -348,7 +395,8 @@ class MatchingEngine:
         # never left half-done and then unwound. Checking first is simpler and
         # leaves no intermediate state an observer could see.
         if command.time_in_force is TimeInForce.FOK and not self._fillable(
-            command.side, limit, command.quantity
+            order,
+            self.execution_band if command.order_type is OrderType.MARKET else None,
         ):
             order.status = OrderStatus.CANCELLED
             self.book.track(order)
@@ -367,27 +415,51 @@ class MatchingEngine:
                 else None,
             )
         )
+        events.extend(self._settle(order, command.time_in_force))
+        # After the order has been settled, never before it. Releasing first
+        # ran a triggered stop against a book that was still missing the
+        # aggressor's own remainder, so the stop rested where the remainder was
+        # about to rest through. Measured: a stop-limit sell for nineteen at 99
+        # triggered by a print at 97, released while the taker's seven unfilled
+        # lots were still in flight, left the book bid **101** against ask
+        # **99** -- a spread of minus two, crossed and stuck. The peg path
+        # already rested before releasing; this one was the odd case out.
         events.extend(self._release_after(events))
 
-        if order.remaining > 0:
-            if command.time_in_force in (TimeInForce.GTC, TimeInForce.POST_ONLY):
-                order.status = (
-                    OrderStatus.PARTIALLY_FILLED
-                    if order.remaining < order.quantity
-                    else OrderStatus.NEW
-                )
-                self.book.add(order)
-            else:
-                order.status = OrderStatus.CANCELLED
-                self.book.track(order)
-                events.append(
-                    Cancelled(self._seq(), command.agent_id, order_id, order.remaining)
-                )
-        else:
+        return events
+
+    def _settle(self, order: Order, time_in_force: TimeInForce) -> list[Event]:
+        """Rest, cancel or retire an order once its matching pass is over.
+
+        The terminal check comes first, and it is not defensive. Self-trade
+        prevention can finish an order mid-walk -- CANCEL_NEWEST and
+        CANCEL_BOTH both do -- and the arithmetic test that follows would then
+        read "nothing left" as "completely filled". Measured: an agent whose
+        own resting offer met its own incoming bid got a ``Cancelled`` event, an
+        empty tape, and an order whose status said **filled** and whose
+        ``filled`` property said **10**. Every reconciliation downstream reads
+        those two, and both of them were describing a trade that never printed.
+        """
+        if order.status.terminal:
+            self.book.track(order)
+            return []
+        if order.remaining <= 0:
             order.status = OrderStatus.FILLED
             self.book.track(order)
-
-        return events
+            return []
+        if time_in_force in (TimeInForce.GTC, TimeInForce.POST_ONLY):
+            order.status = (
+                OrderStatus.PARTIALLY_FILLED
+                if order.remaining < order.quantity
+                else OrderStatus.NEW
+            )
+            self.book.add(order)
+            return []
+        order.status = OrderStatus.CANCELLED
+        self.book.track(order)
+        return [
+            Cancelled(self._seq(), order.agent_id, order.order_id, order.remaining)
+        ]
 
     def _accumulate(self, command: Submit, order: Order) -> list[Event]:
         """Rest an order during a call phase, where nothing matches yet.
@@ -546,14 +618,51 @@ class MatchingEngine:
             order.status = OrderStatus.CANCELLED
         return events
 
-    def _fillable(self, side: Side, limit: Price, quantity: Quantity) -> bool:
-        """Whether ``quantity`` could be filled immediately at ``limit`` or better."""
-        available = 0
-        for price, depth in self._crossable_levels(side, limit):
-            available += depth
-            if available >= quantity:
-                return True
-        return False
+    def _fillable(self, order: Order, collar: tuple[int, int] | None) -> bool:
+        """Whether all of ``order`` could be filled immediately.
+
+        Asks ``_executable`` -- what the walk would really take -- rather than
+        summing published depth, and the difference is the whole contract of
+        fill-or-kill. Aggregate depth counts liquidity the walk cannot have:
+        an order whose own minimum quantity the taker is too small to satisfy,
+        and an order belonging to the taker itself. Both were counted, both
+        admitted the order, and the walk then filled it for less than all of it.
+
+        Measured before the change. Against a twenty-lot offer refusing
+        anything under twenty with five plain lots behind it, a fill-or-kill
+        buy for **ten** printed **five**. Against the taker's own five lots at
+        100 and somebody else's five at 101, a fill-or-kill buy for **ten**
+        printed **five** at 101 while self-trade prevention quietly cancelled
+        the rest of what the check had counted. Partial execution is the one
+        outcome fill-or-kill exists to make impossible.
+
+        It differs the other way too, and that is the same correction rather
+        than a second one. Published depth *under*-counts an iceberg, which
+        shows a slice and holds a reserve. A fill-or-kill for a hundred against
+        a hundred-lot iceberg showing ten was rejected as unfillable, while the
+        identical order sent good-till-cancelled filled all hundred: the walk
+        reaches the reserve because each exhausted slice refreshes behind it.
+
+        Quantity the taker itself owns is not counted either, and that is the
+        third case of the same error rather than a separate rule. Self-trade
+        prevention cancels those lots instead of printing them, so they are
+        liquidity the walk can never have. Measured before the change: against
+        the taker's own five lots at 100 and somebody else's five at 101, a
+        fill-or-kill buy for **ten** printed **five** at 101 while prevention
+        quietly cancelled the rest of what the check had counted.
+
+        Correcting this required moving `tests/reference_matcher.py` in the
+        same step. The reference matcher counted that quantity too, so fixing
+        one side alone made twelve differential tests disagree -- and a
+        harness that disagrees is a worse failure than the one it is reporting,
+        while a harness that agrees on the wrong answer reports nothing at all.
+        Both sides now skip the taker's own resting orders in the same place
+        their walks already skip them.
+        """
+        return (
+            self._executable(order, collar, count_self_matched=False)
+            >= int(order.remaining)
+        )
 
     def _crossable_levels(
         self, side: Side, limit: Price
@@ -595,7 +704,12 @@ class MatchingEngine:
                     self._seq(), incoming.agent_id, incoming.order_id, incoming.remaining
                 )
             )
-            incoming.remaining = Quantity(0)
+            # The status, and not the quantity. Zeroing ``remaining`` to stop
+            # the walk was reading as "completely filled" everywhere afterwards:
+            # ``filled`` is ``quantity - remaining``, so an order that traded
+            # nothing reported its whole size as traded, against an empty tape.
+            # The matching loop already breaks on a terminal status, so the
+            # quantity never had to carry that signal.
             incoming.status = OrderStatus.CANCELLED
 
         return events
@@ -641,13 +755,22 @@ class MatchingEngine:
         Released after the order that caused them has finished matching rather
         than inside the loop, so a cascade is a sequence of complete orders
         rather than an interleaving of half-filled ones.
+
+        **Every** print, not the last one. A walk that sweeps several levels
+        prints at each of them, and offering only the final price to the stops
+        drops any trigger the walk passed through on the way. Measured: offers
+        of five at 100 and five at 110, a sell stop parked at 100, and a buy for
+        ten -- the tape read ``[(5, 100), (5, 110)]``, the market had traded at
+        100, and the stop was still parked afterwards. The rest of the cascade
+        already worked this way, checking each print of every released order, so
+        the first round was the one that disagreed.
         """
-        last = next(
-            (e.price for e in reversed(events) if isinstance(e, Traded)), None
-        )
-        if last is None or not self._stops or self._releasing:
+        if not self._stops or self._releasing:
             return []
-        return self._release_stops(last)
+        prices = [e.price for e in events if isinstance(e, Traded)]
+        if not prices:
+            return []
+        return self._release_stops(prices)
 
     def _triggered_by(self, price: Price) -> list["_PendingStop"]:
         """Stops this print sets off, in a deterministic order.
@@ -675,8 +798,8 @@ class MatchingEngine:
         )
         return hit
 
-    def _release_stops(self, price: Price) -> list[Event]:
-        """Fire everything this print triggered, and everything that triggers.
+    def _release_stops(self, prices: list[Price]) -> list[Event]:
+        """Fire everything these prints triggered, and everything that triggers.
 
         Iterative rather than recursive, and bounded. A stop that fills moves
         the price, which can trigger more stops -- that is a cascade, it is
@@ -685,7 +808,11 @@ class MatchingEngine:
         event in the market. `cascade_depth` records how far each one went.
         """
         events: list[Event] = []
-        pending = self._triggered_by(price)
+        pending: list[_PendingStop] = []
+        for price in prices:
+            pending.extend(self._triggered_by(price))
+        if not pending:
+            return events
         depth = 0
         self._releasing = True
         try:
@@ -702,12 +829,25 @@ class MatchingEngine:
             depth += 1
             following: list[_PendingStop] = []
             for stop in pending:
-                released = self._submit(stop.as_submit())
+                # Under the id it was acknowledged with, so the order an agent
+                # parked and the order it becomes are the same order.
+                released = self._submit(stop.as_submit(), stop.order_id)
                 events.extend(released)
                 for event in released:
                     if isinstance(event, Traded):
                         following.extend(self._triggered_by(event.price))
             pending = following
+        # The bound stops the *chain*, and it must not delete the orders the
+        # chain had already reached. `_triggered_by` takes a stop out of the
+        # parked list to hand it over, so anything still pending when the bound
+        # bites has left the engine entirely: no order, no acknowledgement, no
+        # cancellation, and a later cancel answered `unknown_order`. Measured on
+        # a forty-deep ladder with the bound at 24 -- twenty-four stops
+        # released, fifteen still parked, and **one** that simply ceased to
+        # exist with nothing in the stream to say so. Parked again, it stays a
+        # live order and the next print that reaches it sets it off.
+        if pending:
+            self._stops.extend(pending)
         return depth
 
     # -- pegs ---------------------------------------------------------------
@@ -776,18 +916,12 @@ class MatchingEngine:
         order = peg.order
         order.price = target
         events = self._match(order)
-        if order.remaining > 0:
-            order.status = (
-                OrderStatus.PARTIALLY_FILLED
-                if order.remaining < order.quantity
-                else OrderStatus.NEW
-            )
-            self.book.add(order)
-            peg.on_book = True
-        else:
-            order.status = OrderStatus.FILLED
-            self.book.track(order)
-            peg.on_book = False
+        # Through the same settlement as any other order, so a peg that self-
+        # trade prevention cancelled mid-walk is not then recorded as filled.
+        # A peg is validated as neither immediate-or-cancel nor fill-or-kill, so
+        # its time-in-force always rests.
+        events.extend(self._settle(order, peg.time_in_force))
+        peg.on_book = order.is_resting
         return events
 
     def _lift_peg(self, peg: _Peg) -> Order:
@@ -828,6 +962,12 @@ class MatchingEngine:
             priority=self._arrival,
             display_size=old.display_size,
             min_quantity=old.min_quantity,
+            # Every rebuild of an order has to carry everything the order was,
+            # and this is the third place that lesson has been learnt. A
+            # post-only peg that had repriced even once came back without the
+            # flag, so a replace no longer knew to refuse a crossing price:
+            # measured, a post-only peg replaced to 102 took a lot at 98.
+            post_only=old.post_only,
         )
         peg.order = fresh
         return fresh
@@ -940,10 +1080,18 @@ class MatchingEngine:
         # done, MPL asks only whether it is worth starting. An order for a
         # thousand with a minimum of a hundred will happily take two hundred and
         # rest the remaining eight; what it will not do is take three.
-        if incoming.min_quantity > 0 and (
-            self._executable(incoming, collar) < incoming.min_quantity
-        ):
-            return events
+        #
+        # A decision about *printing*, and not a reason to skip the walk. The
+        # walk is also where an agent meets its own resting orders, and
+        # returning here before it started meant self-trade prevention never
+        # ran. Measured: a maker bid fourteen at 99 and then offered seven at 98
+        # with a minimum of three. Without the minimum its stale bid was
+        # cancelled and the offer rested alone; with it, both orders stayed --
+        # the same agent on both sides of a book crossed 99 against 98, which
+        # only a third party could ever clear.
+        may_print = incoming.min_quantity <= 0 or (
+            self._executable(incoming, collar) >= incoming.min_quantity
+        )
 
         # Prices this pass has exhausted of liquidity it is allowed to take.
         # Only ever non-empty when a resting order refuses executions this
@@ -990,9 +1138,16 @@ class MatchingEngine:
                 and self.self_trade_prevention is not SelfTradePrevention.ALLOW
             ):
                 events.extend(self._prevent_self_trade(incoming, resting, level))
-                if incoming.status is OrderStatus.CANCELLED:
+                if incoming.status.terminal:
                     break
                 continue
+
+            # The first order this pass could really trade with, and the
+            # minimum said it is not worth trading. Here rather than before the
+            # walk, so the agent's own resting orders in front of it have
+            # already been dealt with by the policy that governs them.
+            if not may_print:
+                break
 
             # At most the slice an iceberg is showing. Taking its reserve
             # in one go would make the reserve pointless: the aggressor would
@@ -1093,7 +1248,11 @@ class MatchingEngine:
         return None
 
     def _executable(
-        self, incoming: Order, collar: tuple[int, int] | None
+        self,
+        incoming: Order,
+        collar: tuple[int, int] | None,
+        *,
+        count_self_matched: bool = False,
     ) -> int:
         """How much of ``incoming`` could really trade against the book now.
 
@@ -1104,13 +1263,32 @@ class MatchingEngine:
         one error that matters -- it would admit an order and then fill it for
         less than its minimum, which is the outcome the field exists to prevent.
 
-        An iceberg counts for its whole remaining quantity rather than its
-        visible slice. Within a single walk the reserve is genuinely reachable:
-        an exhausted slice refreshes to the back of its level and the walk
-        arrives there again once everything ahead of it is gone.
+        A **dry run of the walk**, one execution at a time, rather than a sum
+        over resting orders. Summing was tried twice and was wrong both times,
+        because how much a level yields depends on the order the executions
+        happen in. An iceberg's exhausted slice goes to the *back* of its
+        queue, so the aggressor meets whatever was behind it before it can
+        reach the reserve, and by then it may be too small for a minimum that
+        was satisfiable a moment earlier. Measured: an iceberg for eight at 96
+        showing three and refusing anything under three, with a single plain lot
+        behind it, against a sell for six carrying a minimum of five. The sum
+        said six were reachable, the order was admitted, and the walk took
+        three from the iceberg, one from the lot behind it, and then found its
+        remaining two below the iceberg's minimum -- **an order with a minimum
+        of five executed for four**.
+
+        So the queue is copied and consumed exactly as ``_match`` consumes it:
+        the same choice of counterparty, the same slice sizes, the same refresh
+        to the back. Copied, because a count must not move anything.
+
+        ``count_self_matched`` treats the taker's own resting orders as if they
+        belonged to somebody else. It exists for one caller and is wrong on its
+        own terms -- see ``_fillable``, which explains why it is there and what
+        has to change before it can go.
         """
         wanted = int(incoming.remaining)
         policy = self.self_trade_prevention
+        prevents = policy is not SelfTradePrevention.ALLOW and not count_self_matched
         total = 0
         for level in self.book.live_levels(incoming.side.opposite):
             if not incoming.side.crosses(level.price, incoming.price):
@@ -1119,25 +1297,43 @@ class MatchingEngine:
                 low, high = collar
                 if not low <= int(level.price) <= high:
                     break
-            for resting in level.orders:
-                if resting.status.terminal or resting.remaining <= 0:
-                    continue
-                if (
-                    resting.agent_id == incoming.agent_id
-                    and policy is not SelfTradePrevention.ALLOW
-                ):
+
+            queue = [
+                _DryOrder(resting, int(resting.shown), int(resting.remaining))
+                for resting in level.orders
+                if not resting.status.terminal and resting.remaining > 0
+            ]
+            while total < wanted:
+                entry = _first_dry_tradeable(queue, wanted - total)
+                if entry is None:
+                    # Nothing here will trade with an order this size. The walk
+                    # sets the price aside and moves on to a worse one.
+                    break
+                resting = entry.order
+                if prevents and resting.agent_id == incoming.agent_id:
                     if policy is SelfTradePrevention.CANCEL_OLDEST:
                         # The resting order is removed and the walk carries on.
+                        queue.remove(entry)
                         continue
                     # The incoming order's remainder is cancelled where it
                     # stands, so nothing past this point is reachable.
                     return total
-                take = min(wanted - total, int(resting.remaining))
-                if take < resting.min_quantity:
-                    continue
+
+                take = min(wanted - total, entry.available)
                 total += take
-                if total >= wanted:
-                    return total
+                entry.remaining -= take
+                entry.shown -= take
+                if entry.remaining <= 0:
+                    queue.remove(entry)
+                elif resting.is_iceberg and entry.shown < max(1, resting.min_quantity):
+                    # Spent, by the same rule ``OrderBook.consume`` uses: empty,
+                    # or too small for the minimum this order itself insists on.
+                    # A fresh slice, at the back of the queue.
+                    entry.shown = min(resting.display_size, entry.remaining)
+                    queue.remove(entry)
+                    queue.append(entry)
+            if total >= wanted:
+                return total
         return total
 
     # -- cancel ------------------------------------------------------------
@@ -1293,11 +1489,45 @@ class MatchingEngine:
         # price change or size increase is a new claim on the queue.
         keeps_priority = new_price == order.price and command.new_quantity < order.remaining
 
+        if (
+            order.post_only
+            and not keeps_priority
+            and self._crossable_levels(order.side, new_price)
+        ):
+            # Post-only promised the order would never take, and a replace does
+            # not retract the promise -- it is the same order at a new price.
+            # Before the flag was carried on the order, a post-only sell resting
+            # at 105 over a bid of 100 and then replaced to 100 printed **ten
+            # lots as the aggressor**, which is the single thing that order type
+            # exists to make impossible. Refused rather than repriced, so the
+            # order stays exactly where it was resting.
+            #
+            # Only on the branch that re-runs the match. A shrink at an
+            # unchanged price never touches the other side of the book, so there
+            # is nothing there for it to promise about.
+            return [
+                Rejected(
+                    self._seq(),
+                    command.agent_id,
+                    RejectReason.POST_ONLY_WOULD_CROSS,
+                    command.order_id,
+                )
+            ]
+
         if keeps_priority:
-            shrink = Quantity(order.remaining - command.new_quantity)
-            self.book.consume(order, shrink)
-            # consume() marks a shrunk order as partially filled, which is wrong
-            # here: nothing traded. Restore the status the order actually has.
+            # `OrderBook.shrink`, not `consume`. Routing a shrink through the
+            # fill path took the lots out of the level's total even when they
+            # came out of an iceberg's reserve, which was never counted in it,
+            # and refreshed the exhausted slice to the back of the queue -- the
+            # exact priority loss this branch had just promised did not happen.
+            # Measured on an iceberg for twelve showing three with four lots
+            # behind it: shrinking to six left the level at 4 against 7 really
+            # resting, and put the iceberg behind the order that arrived after
+            # it while the event said `kept_priority=True`.
+            self.book.shrink(order, Quantity(order.remaining - command.new_quantity))
+            # A shrink is not a fill, so the order is only partially filled if
+            # something really traded. `shrink` takes the same amount off
+            # `quantity` as off `remaining`, so `filled` answers that honestly.
             order.status = (
                 OrderStatus.PARTIALLY_FILLED
                 if order.filled > 0
@@ -1334,6 +1564,10 @@ class MatchingEngine:
             # and publishes the size its owner was working in slices precisely
             # so that nobody could see it.
             display_size=order.display_size,
+            # For the same reason, and it is the one the display size argument
+            # missed. Post-only is a property of the order, not of the command
+            # that created it.
+            post_only=order.post_only,
         )
         events: list[Event] = [
             Replaced(
@@ -1346,16 +1580,19 @@ class MatchingEngine:
             )
         ]
         events.extend(self._match(replacement))
-        if replacement.remaining > 0:
-            replacement.status = (
-                OrderStatus.PARTIALLY_FILLED
-                if replacement.remaining < replacement.quantity
-                else OrderStatus.NEW
+        events.extend(
+            self._settle(
+                replacement,
+                TimeInForce.POST_ONLY if replacement.post_only else TimeInForce.GTC,
             )
-            self.book.add(replacement)
-        else:
-            replacement.status = OrderStatus.FILLED
-            self.book.track(replacement)
+        )
+        # A replace that crosses is a print like any other, and a stop cannot
+        # tell how the print was caused. Without this, a resting offer moved
+        # down onto a bid traded ten lots at 100 while a stop parked at 100 sat
+        # untouched -- the identical print delivered as a new order set the same
+        # stop off immediately. Whether a stop fires must not depend on which
+        # message the tape came from.
+        events.extend(self._release_after(events))
         return events
 
 
@@ -1433,6 +1670,25 @@ def _validate(command: Submit) -> RejectReason | None:
         return None
     if command.price is None:
         return RejectReason.LIMIT_ORDER_REQUIRES_PRICE
+    return None
+
+
+def _first_dry_tradeable(queue: list["_DryOrder"], wanted: int) -> "_DryOrder | None":
+    """``_first_tradeable``, asked of a copied queue instead of a live one.
+
+    Deliberately the same rule, written twice rather than shared, because the
+    two answer about different things: one picks a real order to trade with, the
+    other picks a copy to subtract from. Any difference between them is a case
+    where the count and the walk disagree, which is the whole failure this
+    machinery exists to prevent -- so they are kept side by side, a few lines
+    apart, where a change to one that is not made to the other is visible.
+    """
+    for entry in queue:
+        available = entry.available
+        if available <= 0:
+            continue
+        if min(wanted, available) >= entry.order.min_quantity:
+            return entry
     return None
 
 

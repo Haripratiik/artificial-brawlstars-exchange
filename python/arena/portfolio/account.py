@@ -102,13 +102,50 @@ class Account:
     def collateral_required(
         quantity: int, price: Money, bounds: tuple[Money, Money]
     ) -> Money:
-        """Worst-case loss on a position of ``quantity`` lots opened at ``price``."""
-        low, high = int(bounds[0]), int(bounds[1])
-        if quantity > 0:
-            return Money(quantity * (int(price) - low))
-        if quantity < 0:
-            return Money(-quantity * (high - int(price)))
-        return Money(0)
+        """Worst-case loss on a position of ``quantity`` lots opened at ``price``.
+
+        For a position not yet taken, where a price is all there is. Once it
+        exists, charge :meth:`collateral_for_basis` against what it actually
+        paid -- an average price is a division and the basis is not.
+        """
+        return Account.collateral_for_basis(
+            quantity, Money(quantity * int(price)), bounds
+        )
+
+    @staticmethod
+    def collateral_for_basis(
+        quantity: int, cost_basis: Money, bounds: tuple[Money, Money]
+    ) -> Money:
+        """Worst-case loss on a position holding exactly this basis.
+
+        One expression covers both directions, because a short is a negative
+        quantity carrying a negative basis. The position will be worth
+        ``quantity * value`` and it paid ``cost_basis`` for that, so the loss is
+        ``cost_basis - quantity * edge`` where the edge is the bottom of the
+        claim's range for a long and the top of it for a short.
+
+        Charged against the basis rather than against an average derived from
+        it, because the average needs a division and the basis does not.
+        `apply_fill` used to post ``collateral_required(quantity, cost_basis //
+        quantity, bounds)``, and floor division rounds a long's average *down*:
+        measured on seven lots bought as three at 10.25 and four at 11.50, the
+        basis is 76,750,000 minor units and the collateral posted was
+        76,749,995 -- five short of what the position can lose. Under a minor
+        unit per lot, and not zero, and this module's whole claim is that the
+        figure is exact rather than close.
+
+        Never negative. A long opened below the least the claim can settle for
+        cannot lose anything, and reporting that as a negative requirement would
+        hand the account a credit against its other positions, since
+        `posted_collateral` simply sums the dictionary. Measured before the
+        clamp: a short of one lot at 12,000 on a contract bounded by [0, 10000]
+        posted -2,000, which is 2,000 of spending power conjured out of a
+        position that cannot make money.
+        """
+        if quantity == 0:
+            return Money(0)
+        edge = int(bounds[0]) if quantity > 0 else int(bounds[1])
+        return Money(max(0, int(cost_basis) - quantity * edge))
 
     def can_afford(
         self, symbol: str, quantity: int, price: Money, bounds: tuple[Money, Money]
@@ -119,6 +156,17 @@ class Account:
         so a trade that reduces exposure stays admissible even with no free
         cash. It must: otherwise an agent becomes unable to close a losing
         position at precisely the moment it needs to.
+
+        And on the resulting position's *basis*, not on its quantity priced at
+        the incoming trade. The two differ whenever a fill adds to a position at
+        a different price, and they differ in the dangerous direction: measured
+        on an account holding 50,000 of cash and ten lots long at 5,000, a
+        further ten lots at 100 was checked as needing ``20 * 100 = 2,000`` and
+        produced a position carrying a basis of 51,000. The account passed, then
+        posted more collateral than it owned -- `free_cash` went to -1,000 --
+        and stood to owe a thousand it did not have if the contract settled at
+        the bottom of its range. Full collateralisation says an account can lose
+        everything it committed and never more; that check let it be more.
         """
         position = self.positions.get(symbol)
         current = position.quantity if position else 0
@@ -126,7 +174,12 @@ class Account:
         if resulting == 0:
             return True
 
-        required = int(self.collateral_required(resulting, price, bounds))
+        basis = (
+            position.basis_after(quantity, price)
+            if position is not None
+            else Money(quantity * int(price))
+        )
+        required = int(self.collateral_for_basis(resulting, basis, bounds))
         released = int(self.collateral.get(symbol, Money(0)))
         return int(self.free_cash) + released >= required
 
@@ -152,12 +205,14 @@ class Account:
         if position.quantity == 0:
             self.collateral.pop(symbol, None)
         else:
-            # Priced at the position's own average, which is what it would lose
-            # from. Derived from the exact basis, so it tracks reality even
-            # after a proportional close left a sub-unit remainder behind.
-            average = Money(int(position.cost_basis) // position.quantity)
-            self.collateral[symbol] = self.collateral_required(
-                position.quantity, average, bounds
+            # Charged against the position's own basis, which is what it would
+            # lose. Not against an average derived from it: that division floors,
+            # and on a long it floors the average downwards, so the requirement
+            # came out under the loss by whatever the basis left over -- up to
+            # one minor unit a lot, every time two fills went on at different
+            # prices.
+            self.collateral[symbol] = self.collateral_for_basis(
+                position.quantity, position.cost_basis, bounds
             )
 
     def distribute(
@@ -185,9 +240,8 @@ class Account:
 
         amount = Money(position.quantity * int(per_unit))
         self.cash = Money(int(self.cash) + int(amount))
-        average = Money(int(position.cost_basis) // position.quantity)
-        self.collateral[symbol] = self.collateral_required(
-            position.quantity, average, bounds
+        self.collateral[symbol] = self.collateral_for_basis(
+            position.quantity, position.cost_basis, bounds
         )
         return amount
 

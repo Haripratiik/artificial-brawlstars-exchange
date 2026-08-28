@@ -25,6 +25,7 @@ from arena.exchange.session import SessionState
 from arena.exchange.types import AgentId
 from arena.market.fees import FREE, MAKER_TAKER, FeeSchedule
 from arena.market.live import HUMAN_ID, LiveMarket
+from arena.portfolio.money import from_money
 from arena.research.stylized import analyse
 from dashboard.build_market import build, true_values
 
@@ -255,12 +256,34 @@ class MarketRunner:
             "fees": venue.fees.to_dict(),
             "fees_collected": str(venue.fees_collected),
             "price_band": venue.price_band,
-            "halts": venue.halts[-20:],
+            "halts": [self._readable_halt(halt) for halt in venue.halts[-20:]],
             "sessions": {
                 symbol: venue.session(symbol).value
                 for symbol in venue.registry.symbols
             },
         }
+
+    def _readable_halt(self, halt: dict[str, Any]) -> dict[str, Any]:
+        """One breaker record, with its prices as prices.
+
+        The venue records a halt in the unit it matches in -- ticks -- which is
+        right for the venue and wrong for a screen. The Halts table draws
+        ``price`` and ``reference`` straight into columns headed as such, so a
+        band break on a contract quoted on a 0.25 grid printed 1,989 against a
+        real price of 497.25, on a claim whose whole settlement range is 0 to
+        1,000. A number four times outside the range the same page publishes
+        does not read as a bug; it reads as a number, which is exactly how the
+        settlement figure survived so long.
+        """
+        instrument = self.market.venue.registry.get(halt.get("symbol", ""))
+        if instrument is None:
+            return dict(halt)
+        readable = dict(halt)
+        for field_name in ("price", "reference"):
+            ticks = halt.get(field_name)
+            if ticks is not None:
+                readable[field_name] = str(instrument.from_ticks(int(ticks)))
+        return readable
 
     def agents(self) -> list[dict[str, Any]]:
         """Who is in the market. The population is the experiment."""
@@ -279,8 +302,17 @@ class MarketRunner:
                     "positions": {
                         s: q for s, q in sorted(getattr(agent, "position", {}).items()) if q
                     },
+                    # In price units, like every other money figure on the
+                    # wire. `Account.equity` answers in *minor* units -- the
+                    # integer the ledger is kept in -- and publishing that
+                    # straight put the Participants table a million times out:
+                    # a maker worth 113,125,513.21 was drawn as
+                    # "113125513.21M", and a person's own seat showed
+                    # "143745.00M" beside a header reading "143.7k". The same
+                    # shape as the settlement bug: a raw internal unit under a
+                    # label that promises a price.
                     "equity": (
-                        str(account.equity(self.market.venue.marks()))
+                        str(from_money(account.equity(self.market.venue.marks())))
                         if account is not None
                         else None
                     ),
@@ -379,8 +411,23 @@ class MarketRunner:
         }
 
     def indicative(self, symbol: str) -> dict[str, Any] | None:
+        """Where an auction in progress would clear, as a price.
+
+        ``AuctionResult.to_dict`` answers in ticks, which is right for the
+        exchange and wrong for anything published. The socket already converts
+        this same figure -- ``books[symbol].indicative`` is "5003.00" -- while
+        the ladder endpoint was handing out 20012 for the same auction, on the
+        same contract, at the same instant. One name, two units, four times
+        apart. Nothing draws the ladder's copy yet, which is the only reason
+        it never appeared on a screen.
+        """
         venue = self.market.venue
-        if venue.registry.get(symbol) is None:
+        instrument = venue.registry.get(symbol)
+        if instrument is None:
             return None
         result = venue.indicative(symbol)
-        return None if result is None else result.to_dict()
+        if result is None:
+            return None
+        payload = result.to_dict()
+        payload["price"] = str(instrument.from_ticks(int(result.price)))
+        return payload

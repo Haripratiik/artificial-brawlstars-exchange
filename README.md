@@ -1,7 +1,7 @@
 # Artificial Brawl Stars Exchange
 
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=flat&logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-745-0A0A0A?style=flat)
+![Tests](https://img.shields.io/badge/tests-885%20passing-2ea44f?style=flat)
 ![Asset classes](https://img.shields.io/badge/asset%20classes-9-0A0A0A?style=flat)
 ![Collateral](https://img.shields.io/badge/collateral-exact%2C%20not%20modelled-8b5cf6?style=flat)
 ![Determinism](https://img.shields.io/badge/replay-bit%20identical-0ea5e9?style=flat)
@@ -11,8 +11,8 @@
 It was built to answer one question with evidence rather than opinion: **does a market aggregate dispersed information better than the agents trading inside it?** Answering that needs an instrument precise enough to trust, so the exchange is complete and runs end to end. A deterministic discrete-event kernel with per-agent latency. A price-time book carrying the order types real venues actually list. Opening and closing auctions, circuit breakers and a participant kill switch. A clearing house that nets portfolios exactly. Live settlement against measured game statistics. A population of heterogeneous trading agents. A research harness that runs paired ablations from a manifest. And a browser front end that anyone can log into and trade on.
 
 ```
-22,000 lines of exchange, agents and research     745 tests
-12,000 lines of tests                             28 listed instruments
+23,000 lines of exchange, agents and research     885 tests, all passing
+14,000 lines of tests                             28 listed instruments
 9 asset classes on one matching engine            conservation: integer zero
 bit-identical replay from a seed                  collateral: exact, not modelled
 ```

@@ -14,12 +14,15 @@ length rather than leaving the difference between "signed in" and
 
 from __future__ import annotations
 
+import hmac
+from hashlib import sha256
+
 import pytest
 from fastapi.testclient import TestClient
 
 from arena.sim.time import Timestamp, millis, seconds
 
-from dashboard.identity import COOKIE, display_name, sign, verify
+from dashboard.identity import COOKIE, _b64, display_name, sign, verify
 import dashboard.server as server
 
 
@@ -255,3 +258,157 @@ def test_the_roster_names_the_people_as_well_as_the_bots(browsers):
     with first.websocket_connect("/ws") as socket:
         payload = socket.receive_json()
     assert "Ada" in {t["name"] for t in payload["traders"]}
+
+
+def test_a_forged_cookie_gets_a_seat_of_its_own_not_somebody_elses(browsers):
+    """A browser can read what its cookie says and cannot write itself another.
+
+    The interesting case is not nonsense in the cookie, it is a *plausible*
+    cookie: the right shape, naming a real session id, signed with the wrong
+    key. That has to fall back to a seat of its own rather than be handed the
+    session it names.
+    """
+    first, _second = browsers
+    first.post("/api/me", json={"name": "Ada"})
+    with first.websocket_connect("/ws") as socket:
+        ada = socket.receive_json()["you"]
+
+    # The session id Ada is actually sitting on, signed with a key the server
+    # does not hold. Nothing else about the cookie is changed.
+    sid = next(k for k, v in server._SEATS.items() if str(v.agent_id) == ada["id"])
+    body = sign({"sid": sid, "name": "Ada"}).split(".")[0]
+    forged = f"{body}.{_b64(hmac.new(b'not the key', body.encode(), sha256).digest())}"
+
+    with TestClient(server.app) as attacker:
+        attacker.cookies.clear()
+        attacker.cookies.set(COOKIE, forged)
+        with attacker.websocket_connect("/ws") as socket:
+            theirs = socket.receive_json()["you"]
+
+    assert verify(forged) is None, "the forgery was accepted as a signature"
+    assert theirs["id"] != ada["id"], "a forged cookie was seated in Ada's account"
+
+
+def test_rebuilding_the_market_does_not_merge_everyone_into_one_account(browsers):
+    """The Rebuild button in the Lab used to undo the whole of this module.
+
+    ``reconfigure`` discards the running market and every account in it. The
+    table mapping a session id to an account was left holding ids the new
+    market had never heard of, and ``LiveMarket.trader`` answers an unknown id
+    with the *shared* account -- so every signed-in visitor collapsed onto one
+    seat: one balance, one blotter, and each of them able to cancel the others'
+    orders. Reloading the page did not clear it, because the stale entry was
+    still in the table.
+    """
+    first, second = browsers
+    first.post("/api/me", json={"name": "Ada"})
+    second.post("/api/me", json={"name": "Grace"})
+
+    with first.websocket_connect("/ws") as one, second.websocket_connect("/ws") as two:
+        before = (one.receive_json()["you"], two.receive_json()["you"])
+    assert before[0]["id"] != before[1]["id"]
+
+    original = server.runner.config
+    try:
+        server.runner.reconfigure(server.MarketConfig.from_dict({"seed": 11}))
+
+        with first.websocket_connect("/ws") as one, second.websocket_connect("/ws") as two:
+            ada = one.receive_json()["you"]
+            grace = two.receive_json()["you"]
+    finally:
+        server.runner.reconfigure(original)
+
+    assert ada["id"] != grace["id"], (
+        "a rebuild put both browsers in the same account: "
+        f"{ada} and {grace}"
+    )
+    assert (ada["name"], grace["name"]) == ("Ada", "Grace"), (
+        "a rebuild lost the names people chose"
+    )
+
+
+def test_a_socket_open_across_a_rebuild_follows_its_own_person(browsers):
+    """The seat is resolved per tick, not captured when the socket opened.
+
+    A connection that had captured an account id would spend the rest of its
+    life reading the shared account, which is the same failure by a slower
+    route -- and the browser has no reason to reconnect, because nothing about
+    the socket broke.
+    """
+    first, second = browsers
+    first.post("/api/me", json={"name": "Ada"})
+    second.post("/api/me", json={"name": "Grace"})
+
+    original = server.runner.config
+    try:
+        with first.websocket_connect("/ws") as one, second.websocket_connect("/ws") as two:
+            one.receive_json()
+            two.receive_json()
+            before = server.runner.generation
+            server.runner.reconfigure(server.MarketConfig.from_dict({"seed": 13}))
+
+            ada = _after_rebuild(one, before)
+            grace = _after_rebuild(two, before)
+    finally:
+        server.runner.reconfigure(original)
+
+    assert ada["id"] != grace["id"], f"both sockets ended up in {ada}"
+    assert (ada["name"], grace["name"]) == ("Ada", "Grace")
+
+
+def test_a_seat_from_an_older_market_never_lands_in_a_newcomers_account():
+    """Account ids are reused, so matching on the id alone is not enough.
+
+    Seats are handed out `you-1`, `you-2`, ... and a rebuild starts the count
+    again. A visitor whose remembered id was `you-1` therefore came back to
+    find a `you-1` in the roster -- somebody else's, freshly issued -- and was
+    seated in it. Two people, one account, arrived at from the far side of the
+    thing this module exists to prevent. The seat has to remember which market
+    issued it, not only what it was called there.
+    """
+    original = server.runner.config
+    try:
+        # A market of her own, so Ada holds the first id and a rebuild will
+        # hand that same id to whoever arrives next.
+        server.runner.reconfigure(server.MarketConfig.from_dict({"seed": 21}))
+        with TestClient(server.app) as ada_browser:
+            ada_browser.get("/")
+            ada_browser.post("/api/me", json={"name": "Ada"})
+            with ada_browser.websocket_connect("/ws") as socket:
+                before = socket.receive_json()["you"]
+
+            server.runner.reconfigure(server.MarketConfig.from_dict({"seed": 22}))
+
+            with TestClient(server.app) as newcomer_browser:
+                newcomer_browser.get("/")
+                newcomer_browser.post("/api/me", json={"name": "Newcomer"})
+                with newcomer_browser.websocket_connect("/ws") as socket:
+                    newcomer = socket.receive_json()["you"]
+                # Ada comes back to a market she has never traded in.
+                with ada_browser.websocket_connect("/ws") as socket:
+                    after = socket.receive_json()["you"]
+    finally:
+        server.runner.reconfigure(original)
+
+    assert newcomer["id"] == before["id"], (
+        "the newcomer did not reuse Ada's old id, so the collision this test "
+        "is about never arose"
+    )
+    assert after["id"] != newcomer["id"], (
+        f"Ada came back into the newcomer's account: {after}"
+    )
+    assert after["name"] == "Ada"
+
+
+def _after_rebuild(socket, before: int, tries: int = 40) -> dict:
+    """The first snapshot a socket sends from the *rebuilt* market.
+
+    Compared against the generation that was running rather than against zero:
+    a socket has snapshots in flight when the rebuild lands, and every one of
+    them carries a generation that is merely non-zero.
+    """
+    for _ in range(tries):
+        payload = socket.receive_json()
+        if payload.get("generation", -1) > before and "you" in payload:
+            return payload["you"]
+    raise AssertionError("the socket never reported the rebuilt market")

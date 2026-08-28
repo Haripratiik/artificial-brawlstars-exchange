@@ -13,7 +13,7 @@
  */
 
 import { clock, count, impliedProbability, money, percent, price, signed, cls,
-         walkBook } from './format.js';
+         walkBook, worstCase } from './format.js';
 import { lab, markets, matches, portfolio, research, trade } from './views.js';
 import { countTo, press, revealAll } from './motion.js';
 
@@ -59,11 +59,17 @@ function connect() {
     if (payload.generation !== store.generation) {
       store.generation = payload.generation;
       store.history = {};
+      // A new market restarts its clock at zero, so a fresh event can carry
+      // the same stamp as one already announced. Forgetting the old session's
+      // events is the only way the new one's get heard.
+      announced.clear();
+      announcing = false;
       refreshSlow();
     }
 
     store.snapshot = payload;
     recordHistory(payload);
+    announceRejections(payload);
     if (!store.symbol) store.symbol = Object.keys(payload.books)[0] ?? null;
     render();
   };
@@ -89,7 +95,49 @@ function send(message) {
 
 function acknowledge(ack) {
   if (ack.ok === false) toast(ack.error ?? 'Rejected', true);
-  else if (ack.speed === undefined) toast('Accepted');
+  // "Accepted" was a promise the acknowledgement cannot make. An order is
+  // *queued* here, and travels a latency link before the venue ever looks at
+  // it -- so the collateral check, the price band and the closing bell all
+  // answer later. Saying "Sent" and letting announceRejections carry what came
+  // back is the difference between a status and a guess.
+  else if (ack.speed === undefined) toast('Sent to the exchange');
+}
+
+/*
+ * Say out loud when the venue refuses an order.
+ *
+ * Rejections arrive asynchronously, in the private event log, and the only
+ * place that log is drawn is the Activity panel on the Portfolio screen --
+ * which is not where anybody is standing when they press Place Order. So the
+ * screen said "Accepted", the order never appeared in the book or the
+ * blotter beside it, and nothing on that page ever explained why. Insufficient
+ * collateral, a price band, a closed contract: all of them looked identical to
+ * nothing happening.
+ */
+const announced = new Set();
+let announcing = false;
+
+function announceRejections(payload) {
+  const fresh = [];
+  for (const entry of payload.log ?? []) {
+    const key = `${entry.t}|${entry.type}|${entry.symbol}|${entry.reason ?? ''}|${entry.order_id ?? ''}`;
+    if (announced.has(key)) continue;
+    announced.add(key);
+    if (entry.type === 'reject') fresh.push(entry);
+  }
+  // The first snapshot carries whatever history the account already had, and
+  // replaying old refusals as if they had just happened would be a lie about
+  // when. Everything in it is marked seen and nothing is announced.
+  if (!announcing) {
+    announcing = true;
+    return;
+  }
+  if (announced.size > 400) {
+    for (const key of [...announced].slice(0, announced.size - 200)) announced.delete(key);
+  }
+  for (const entry of fresh) {
+    toast(`${entry.symbol ?? 'Order'} refused: ${String(entry.reason ?? 'rejected').replace(/_/g, ' ')}`, true);
+  }
 }
 
 /* ── slow data ───────────────────────────────────────────────────────── */
@@ -488,11 +536,20 @@ function updatePreview() {
     // guess dressed as a quotation. What it *is* is the size of the
     // commitment -- which is what the venue reserves against, and the only
     // honest thing to show before it triggers.
+    //
+    // It was `stop * quantity`, which is the notional, not the reservation.
+    // Those agree only for a long on a claim whose floor is zero. A sell of
+    // ten futures stopped at 4,600 said 46,000 against the 54,000 the venue
+    // actually held; a spread stopped at zero said nothing was reserved at
+    // all, against 100,000. Understating every time, which is the direction
+    // that gets the next order refused for a reason the screen never showed.
+    const reserved = worstCase(quantity, stop, book.bounds, buying);
     panel.innerHTML = `<dl>
       <div><dt>Waits until</dt><dd class="mono">${price(stop)}</dd></div>
       <div><dt>Then</dt><dd class="mono">${limit === null
         ? 'goes to market' : `works a limit at ${price(limit)}`}</dd></div>
-      <div><dt>Reserved now</dt><dd class="mono">${money(Number(stop) * quantity)}</dd></div>
+      <div><dt>Reserved now</dt><dd class="mono">${
+        reserved == null ? '&mdash;' : money(reserved)}</dd></div>
     </dl>
     <p class="note">Nobody can see a stop while it waits, and it is
       collateralised from the moment you place it.</p>`;
@@ -515,10 +572,10 @@ function updatePreview() {
     return;
   }
 
-  const [low, high] = (book.bounds ?? []).map(Number);
-  const risk = Number.isFinite(low) && Number.isFinite(high)
-    ? quantity * (buying ? average - low : high - average)
-    : null;
+  // The same number as "Reserved now", by the same expression, because they
+  // are the same quantity: what this position can lose is what the venue
+  // holds against it. Two formulas for one figure is how one of them drifted.
+  const risk = worstCase(quantity, average, book.bounds, buying);
 
   const payoff = book.contract?.payoff;
   const odds = impliedProbability(average, payoff);
@@ -548,16 +605,31 @@ function updatePreview() {
       `<div><span>${label}</span><b class="mono">${value}</b></div>`).join('') + warning;
 }
 
+/*
+ * Send exactly the order the ticket describes.
+ *
+ * The stop trigger and the iceberg size were collected, previewed and then
+ * dropped on the floor: the panel said "Waits until 8,900.00" and "Reserved
+ * now ...", and what left the browser was a plain limit at 9,000 that rested
+ * in full, visible, immediately. Both fields have been supported by the server
+ * and by the venue the whole time; the submitter simply never read them.
+ *
+ * Raw strings rather than `Number`, deliberately -- `Number('')` is 0 and
+ * `Number('9,233.75')` is NaN, and JSON turns NaN into null, so a size box the
+ * server should refuse would have arrived looking like a field nobody filled
+ * in. The server parses and answers in the terms of the box.
+ */
 function submitOrder() {
-  const quantity = Number(document.getElementById('t-qty').value);
-  const raw = document.getElementById('t-px').value.trim();
+  const field = (id) => document.getElementById(id)?.value.trim() ?? '';
   send({
     action: 'submit',
     symbol: store.symbol,
     side: store.side,
-    quantity,
-    price: raw === '' ? null : raw,
-    tif: document.getElementById('t-tif').value,
+    quantity: field('t-qty'),
+    price: field('t-px') || null,
+    tif: field('t-tif'),
+    stop: field('t-stop') || null,
+    display: field('t-show') || 0,
   });
 }
 
