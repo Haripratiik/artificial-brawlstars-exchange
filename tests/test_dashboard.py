@@ -955,3 +955,43 @@ def test_the_revealed_value_is_a_price_not_a_tick_count(client):
         )
         checked += 1
     assert checked > 5, "too few contracts had a value to check"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_percentage_gives_way_to_points_when_its_base_has_no_resolution(tmp_path):
+    """A ratio divided by almost nothing is correct and useless.
+
+    An option can open a session worth one tick. `SPIKE_C4600` did, reached
+    96.375, and the market rail rendered the move as **+308,825.00%** -- which
+    is arithmetically right and says only that the contract went from the
+    smallest price it can represent to a real one. The move itself says that
+    better. Above 999% the figure is shown in points instead, which is a
+    statement about the resolution of a ratio rather than about the market:
+    nothing is clamped, hidden or invented.
+    """
+    probe = tmp_path / "probe.mjs"
+    # An absolute file URL: the probe is written into pytest's tmp dir, so a
+    # path relative to the repo resolves against the wrong root.
+    module = (REPO / "dashboard" / "static" / "js" / "format.js").as_uri()
+    probe.write_text(
+        f"import {{ move }} from '{module}';\n"
+        "const cases = [\n"
+        "  [96.125, 0.25, 'pts'],\n"   # the measured case
+        "  [50, 0, 'pts'],\n"          # no base at all
+        "  [4.7, 470, '%'],\n"         # an ordinary move
+        "  [-9.4, 470, '%'],\n"        # ordinary, negative
+        "  [469, 47, '%'],\n"          # 998%, still inside the column
+        "];\n"
+        "for (const [change, base, want] of cases) {\n"
+        "  const got = move(change, base).text;\n"
+        "  const ok = want === 'pts' ? got.endsWith('pts') : got.endsWith('%');\n"
+        "  if (!ok) { console.error(`move(${change}, ${base}) = ${got}, wanted ${want}`);"
+        " process.exit(1); }\n"
+        "}\n"
+        "if (move(0.5, 100).text !== '+0.50%') { console.error('sign lost'); process.exit(1); }\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["node", str(probe)], capture_output=True, text=True, cwd=REPO, timeout=60
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

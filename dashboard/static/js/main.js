@@ -12,7 +12,7 @@
  * it is the fastest way to make a trading screen unusable.
  */
 
-import { clock, count, impliedProbability, money, percent, price, signed, cls,
+import { clock, count, impliedProbability, money, move, percent, price, signed, cls,
          walkBook, worstCase } from './format.js';
 import { lab, markets, matches, portfolio, research, trade } from './views.js';
 import { countTo, press, revealAll } from './motion.js';
@@ -388,7 +388,7 @@ function renderWatchlist() {
         <span class="sym">${symbol}</span>
         <span class="px ${cls(change)}">${price(book.mark)}</span>
         <span class="cls">${book.class ?? ''}</span>
-        <span class="chg ${cls(change)}">${signed(pct)}%</span>
+        <span class="chg ${cls(change)}">${move(change, first).text}</span>
         <span class="spark" aria-hidden="true">${sparklineFor(series)}</span>
       </button>`;
     })

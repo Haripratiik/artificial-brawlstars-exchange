@@ -333,8 +333,15 @@ main { overflow: hidden; display: flex; flex-direction: column; }
 .view.stack > .panel.grow { flex: 1; min-height: 160px; }
 
 /* An empty panel says so in the middle of itself, not pinned to its top left
- * corner with the rest of the box left blank. */
-.panel.grow .panel-body { display: flex; }
+ * corner with the rest of the box left blank.
+ *
+ * Scoped with `:has()` because the unscoped version was a real regression: a
+ * panel-body that is always flex turns a *populated* table into a stretched
+ * flex item, and the rows then distribute over the whole height. A blotter
+ * holding one fill and one acknowledgement rendered them roughly 400px apart,
+ * which looks like a rendering fault rather than a list. Only the empty case
+ * wants centring. */
+.panel.grow .panel-body:has(> .empty) { display: flex; }
 .panel.grow .panel-body > .empty { margin: auto; text-align: center; }
 
 /* Panels. Hairline-ruled boxes with an uppercase mono caption. */
@@ -913,7 +920,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   min-height: calc(100vh - 94px);
 }
 .market-side > .panel:last-child { flex: 1; min-height: 120px; }
-.market-side > .panel:last-child .panel-body { display: flex; }
+.market-side > .panel:last-child .panel-body:has(> .empty) { display: flex; }
 .market-side > .panel:last-child .panel-body > .empty { margin: auto; text-align: center; }
 
 .contract {
@@ -1160,13 +1167,38 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
     white-space: nowrap;
     border-left: none;
     border-bottom: 2px solid transparent;
-    padding: 10px 16px;
+    /* Tighter than the rail's 16px so all five views fit a 375px screen.
+     * At 16px the row measured 537px against a 375px viewport, which put Lab
+     * entirely off-screen and left one pixel of Research showing, on a
+     * scroller with no visible affordance. Two of the five views were
+     * unreachable unless you guessed they were there. */
+    padding: 10px 8px;
+    /* 44px is the smallest target a finger hits reliably, and these are the
+     * primary navigation. Measured at 36px before this. Horizontal padding is
+     * untouched, so the five tabs still fit 375px exactly. */
+    min-height: 44px;
   }
   .nav-links button[aria-current='page'] {
     border-left-color: transparent;
     border-bottom-color: var(--amber);
   }
-  .nav-group {
+  /* The group heading is a device for a vertical rail. Laid out horizontally
+   * it becomes a 90px dead tab between Portfolio and Research, reading as a
+   * disabled view rather than as a label, while consuming a quarter of the
+   * width the real tabs needed. The grouping is not information a tab bar can
+   * carry, so it is dropped rather than restyled. */
+  .nav-group { display: none; }
+
+  /* Everything else a finger has to hit. The search field measured 33px and
+   * the identity button 28px, both well under the 44px a touch target needs. */
+  /* Specificity note, because this bit me: the base `.whoami .ghost` rule sets
+   * `min-height: 26px` and lives LATER in the file at equal specificity, so it
+   * won and the button stayed at 28px. Raised here so the media query wins on
+   * order rather than on weight. */
+  .search input,
+  header .whoami .ghost,
+  .speed input[type='range'] { min-height: 44px; }
+  .nav-group.keep {
     border-top: none;
     border-left: 1px solid var(--rule);
     margin: 0;

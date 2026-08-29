@@ -77,6 +77,34 @@ export function signed(value, dp = 2) {
 
 export const cls = (n) => (n > 0 ? 'up' : n < 0 ? 'down' : 'dim');
 
+/**
+ * A session move, as a percentage where that means something and as points
+ * where it does not.
+ *
+ * A percentage divides by where the price started, and an option can start a
+ * session worth a single tick. `SPIKE_C4600` opened at a hair above nothing
+ * and reached 96.375, which is arithmetically **+308,825%** and was rendered
+ * as exactly that in the market rail. The number is correct and useless: it
+ * reports that the contract went from the smallest price it can represent to a
+ * real one, which the move itself says better.
+ *
+ * Above 999% the column cannot carry the digits and the percentage has stopped
+ * carrying meaning, so the move is shown in points instead. This is a display
+ * rule about a ratio's resolution, not a rule about the market: nothing is
+ * clamped, hidden or invented, and the same move is simply named in the unit
+ * that still describes it.
+ */
+export function move(change, base) {
+  const c = Number(change);
+  if (!Number.isFinite(c)) return { text: '-', value: 0 };
+  const b = Number(base);
+  const pct = Number.isFinite(b) && b !== 0 ? (c / b) * 100 : null;
+  if (pct === null || Math.abs(pct) >= 1000) {
+    return { text: `${signed(c)} pts`, value: c };
+  }
+  return { text: `${signed(pct)}%`, value: c };
+}
+
 /** Nanoseconds of simulated time, as a session clock. */
 export function clock(ns) {
   const s = Number(ns) / 1e9;

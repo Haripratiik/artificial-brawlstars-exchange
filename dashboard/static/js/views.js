@@ -23,7 +23,7 @@
  */
 
 import {
-  clock, cls, count, describe, esc, impliedProbability, money, percent,
+  clock, cls, count, describe, esc, impliedProbability, money, move, percent,
   price, priceChart, signed, sparkline,
 } from './format.js';
 
@@ -90,7 +90,6 @@ export function markets(store) {
       const first = series.find((v) => v != null);
       const last = series.length ? series[series.length - 1] : null;
       const change = first != null && last != null ? last - first : 0;
-      const pct = first ? (change / first) * 100 : 0;
       const session = snapshot.sessions?.[symbol] ?? 'continuous';
       const odds = impliedProbability(book.mark, book.contract?.payoff);
       const headline = odds != null ? percent(odds, 0) : price(book.mark);
@@ -98,7 +97,7 @@ export function markets(store) {
       return `<button type="button" class="card" data-symbol="${esc(symbol)}"
                    data-region="card:${esc(symbol)}"
                    data-session="${esc(session)}"
-                   aria-label="${esc(symbol)}, ${headline}, ${signed(pct)} percent">
+                   aria-label="${esc(symbol)}, ${headline}, ${move(change, first).text}">
         <span class="card-top">
           <span class="sym">${esc(symbol)}</span>
           ${session !== 'continuous'
@@ -110,7 +109,7 @@ export function markets(store) {
 
         <span class="card-figure">
           <span class="price mono ${cls(change)}">${headline}</span>
-          <span class="chg mono ${cls(change)}">${signed(pct)}%</span>
+          <span class="chg mono ${cls(change)}">${move(change, first).text}</span>
         </span>
 
         <span class="spark" aria-hidden="true">${sparkline(series)}</span>

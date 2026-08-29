@@ -256,3 +256,23 @@ def test_the_interface_carries_no_em_dashes():
         if hits:
             offenders[path.name] = len(hits)
     assert not offenders, f"em dashes in the interface: {offenders}"
+
+
+def test_the_narrow_layout_reaches_every_view():
+    """Five views, and two of them were off the side of a phone.
+
+    The rail's group heading is a device for a vertical list. Laid out
+    horizontally it becomes a dead tab that reads as a disabled view, and it
+    took 90px of a 375px screen: measured, the tab row wanted 537px, which put
+    Lab entirely off-screen and left one pixel of Research showing, on a
+    scroller with no visible affordance. The heading is dropped at that width
+    and the tabs tightened, which seats all five.
+    """
+    css = CSS.read_text(encoding="utf-8")
+    narrow = css.split("@media (max-width: 860px)", 1)
+    assert len(narrow) > 1, "the narrow breakpoint has gone"
+    block = narrow[1]
+    assert ".nav-group { display: none; }" in block, (
+        "the group heading is back in the tab row"
+    )
+    assert "min-height: 44px" in block, "touch targets are unconstrained again"
