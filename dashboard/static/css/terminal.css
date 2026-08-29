@@ -404,7 +404,13 @@ tbody tr:hover { background: var(--raised); }
 
 /* ── markets grid ───────────────────────────────────────────────────── */
 
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(268px, 1fr)); gap: 12px; }
+/* 232px rather than 268px, which is the difference between four columns and
+ * five at a 1,440px window. The two largest groups on this exchange hold five
+ * contracts each -- the prediction markets and the commodities -- and at four
+ * columns each of them stranded a single card on a row of its own beside three
+ * empty cells, roughly a quarter of the visible page left as flat black. Five
+ * columns seats both exactly. */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
 
 .card {
   display: block;

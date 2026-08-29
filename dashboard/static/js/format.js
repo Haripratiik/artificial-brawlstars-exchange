@@ -228,16 +228,27 @@ export function walkBook(levels, quantity) {
 export function sparkline(values, { width = 200, height = 34 } = {}) {
   const pts = values.filter((v) => v != null && Number.isFinite(v));
   if (pts.length < 2) return '';
-  const lo = Math.min(...pts);
-  const hi = Math.max(...pts);
-  const span = hi - lo || 1;
+  // Padded the way the price panel pads, and for the reason a flat series
+  // exposes. With `span = hi - lo || 1` every point of a series that has not
+  // moved evaluates to `height - 2` -- the floor of the box -- so a quiet
+  // market drew a hard rule along the bottom edge under an empty rectangle,
+  // which reads as a chart that failed rather than a price that held. Padding
+  // the range puts a flat line through the middle, where it means "flat".
+  const low = Math.min(...pts);
+  const high = Math.max(...pts);
+  const pad = (high - low) * 0.08 || Math.abs(high) * 0.002 || 1;
+  const lo = low - pad;
+  const span = (high + pad) - lo;
   const step = width / (pts.length - 1);
   const y = (v) => height - 2 - ((v - lo) / span) * (height - 4);
 
   const d = pts.map((v, i) => `${i ? 'L' : 'M'}${(i * step).toFixed(1)},${y(v).toFixed(1)}`).join('');
-  const rising = pts[pts.length - 1] >= pts[0];
-  const stroke = rising ? 'var(--up)' : 'var(--down)';
-  const fill = rising ? 'var(--up-sunk)' : 'var(--down-sunk)';
+  // A series that never moved has no direction, and green and red are reserved
+  // strictly for direction here. `last >= first` is true for a flat line, so
+  // every unmoved market was being painted as though it had risen.
+  const move = pts[pts.length - 1] - pts[0];
+  const stroke = move === 0 ? 'var(--ink-faint)' : move > 0 ? 'var(--up)' : 'var(--down)';
+  const fill = move === 0 ? 'transparent' : move > 0 ? 'var(--up-sunk)' : 'var(--down-sunk)';
 
   return `<svg class="chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
     <path d="${d}L${width},${height}L0,${height}Z" fill="${fill}"/>
