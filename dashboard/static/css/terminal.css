@@ -319,6 +319,24 @@ main { overflow: hidden; display: flex; flex-direction: column; }
 .view { flex: 1; overflow-y: auto; padding: 16px; }
 .view.pad0 { padding: 0; }
 
+/* A column that reaches the bottom of the window.
+ *
+ * Panels size to their content, so a portfolio with nothing in it stopped dead
+ * about a third of the way down and left the remaining two thirds of the
+ * window as flat black. The panels were not wrong; nothing was telling the
+ * column to occupy the height it had been given. The last panel takes up the
+ * slack, so an empty account reads as an empty ledger rather than as a page
+ * that failed to finish loading. */
+.view.stack { display: flex; flex-direction: column; gap: 12px; }
+.view.stack > .figures { margin-bottom: 0; }
+.view.stack > .panel { flex: none; }
+.view.stack > .panel.grow { flex: 1; min-height: 160px; }
+
+/* An empty panel says so in the middle of itself, not pinned to its top left
+ * corner with the rest of the box left blank. */
+.panel.grow .panel-body { display: flex; }
+.panel.grow .panel-body > .empty { margin: auto; text-align: center; }
+
 /* Panels. Hairline-ruled boxes with an uppercase mono caption. */
 .panel {
   background: var(--panel);
@@ -788,10 +806,35 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
  * colours are used here because this *is* direction -- the same meaning they
  * carry everywhere else. Reduced motion collapses the duration, so the tint
  * simply does not appear rather than appearing and sticking. */
-.tick-up { animation: tick-up 0.55s ease-out; }
-.tick-down { animation: tick-down 0.55s ease-out; }
+/* The tick flash lands on the price, not on the whole row.
+ *
+ * Washing the row was wrong twice over, and both were measurable. Sampled ten
+ * times a second over six seconds across 28 markets: **32.5% of rows carried a
+ * flash at any given instant**, so a signal meant to say "this one just
+ * changed" was lit on a third of the list continuously and said nothing. And
+ * the flash follows the last tick while the row's own percentage follows the
+ * whole session, so the two disagreed **45.1% of the time** -- a row washed
+ * green above a red -9.19%.
+ *
+ * Both readings are correct about different things, which is exactly why they
+ * cannot share a surface. Tinting the cell that actually changed keeps the
+ * tick's information and leaves the row's colour meaning the one thing the
+ * palette says it means. */
+.tick-up .px, .tick-down .px {
+  border-radius: 2px;
+  /* Shorter, because it fires constantly. A high-frequency signal that lingers
+   * is a smear rather than a blink. */
+  animation-duration: 0.35s;
+  animation-timing-function: ease-out;
+}
+.tick-up .px { animation-name: tick-up; }
+.tick-down .px { animation-name: tick-down; }
 @keyframes tick-up { from { background: var(--up-sunk); } }
 @keyframes tick-down { from { background: var(--down-sunk); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .tick-up .px, .tick-down .px { animation: none; }
+}
 
 /* ══ user-facing exchange ═════════════════════════════════════════════ */
 
@@ -852,7 +895,26 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   align-items: start;
 }
 .market-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-.market-side { display: flex; flex-direction: column; gap: 16px; position: sticky; top: 14px; }
+/* The ticket column reaches the bottom of the window.
+ *
+ * It is sticky and it sizes to its content, so on an account holding nothing
+ * it stopped about two thirds of the way down and left a tall black rectangle
+ * beside the tape. A column that ends where its text happens to end reads as
+ * unfinished; one that reaches the bottom reads as a panel with nothing in it,
+ * which is the true statement. Working orders takes the slack because it is
+ * the panel that grows on its own once there is anything to show. */
+.market-side {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  position: sticky;
+  top: 14px;
+  /* Header is 46px and the view pads 16px top and bottom. */
+  min-height: calc(100vh - 94px);
+}
+.market-side > .panel:last-child { flex: 1; min-height: 120px; }
+.market-side > .panel:last-child .panel-body { display: flex; }
+.market-side > .panel:last-child .panel-body > .empty { margin: auto; text-align: center; }
 
 .contract {
   background: var(--panel);

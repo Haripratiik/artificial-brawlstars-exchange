@@ -486,9 +486,9 @@ function ladder(book, depth) {
  * and there "orders will rest" was a lie in the other direction.
  */
 const PHASE = {
-  pre_open: { open: true, label: 'Place Order &mdash; joins the opening call' },
-  auction: { open: true, label: 'Place Order &mdash; joins the reopening call' },
-  closed: { open: false, label: 'Closed &mdash; no new orders' },
+  pre_open: { open: true, label: 'Place Order, joins the opening call' },
+  auction: { open: true, label: 'Place Order, joins the reopening call' },
+  closed: { open: false, label: 'Closed, no new orders' },
 };
 
 export function sendButton(session) {
@@ -533,7 +533,7 @@ function ticket(symbol, book, session) {
     <details class="advanced">
       <summary>Advanced</summary>
       <div class="field">
-        <label for="t-px">Limit price &mdash; blank trades at market</label>
+        <label for="t-px">Limit price (blank trades at market)</label>
         <input id="t-px" type="text" inputmode="decimal" placeholder="4660.25&hellip;"
                autocomplete="off" spellcheck="false">
       </div>
@@ -544,13 +544,13 @@ function ticket(symbol, book, session) {
                  autocomplete="off" spellcheck="false">
         </div>
         <div class="field">
-          <label for="t-show">Show at a time &mdash; blank shows all</label>
+          <label for="t-show">Show at a time (blank shows all)</label>
           <input id="t-show" type="number" min="0" step="1" placeholder="10"
                  inputmode="numeric" autocomplete="off" spellcheck="false">
         </div>
       </div>
       <p class="note">A <b>stop</b> waits off the book until the market trades at
-        or through your trigger, then goes to market &mdash; or to your limit
+        or through your trigger, then goes to market (or to your limit)
         price, if you gave one. Nobody can see it while it waits. An
         <b>iceberg</b> shows part of your size at a time and refreshes the rest
         behind whoever queued up meanwhile, which is what hiding costs.</p>
@@ -691,7 +691,7 @@ export function portfolio(store) {
   const figure = (label, value, klass = '') =>
     `<div class="panel figure"><span>${label}</span><b class="mono ${klass}">${value}</b></div>`;
 
-  return `<div class="view">
+  return `<div class="view stack">
     <div class="figures" data-region="figures">
       ${figure('Account Value', money(a.equity))}
       ${figure('Profit &amp; Loss', money(a.pnl), cls(Number(a.pnl)))}
@@ -718,7 +718,7 @@ export function portfolio(store) {
       }</div>
     </div>
 
-    <div class="panel" data-region="activity">
+    <div class="panel grow" data-region="activity">
       <h2>Activity <em>${(s.log || []).length}</em></h2>
       <div class="panel-body">${blotter(s.log)}</div>
     </div>
@@ -801,7 +801,7 @@ export function research(store) {
     </div>
 
     <p class="note" style="margin-bottom:12px">The same estimators the research
-      harness uses, run on the live price series &mdash; not a second
+      harness uses, run on the live price series , not a second
       implementation that could disagree with it. A verdict of
       &ldquo;unexpected&rdquo; is information, not a failure.</p>
 
@@ -836,7 +836,7 @@ export function lab(store) {
   return `<div class="view">
     <p class="note" style="margin-bottom:12px">Operator controls. Changing any of
       these starts a <em>new</em> session rather than editing the running one
-      &mdash; a population edited mid-flight would produce a market no seed could
+      . A population edited mid-flight would produce a market no seed could
       reproduce, and reproducibility is most of what makes a result here worth
       anything.</p>
 
@@ -870,9 +870,9 @@ export function lab(store) {
               <label for="c-mechanism">Mechanism</label>
               <select id="c-mechanism">
                 <option value="book" ${c.mechanism === 'scoring-rule' ? '' : 'selected'}>
-                  Order book &mdash; every contract</option>
+                  Order book : every contract</option>
                 <option value="scoring-rule" ${c.mechanism === 'scoring-rule' ? 'selected' : ''}>
-                  Scoring rule &mdash; event contracts only</option>
+                  Scoring rule (event contracts only)</option>
               </select>
               <p class="note">A logarithmic scoring rule is defined on a partition of
                 outcomes, so it can quote a coin flip and not a future. On it the venue
@@ -881,7 +881,7 @@ export function lab(store) {
                 mechanism explains none of the difference in what a market learns.</p>
             </div>
             <div class="field">
-              <label for="c-band">Price band &mdash; blank for none</label>
+              <label for="c-band">Price band <span class="opt">optional</span></label>
               <input id="c-band" type="text" inputmode="decimal"
                      value="${c.price_band ?? ''}" placeholder="0.10&hellip;"
                      autocomplete="off" spellcheck="false">

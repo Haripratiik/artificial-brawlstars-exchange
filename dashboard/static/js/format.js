@@ -108,7 +108,7 @@ export function describe(contract) {
     const d = stream.payoff || {};
     return `A share of ${subject}. Pays ${d.scale} &times; its measured rate at the `
       + `end of each of ${stream.periods} weeks, the last on ${esc(stream.last)}, `
-      + `then expires worth nothing &mdash; by then it has paid out everything it `
+      + `then expires worth nothing, having by then paid out everything it `
       + `was ever going to.`;
   }
   switch (p.kind) {

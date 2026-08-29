@@ -237,3 +237,22 @@ def test_flexible_grid_columns_can_actually_shrink():
         assert "min-width: 0" in block[1].split("}", 1)[0], (
             f"{selector} can be pushed past its container again"
         )
+
+
+def test_the_interface_carries_no_em_dashes():
+    """A house style rule, held where it is easy to break it again.
+
+    Twelve of these were sitting in the front end after the docs had been swept
+    of them, because they were HTML entities rather than literal characters and
+    a search for the character found nothing. Most were doing a comma's job.
+    """
+    root = CSS.parent.parent
+    offenders = {}
+    for path in sorted(list((root / "js").glob("*.js")) + [root / "index.html"]):
+        if "vendor" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8")
+        hits = re.findall(r"&mdash;|—", text)
+        if hits:
+            offenders[path.name] = len(hits)
+    assert not offenders, f"em dashes in the interface: {offenders}"

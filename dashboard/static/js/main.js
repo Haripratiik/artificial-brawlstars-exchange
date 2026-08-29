@@ -549,7 +549,7 @@ function updatePreview() {
       <div><dt>Then</dt><dd class="mono">${limit === null
         ? 'goes to market' : `works a limit at ${price(limit)}`}</dd></div>
       <div><dt>Reserved now</dt><dd class="mono">${
-        reserved == null ? '&mdash;' : money(reserved)}</dd></div>
+        reserved == null ? '--' : money(reserved)}</dd></div>
     </dl>
     <p class="note">Nobody can see a stop while it waits, and it is
       collateralised from the moment you place it.</p>`;
