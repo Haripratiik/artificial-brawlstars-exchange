@@ -560,17 +560,38 @@ def test_paying_a_distribution_moves_cash_and_conserves_it():
             and book.best_ask is not None
         ):
             break
-    market.human.enqueue(
-        SymbolCommand(
-            symbol,
-            Submit(HUMAN_ID, Side.BUY, Quantity(40), None, OrderType.MARKET, TimeInForce.IOC),
-        )
-    )
-    market.kernel.advance(until=Timestamp(int(market.kernel.now) + int(seconds(2))))
-
+    # Retried, because seeing an offer and reaching it are different events.
+    #
+    # An order enqueued here travels the same latency link as an algorithm's,
+    # and a maker is free to pull in between -- so a fill-or-cancel market
+    # order that was aimed at a real offer arrives to an empty side and cancels
+    # itself. Acknowledged, then Cancelled, with no position. That is the
+    # market working, not a fault, and it began failing here only because
+    # listing nineteen more contracts moved the trajectory at this seed.
+    #
+    # Holding the share is *setup* for this test; what is under test is that
+    # `distribute` moves cash and conserves it. So the setup retries rather
+    # than the assertion loosening.
     venue = market.venue
-    position = venue.account(HUMAN_ID).positions.get(symbol)
-    assert position is not None and position.quantity > 0
+    position = None
+    for _ in range(12):
+        market.human.enqueue(
+            SymbolCommand(
+                symbol,
+                Submit(
+                    HUMAN_ID, Side.BUY, Quantity(40), None, OrderType.MARKET, TimeInForce.IOC
+                ),
+            )
+        )
+        market.kernel.advance(until=Timestamp(int(market.kernel.now) + int(seconds(2))))
+        position = venue.account(HUMAN_ID).positions.get(symbol)
+        if position is not None and position.quantity > 0:
+            break
+
+    assert position is not None and position.quantity > 0, (
+        "twelve marketable orders in a row found no offer to take, which is a "
+        "market with no sell side rather than a race"
+    )
 
     before = int(venue.account(HUMAN_ID).cash)
     assert int(venue.conservation_check()) == 0

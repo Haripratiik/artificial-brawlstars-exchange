@@ -77,8 +77,14 @@
    * line, and `SPIKE_WR_FUT` needs about 86px of that at the mono size. At 232
    * the price column -- sized `auto`, so set by the widest number in the list
    * -- took the difference and the tickers truncated to `ASSASSIN...`. A
-   * navigation list whose names are cut off is not navigation. */
-  --rail: 264px;
+   * navigation list whose names are cut off is not navigation.
+   *
+   * 288px after listing ELPRIMO. `ELPRIMO_WR_FUT` is fourteen characters,
+   * about 101px at the mono size, and the change column also had to widen:
+   * where a percentage is not meaningful the move is shown in points, and
+   * "+26.38 pts" is wider than a percentage ever is, so it wrapped the row
+   * onto two lines and broke the 32px rhythm the rail exists for. */
+  --rail: 288px;
   --tick: 0.12s cubic-bezier(0.3, 0, 0.2, 1);
 }
 
@@ -312,7 +318,7 @@ nav {
   /* Fixed number columns so the ticker keeps its width whatever the prices
    * happen to be: a rate at 0.39 and a future at 4,725.13 must not resize the
    * name beside them. */
-  grid-template-columns: minmax(0, 1fr) 72px 56px;
+  grid-template-columns: minmax(0, 1fr) 72px 66px;
   align-items: center;
   gap: 8px;
   height: 32px;
@@ -349,6 +355,14 @@ nav {
   font-size: var(--t-xs);
   text-align: right;
   font-variant-numeric: tabular-nums;
+  /* Never wrap. The change column usually holds a percentage, but where a
+   * percentage has no meaningful base it holds a point move instead, and
+   * "+26.38 pts" is wider than any percentage. Wrapping broke the row onto two
+   * lines and destroyed the 32px rhythm the whole rail was rebuilt for. Sizing
+   * the column for the widest case and forbidding the wrap outright is the
+   * guarantee; measuring two samples and hoping is not. */
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 /* ── the markets list ───────────────────────────────────────────────── */

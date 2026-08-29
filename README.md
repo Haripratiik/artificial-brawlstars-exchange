@@ -13,7 +13,7 @@ It was built to answer one question with evidence rather than opinion: **does a 
 
 ```
 24,000 lines of exchange, agents and research     1,054 tests, all passing
-14,000 lines of tests                             28 listed instruments
+14,000 lines of tests                             47 listed instruments
 9 asset classes on one matching engine            conservation: integer zero
 bit-identical replay from a seed                  collateral: exact, not modelled
 ```
@@ -30,7 +30,7 @@ bit-identical replay from a seed                  collateral: exact, not modelle
 - **The mechanism is not the order book.** The natural reading of Experiment 1 is that a limit order book aggregates by capital because it needs a counterparty for every trade. Experiment 2 built an LMSR venue, which always quotes and needs no counterparty, and it lands in the same place, p = 0.97. The binding constraint is the agents' balance sheets, not the matching rule.
 - **Concentrating information makes the price worse.** Holding total evidence fixed at 10,319 battles and moving all of it into a single trader raises market error **2.7x**, because one agent has one balance sheet. Dispersed information reaches the price better than concentrated information, which is the opposite of the usual intuition about an informed monopolist.
 - **A real API, not a demo endpoint.** 17 REST routes plus a streaming socket, covering market data, accounts, positions, fills and the whole order lifecycle across every asset class through one code path. Requests are **signed, not labelled**: HMAC-SHA256 covers the timestamp, method, path and body together, so a captured signature cannot be moved onto a different order. An API order is enqueued onto the same agent, crosses the same latency link and meets the same collateral check as one clicked in the browser, because a privileged lane for machines would make the simulation a lie. See [docs/API.md](docs/API.md).
-- **Nine asset classes on one matching engine.** Futures, binaries, calls, puts, calendar spreads, an index, commodities, equities and a volatility contract. 28 listed instruments sharing one collateral rule, because they all reduce to a bounded payoff function.
+- **Nine asset classes on one matching engine.** Futures, binaries, calls, puts, calendar spreads, an index, commodities, equities and a volatility contract. 47 listed instruments sharing one collateral rule, because they all reduce to a bounded payoff function.
 
 ---
 

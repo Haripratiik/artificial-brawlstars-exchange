@@ -140,6 +140,40 @@ DELIVERY_WEEKS = [
 ]
 
 
+def _chain(subject: str, calls: tuple[int, ...], puts: tuple[int, ...]) -> list[Instrument]:
+    """An option ladder on one subject.
+
+    Strikes are listed across the plausible band an adjusted win rate occupies,
+    the way an exchange lists strikes, and deliberately not around where the
+    metric is known to settle -- listing the answer is not listing a market.
+    Some rungs will be near-certain and some genuinely open, and which is which
+    is the thing the market is for.
+
+    Ladders were thin before this. `SPIKE` carried three calls and two puts,
+    `CROW` and `ELPRIMO` carried none, so a chain that the surface maker,
+    the arbitrageur's vertical and butterfly relations and the whole
+    static-arbitrage apparatus exist to price had almost nothing to price. The
+    exchange is also the wrong shape at that size: real venues reach hundreds
+    of listings mostly through strikes and expiries on subjects they already
+    carry, which is exactly what the markets screen was rebuilt to absorb.
+    """
+    return [
+        Instrument(
+            f"{subject}_C{strike}",
+            _spec(f"{subject}_C{strike}", _wr(subject), Call(float(strike), 10_000.0),
+                  tick="0.25"),
+        )
+        for strike in calls
+    ] + [
+        Instrument(
+            f"{subject}_P{strike}",
+            _spec(f"{subject}_P{strike}", _wr(subject), Put(float(strike), 10_000.0),
+                  tick="0.25"),
+        )
+        for strike in puts
+    ]
+
+
 def instruments() -> list[Instrument]:
     return [
         Instrument("SPIKE_WR_FUT", _spec("SPIKE_WR_FUT", _wr("SPIKE"), Linear(10_000.0))),
@@ -202,30 +236,36 @@ def instruments() -> list[Instrument]:
         # 4,700 against a rate settling near 4,669, so both were worth almost
         # nothing and their books were two-sided about two percent of the time.
         # An option nobody can quote is not an asset class, it is a row.
+        *_chain("SPIKE", (4_550, 4_600, 4_650, 4_700, 4_750),
+                (4_600, 4_650, 4_700, 4_750, 4_800)),
+        # CROW carried a future and one binary and no options at all, so half
+        # the chain machinery had nothing to act on for the second-largest
+        # subject on the exchange.
+        *_chain("CROW", (4_650, 4_700, 4_750), (4_700, 4_750)),
+        # ── ELPRIMO ──────────────────────────────────────────────────────
+        #
+        # A fourth subject, and it was already in the data. The fixture carries
+        # CROW, ELPRIMO, PIPER and SPIKE, and ELPRIMO was the one with no
+        # market written on it -- so this lists a Brawler the oracle can
+        # already settle rather than inventing one it cannot. Prior level
+        # 0.4674, which is where its strikes are banded from.
+        Instrument(
+            "ELPRIMO_WR_FUT",
+            _spec("ELPRIMO_WR_FUT", _wr("ELPRIMO"), Linear(10_000.0)),
+        ),
         *[
             Instrument(
-                f"SPIKE_C{strike}",
+                f"ELPRIMO_GT{int(threshold * 100)}",
                 _spec(
-                    f"SPIKE_C{strike}",
-                    _wr("SPIKE"),
-                    Call(float(strike), 10_000.0),
-                    tick="0.25",
+                    f"ELPRIMO_GT{int(threshold * 100)}",
+                    _wr("ELPRIMO"),
+                    Binary(">", threshold, payout=1.0),
+                    tick="0.01",
                 ),
             )
-            for strike in (4_600, 4_650, 4_700)
+            for threshold in (0.45, 0.47, 0.49)
         ],
-        *[
-            Instrument(
-                f"SPIKE_P{strike}",
-                _spec(
-                    f"SPIKE_P{strike}",
-                    _wr("SPIKE"),
-                    Put(float(strike), 10_000.0),
-                    tick="0.25",
-                ),
-            )
-            for strike in (4_700, 4_750)
-        ],
+        *_chain("ELPRIMO", (4_600, 4_650, 4_700), (4_650, 4_700)),
         # ── volatility ───────────────────────────────────────────────────
         #
         # A claim on how unevenly a Brawler performs across the maps and modes
