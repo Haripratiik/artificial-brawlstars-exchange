@@ -1,0 +1,141 @@
+# arena_client
+
+The Python client for the [Artificial Brawl Stars Exchange](../../README.md)
+trading API. Signs requests for you, and gives back every price and balance as
+`decimal.Decimal`.
+
+**This is a simulated exchange.** No real money and no real securities are
+involved. The underlyings are public game statistics and every counterparty is a
+simulated agent.
+
+## Install
+
+One dependency, plus the standard library:
+
+```
+pip install httpx
+```
+
+The client is a plain package directory with no build file of its own. Put it on
+the path:
+
+```
+export PYTHONPATH=clients/python        # or copy arena_client/ into your project
+```
+
+It deliberately imports nothing from `python/arena`. A client that needs the
+exchange's source in order to sign a request is not a client, so the signing
+scheme is transcribed rather than imported -- and `tests/test_api_client.py`
+signs the same inputs with both implementations and demands identical bytes, so
+the copy cannot drift.
+
+## Authenticate
+
+```python
+from arena_client import ArenaClient
+
+client = ArenaClient("http://localhost:8000", key_id="ak_...", secret="...")
+```
+
+That is the whole of it. Every signed endpoint signs itself: HMAC-SHA256 over
+the timestamp, the method, the path with its query string, and the exact body
+bytes. Market data needs no key, so a client built without one still reads the
+book.
+
+The secret is shown once, when the key is issued. Requests are refused if your
+clock is more than 30 seconds from the venue's. The scheme, and a worked vector
+you can check another language's implementation against, are in
+[docs/API.md](../../docs/API.md).
+
+## Three things worth doing on day one
+
+### 1. Read the book, exactly
+
+```python
+from arena_client import ArenaClient
+
+client = ArenaClient("http://localhost:8000")
+book = client.book("SPIKE_WR_FUT", depth=5)
+
+best_bid, size = book["bids"][0]          # still a pair
+best_ask = book["asks"][0].price          # and still named
+print(f"{size} bid at {best_bid}, offered at {best_ask}")
+print(f"spread {best_ask - best_bid}")    # Decimal('4.25'), exactly
+```
+
+Prices are `Decimal`, never `float`. That is the point of the library rather
+than a detail of it: this venue publishes an average price of
+`3479.328892044943820224719101`, because average cost is a ratio of two exact
+integers, and `float()` keeps sixteen of those twenty-eight digits. There is
+no code path in this client that produces a float, and the test suite asserts
+that by walking parsed responses looking for one.
+
+### 2. Quote behind the touch
+
+```python
+from arena_client import ArenaClient
+
+client = ArenaClient("http://localhost:8000", key_id="ak_...", secret="...")
+tick = client.instrument("SPIKE_WR_FUT")["tick_size"]
+best_bid = client.book("SPIKE_WR_FUT")["bids"][0].price
+
+order = client.place_order(
+    "SPIKE_WR_FUT",
+    "buy",
+    1,
+    price=best_bid - tick,                 # exact, and therefore on the grid
+    time_in_force="post_only",             # never cross; reject instead
+    client_order_id="quote-1",
+)
+client.cancel("SPIKE_WR_FUT", order["order_id"])
+```
+
+Passing a `float` as `price` raises a `TypeError` rather than sending it. A
+price is the last place to discover that `0.1 + 0.2` is not `0.3`, and this
+venue refuses an off-grid price rather than rounding it back on -- rounding
+would rest the order at a price nobody chose and then fill it there.
+
+`client_order_id` is optional and worth setting: it is the only thing that lets
+a retry after a timeout be told apart from a second order.
+
+The `order["order_id"]` above is the shape the endpoint contract implies, not
+one observed from a running server -- the order handler was being written in
+parallel with this client. `docs/API.md` lists what else is unverified.
+
+### 3. Branch on the code, not on the sentence
+
+```python
+from arena_client import ArenaClient, ArenaError, AuthError, RateLimited, Rejected
+
+try:
+    client.place_order("SPIKE_WR_FUT", "buy", 1, price="4663.30")
+except AuthError:
+    raise                                  # stop; retrying cannot help
+except RateLimited:
+    back_off()                             # temporary by definition
+except Rejected as err:
+    log(f"the venue refused it: {err.message}")
+except ArenaError as err:
+    if err.code == "invalid_price":
+        log(f"off the grid: {err.detail}")  # detail carries the tick size
+```
+
+Every failure carries a stable machine code and arrives as an `ArenaError`.
+The subclasses group the codes by what to do about them; `err.code` is the
+contract, and a code this client has never seen still arrives with its code
+intact rather than as a parse failure. Failures that never reached the venue --
+no credentials, an unreachable host, a body that is not JSON -- use the same
+exception type under codes prefixed `client_`, so one `except` covers the loop
+and a log can still tell the two apart.
+
+## More
+
+- [`examples/quote_and_trade.py`](examples/quote_and_trade.py) reads the book,
+  rests an order behind the touch, reads it back and cancels it, narrating each
+  step.
+- [docs/API.md](../../docs/API.md) is the endpoint reference, the signing
+  vector, and the streaming protocol.
+- The streaming socket is not opened by this client. It builds the URL
+  (`client.stream_url()`) and the signed auth frame (`client.stream_auth()`) and
+  leaves the reconnect loop to you, because that loop is the part a caller wants
+  to own.

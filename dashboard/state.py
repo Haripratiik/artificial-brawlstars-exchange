@@ -254,7 +254,21 @@ class MarketRunner:
             "uptime": time.time() - self.started_at,
             "config": self.config.to_dict(),
             "fees": venue.fees.to_dict(),
-            "fees_collected": str(venue.fees_collected),
+            # Through `from_money`, like every other money field on this
+            # payload. It was published in raw *minor* units -- a factor of a
+            # million -- and the browser silently corrected it with `/ 1e6` at
+            # the point of display. That is the same defect shape as the
+            # settlement value that read 18,677 against a real 4,663 and the
+            # equity column that rendered a seat as "143745.00M": a number
+            # crossing the wire in units its label does not claim, with one
+            # consumer compensating and every other consumer wrong.
+            #
+            # It matters more now than it did, because the browser is no longer
+            # the only reader. A programmatic client asking `GET /v1/exchange`
+            # has no `/ 1e6` to apply and no reason to suspect it needs one.
+            # The compensation was also `Number(...)`, which puts a float in a
+            # money path in a project whose whole claim is exact arithmetic.
+            "fees_collected": str(from_money(venue.fees_collected)),
             "price_band": venue.price_band,
             "halts": [self._readable_halt(halt) for halt in venue.halts[-20:]],
             "sessions": {

@@ -1008,7 +1008,7 @@ export function lab(store) {
             <table><tbody>
               <tr><td style="text-align:left">Taker fee</td><td>${s.fees.taker_bps} bp</td></tr>
               <tr><td style="text-align:left">Maker fee</td><td>${s.fees.maker_bps} bp</td></tr>
-              <tr><td style="text-align:left">Fees collected</td><td>${money(Number(s.fees_collected) / 1e6)}</td></tr>
+              <tr><td style="text-align:left">Fees collected</td><td>${money(s.fees_collected)}</td></tr>
               <tr><td style="text-align:left">Price band</td><td>${s.price_band ?? '-'}</td></tr>
               <tr><td style="text-align:left">Uptime</td><td>${(s.uptime || 0).toFixed(0)}s</td></tr>
             </tbody></table>

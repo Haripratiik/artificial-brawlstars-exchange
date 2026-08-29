@@ -22,6 +22,31 @@ Layout of the surface:
     POST /api/session/{sym}/uncross   clear the call and resume
     WS   /ws                   live snapshot at the tick rate, and order entry
 
+Those are the *page's* endpoints, shaped for one browser: they answer whatever
+the screen needs and they trust a session cookie. A program wants neither. The
+programmatic surface is separate and versioned, under ``/v1``, and is
+documented in `docs/API.md`:
+
+    GET  /v1/exchange          clock, generation, conservation, session summary
+    GET  /v1/instruments       every listing, filterable by class or subject
+    GET  /v1/instruments/{s}/book|trades|history
+    GET  /v1/account           and /positions, /fills
+    POST /v1/orders            place; GET, DELETE for the rest of the lifecycle
+    POST /v1/keys              issue a credential for the caller's seat
+    WS   /v1/stream            ticker, book and trades, plus a seat's own
+                               orders and fills once the socket authenticates
+
+Requests there are *signed* rather than labelled: HMAC-SHA256 over the
+timestamp, method, path and body together, so a captured signature cannot be
+moved onto a different order. See :mod:`arena.api.keys`.
+
+Both surfaces reach one exchange, in one process. That is the point rather than
+a simplification: an API served by a second process would be a second market,
+and a client that could not see the book the page is showing would be a demo.
+An order arriving over ``/v1/orders`` is enqueued onto the same agent, crosses
+the same latency link and meets the same collateral check as one clicked in the
+browser -- there is no privileged lane for the machine.
+
 Single-process and single-market by design. A second viewer sees the *same*
 market, which is the useful behaviour when you want the book on one screen and
 the blotter on another.
@@ -44,6 +69,9 @@ from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from arena.api import rest
+from arena.api import stream as api_stream
+from arena.api.keys import KeyStore
 from arena.exchange.types import AgentId
 from arena.portfolio.money import from_money
 from dashboard.identity import COOKIE, display_name, sign, verify
@@ -601,6 +629,45 @@ class _FreshStatic(StaticFiles):
 
 if STATIC.is_dir():
     app.mount("/static", _FreshStatic(directory=STATIC), name="static")
+
+
+# --------------------------------------------------------------------------
+# The programmatic API
+# --------------------------------------------------------------------------
+#
+# Mounted here rather than served by a second process, because a systematic
+# trader and a person at the browser have to reach the *same* exchange. Two
+# processes would be two markets, and a client that could not see the book the
+# page is showing would be a demo rather than an API.
+#
+# The two facts `arena.api` cannot work out for itself are both about identity:
+# how to recognise one of this application's browser sessions, and where that
+# session is sitting in the market running right now. Both are answered from
+# the same helpers the page uses, so a key and the cookie that minted it share
+# one account -- including across a rebuild, which discards every account and
+# is the point at which a naive binding would silently fall back to the shared
+# seat.
+api_keys = KeyStore()
+
+rest.configure(
+    keys=api_keys,
+    runner=runner,
+    browser_seat=lambda request: (
+        rest.Seat(sid, _SEATS[sid].name)
+        if (sid := _session_id(request)) in _SEATS
+        else None
+    ),
+    seat_now=_seat_now,
+)
+app.include_router(rest.router)
+
+# The same key store and the same seat resolver, deliberately. Two stores would
+# mean the streaming half refuses credentials the REST half issued; two
+# resolvers would put one credential on two different accounts, so a client
+# would place orders on one and watch the other's fills -- which is
+# indistinguishable from a broken feed and would be blamed on the feed.
+api_stream.configure(keys=api_keys, runner=runner, seat_now=_seat_now)
+app.add_api_websocket_route("/v1/stream", api_stream.stream_endpoint())
 
 
 def main() -> None:

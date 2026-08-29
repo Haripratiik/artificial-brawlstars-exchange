@@ -995,3 +995,58 @@ def test_a_percentage_gives_way_to_points_when_its_base_has_no_resolution(tmp_pa
         ["node", str(probe)], capture_output=True, text=True, cwd=REPO, timeout=60
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_no_client_compensates_for_minor_units():
+    """If the browser has to divide by a million, a serialiser is wrong.
+
+    This is the third instance of one defect: a number crossing the wire in
+    units its label does not claim, with one consumer quietly correcting it and
+    every other consumer wrong. The first rendered a settlement value of 18,677
+    against a real 4,663. The second rendered a seat's equity as "143745.00M"
+    beside a header reading "143.7k". The third was `fees_collected`, published
+    in raw minor units while every money field beside it went through
+    `from_money`, with `views.js` compensating at the point of display.
+
+    It stopped being a display bug the moment this exchange grew an API. A
+    client calling `GET /v1/exchange` has no `/ 1e6` to apply and no reason to
+    suspect it needs one, so the compensation has to live in the serialiser or
+    nowhere. The old compensation was also `Number(...)`, which puts a float in
+    a money path in a project whose entire claim is exact arithmetic.
+
+    The pattern requires a *property access* in the numerator, and that is not
+    incidental. Dividing by a million is perfectly legitimate as a magnitude
+    abbreviation: `money()` renders 1,500,000 as "1.5M" and `count()` does the
+    same for trade counts. The first version of this test flagged both and was
+    wrong. What distinguishes the defect is that it divides a field which
+    arrived from the server, and that always reads as `something.field`, where
+    a formatter divides a local like `abs` or `v`.
+    """
+    root = REPO / "dashboard" / "static" / "js"
+    # `x.field ... / 1e6`, tolerating a cast or close paren in between.
+    compensation = re.compile(
+        r"[\w$]+\.[\w$]+[^\n;]{0,40}?/\s*(?:1e6|1_?000_?000)\b", re.IGNORECASE
+    )
+    offenders: dict[str, list[str]] = {}
+    for path in sorted(root.glob("*.js")):
+        text = path.read_text(encoding="utf-8")
+        hits = [m.group(0).strip() for m in compensation.finditer(text)]
+        if hits:
+            offenders[path.name] = hits
+    assert not offenders, (
+        f"the browser is correcting the server's units: {offenders}. "
+        "Publish the field through `from_money` instead."
+    )
+
+
+def test_the_fee_ledger_is_published_in_contract_units():
+    """The specific case, pinned, since a general rule catches only the shape."""
+    from decimal import Decimal
+
+    from arena.portfolio.money import from_money
+
+    published = runner.session_state()["fees_collected"]
+    expected = from_money(runner.market.venue.fees_collected)
+    assert Decimal(published) == expected, (
+        f"published {published}, venue holds {expected}"
+    )
