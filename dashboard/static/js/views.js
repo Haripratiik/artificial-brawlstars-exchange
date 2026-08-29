@@ -460,8 +460,8 @@ function ladder(book, depth) {
       return `<button type="button" class="lad-row ${i === nearest ? 'at-mark' : ''}"
                    data-price="${p}"
                    aria-label="Price ${price(p)}, ${side.bid || 0} bid, ${side.ask || 0} offered">
-        <span class="bar bid" style="width:${bidW.toFixed(1)}%" aria-hidden="true"></span>
-        <span class="bar ask" style="width:${askW.toFixed(1)}%" aria-hidden="true"></span>
+        <span class="bar bid" style="transform:scaleX(${(bidW / 100).toFixed(4)})" aria-hidden="true"></span>
+        <span class="bar ask" style="transform:scaleX(${(askW / 100).toFixed(4)})" aria-hidden="true"></span>
         <span class="bidq">${side.bid ? count(side.bid) : ''}</span>
         <span class="px">${price(p)}</span>
         <span class="askq">${side.ask ? count(side.ask) : ''}</span>
@@ -539,7 +539,7 @@ function ticket(symbol, book, session) {
       </div>
       <div class="row2">
         <div class="field">
-          <label for="t-stop">Stop trigger &mdash; blank for none</label>
+          <label for="t-stop">Stop trigger <span class="opt">optional</span></label>
           <input id="t-stop" type="text" inputmode="decimal" placeholder="4600.00&hellip;"
                  autocomplete="off" spellcheck="false">
         </div>

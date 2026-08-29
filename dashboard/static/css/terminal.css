@@ -135,7 +135,7 @@ button {
   background: var(--amber);
   color: #16120a;
   font-weight: 700;
-  padding: 9px 14px;
+  padding: 10px 16px;
   text-decoration: none;
   transition: top var(--tick);
 }
@@ -161,7 +161,7 @@ header {
   grid-column: 1 / -1;
   display: flex;
   align-items: center;
-  gap: 22px;
+  gap: 24px;
   padding: 0 16px;
   background: var(--sunk);
   border-bottom: 1px solid var(--rule);
@@ -220,7 +220,7 @@ header {
 .health {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   font-family: var(--mono);
   font-size: 11px;
   letter-spacing: 0.1em;
@@ -254,7 +254,7 @@ nav {
   display: block;
   width: 100%;
   text-align: left;
-  padding: 7px 16px;
+  padding: 8px 16px;
   font-size: 12px;
   letter-spacing: 0.11em;
   text-transform: uppercase;
@@ -270,7 +270,7 @@ nav {
 }
 
 .watch-head {
-  padding: 9px 16px 6px;
+  padding: 10px 16px 6px;
   font-family: var(--mono);
   font-size: 10px;
   letter-spacing: 0.16em;
@@ -310,13 +310,13 @@ nav {
 }
 .watch .cls { font-size: 10px; color: var(--ink-faint); letter-spacing: 0.06em; text-transform: uppercase; }
 .watch .chg { font-family: var(--mono); font-size: 11px; text-align: right; }
-.watch .spark { grid-column: 1 / -1; height: 16px; margin-top: 3px; }
+.watch .spark { grid-column: 1 / -1; height: 16px; margin-top: 4px; }
 
 /* ── main ───────────────────────────────────────────────────────────── */
 
 main { overflow: hidden; display: flex; flex-direction: column; }
 
-.view { flex: 1; overflow-y: auto; padding: 14px; }
+.view { flex: 1; overflow-y: auto; padding: 16px; }
 .view.pad0 { padding: 0; }
 
 /* Panels. Hairline-ruled boxes with an uppercase mono caption. */
@@ -333,14 +333,29 @@ main { overflow: hidden; display: flex; flex-direction: column; }
  * flicker. The keyframe stays for the toast, which really is created once. */
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
 
-.panel > h2 {
+/* Every panel heading, at whatever depth.
+ *
+ * This was `.panel > h2`, and the direct-child combinator quietly excluded the
+ * two collapsible panels, whose heading sits inside a <summary> for the
+ * disclosure triangle to work. Those headings matched no rule at all and fell
+ * through to the user-agent stylesheet, so "Order Book" and "Contract
+ * Specification" rendered at 19.5px -- 1.5em of a 13px root, the browser
+ * default -- beside eight sibling headings at 10px. Section headings that are
+ * either half the size of the body text or double it, on the same screen, is
+ * most of why the page read as unfinished.
+ *
+ * A descendant selector is the right shape here: a heading inside a panel is a
+ * panel heading regardless of what wraps it for behaviour. */
+.panel h2 {
   font-family: var(--mono);
-  font-size: 10px;
+  /* One step above the 10px micro tier. These label every region of the
+   * screen, and a label a reader has to lean in for is not doing its job. */
+  font-size: var(--t-xs);
   font-weight: 600;
   letter-spacing: 0.17em;
   text-transform: uppercase;
   color: var(--ink-faint);
-  padding: 8px 11px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--rule);
   display: flex;
   align-items: center;
@@ -348,7 +363,14 @@ main { overflow: hidden; display: flex; flex-direction: column; }
   gap: 10px;
   flex: none;
 }
-.panel > h2 em { font-style: normal; color: var(--amber); }
+/* Counts live in these headings -- working orders, positions, tape length --
+ * and they change while a person is looking at them. Without tabular figures
+ * the heading reflows sideways every time a count crosses a digit width. */
+.panel h2 em {
+  font-style: normal;
+  color: var(--amber);
+  font-variant-numeric: tabular-nums;
+}
 .panel-body { overflow: auto; flex: 1; min-height: 0; }
 
 /* ── tables ─────────────────────────────────────────────────────────── */
@@ -373,12 +395,12 @@ th:first-child, td:first-child { text-align: left; }
 td {
   font-family: var(--mono);
   font-size: 12px;
-  padding: 5px 10px;
+  padding: 6px 10px;
   text-align: right;
   border-bottom: 1px solid rgba(35, 35, 43, 0.55);
 }
 tbody tr:hover { background: var(--raised); }
-.empty { padding: 18px 11px; color: var(--ink-faint); font-size: 12px; font-family: var(--mono); }
+.empty { padding: 16px 12px; color: var(--ink-faint); font-size: 12px; font-family: var(--mono); }
 
 /* ── markets grid ───────────────────────────────────────────────────── */
 
@@ -417,13 +439,20 @@ tbody tr:hover { background: var(--raised); }
   font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
   color: var(--ink-faint); font-family: var(--mono);
 }
-.card .price { font-family: var(--mono); font-size: 25px; font-weight: 400; letter-spacing: -0.035em; margin: 7px 0 1px; }
+.card .price { font-family: var(--mono); font-size: 25px; font-weight: 400; letter-spacing: -0.035em; margin: 8px 0 1px; }
 .card .sub { display: flex; gap: 12px; font-family: var(--mono); font-size: 11px; color: var(--ink-dim); }
-.card .spark { height: 34px; margin-top: 9px; }
+.card .spark { height: 34px; margin-top: 10px; }
 
 /* ── ladder, the signature element ─────────────────────────────────── */
 
 .ladder { font-family: var(--mono); font-size: 12px; }
+/* The same `min-width: auto` blowout as the ticket's paired rows, in the one
+ * element people actually look at. A `1fr 78px 1fr` row will not let either
+ * flexible column shrink below its own content, so a wide quantity pushed the
+ * row 12px past the panel and hung the depth figures off the edge. Two
+ * instances of this now, which makes it the pattern rather than the accident:
+ * a grid child that holds text needs `min-width: 0` or `1fr` is a suggestion. */
+.lad-row > * { min-width: 0; }
 .lad-row {
   width: 100%;
   font: inherit;
@@ -443,7 +472,7 @@ tbody tr:hover { background: var(--raised); }
   cursor: pointer;
 }
 .lad-row:hover { background: var(--hover); }
-.lad-row .bidq, .lad-row .askq { padding: 0 9px; position: relative; z-index: 1; }
+.lad-row .bidq, .lad-row .askq { padding: 0 10px; position: relative; z-index: 1; }
 .lad-row .bidq { text-align: right; color: var(--up); }
 .lad-row .askq { text-align: left; color: var(--down); }
 .lad-row .px {
@@ -458,12 +487,33 @@ tbody tr:hover { background: var(--raised); }
 }
 /* Depth bars grow inward from each edge. Proportional, so the shape of the
    book is legible at a glance rather than requiring the numbers to be read. */
+/* Depth bars, scaled rather than widthed.
+ *
+ * They were sized with an inline `width: N%`, and a percentage on an
+ * absolutely positioned element resolves against the whole containing block --
+ * the entire row -- while each bar only owns the half beyond the 78px price
+ * column. So the scale was wrong everywhere and overflowed past 50%: measured,
+ * a 46% ask bar rendered 307px into 295px of room and pushed the row 12px past
+ * the panel. A bar at full depth would have overrun by 373px.
+ *
+ * Each bar now spans its own half and is scaled from the centre outward, so
+ * the fraction means what it says. Transform is also the property that belongs
+ * in a transition -- it composites, where animating width relayouts the row on
+ * every tick, twenty times a second, for every level in the book. */
 .lad-row .bar {
   position: absolute; top: 1px; bottom: 1px;
-  transition: width var(--tick);
+  width: calc(50% - 39px);
+  transition: transform var(--tick);
+  will-change: transform;
 }
-.lad-row .bar.bid { right: 50%; margin-right: 39px; background: var(--up-sunk); }
-.lad-row .bar.ask { left: 50%; margin-left: 39px; background: var(--down-sunk); }
+.lad-row .bar.bid {
+  right: 50%; margin-right: 39px; background: var(--up-sunk);
+  transform-origin: right center;
+}
+.lad-row .bar.ask {
+  left: 50%; margin-left: 39px; background: var(--down-sunk);
+  transform-origin: left center;
+}
 .lad-row.at-mark .px { color: var(--amber); font-weight: 600; }
 .lad-row.at-mark { background: var(--amber-sunk); }
 
@@ -475,7 +525,7 @@ tbody tr:hover { background: var(--raised); }
 
 /* ── ticket ─────────────────────────────────────────────────────────── */
 
-.ticket { padding: 11px; display: flex; flex-direction: column; gap: 9px; }
+.ticket { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
 .sides { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .sides button {
   padding: 8px;
@@ -495,7 +545,7 @@ tbody tr:hover { background: var(--raised); }
   background: var(--down-sunk); border-color: var(--down); color: var(--down);
 }
 
-.field { display: flex; flex-direction: column; gap: 3px; }
+.field { display: flex; flex-direction: column; gap: 4px; }
 .field label {
   font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em;
   text-transform: uppercase; color: var(--ink-faint);
@@ -503,14 +553,33 @@ tbody tr:hover { background: var(--raised); }
 .field input, .field select {
   background: var(--sunk);
   border: 1px solid var(--control-edge);
-  padding: 7px 9px;
+  padding: 8px 10px;
   font-family: var(--mono);
   font-size: 12px;
   outline: none;
   transition: border-color var(--tick);
 }
 .field input:focus, .field select:focus { border-color: var(--amber); }
+/* `min-width: 0` is load-bearing, not defensive.
+ *
+ * A grid child's default `min-width: auto` refuses to shrink below its own
+ * min-content width, so a `1fr 1fr` row silently stops being two equal columns
+ * the moment either one holds a label that will not wrap small enough. Measured
+ * in the ticket: the row wanted 348px inside a 304px panel and pushed 44px past
+ * its container, which is the whole width of the stop field hanging off the
+ * edge. Every equal-column row in this ticket has the same exposure. */
 .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.row2 > * { min-width: 0; }
+/* "optional" rather than an em-dashed aside. The label read "Stop trigger --
+ * blank for none", which is a sentence where a tag would do, and it was the
+ * text that would not wrap small enough to keep the row two columns wide. */
+.opt {
+  font-size: var(--t-micro);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-left: 4px;
+}
 
 .send {
   padding: 10px;
@@ -547,7 +616,7 @@ tbody tr:hover { background: var(--raised); }
   grid-template-columns: 258px 1fr 268px;
   grid-template-rows: auto 1fr 176px;
   gap: 12px;
-  padding: 14px;
+  padding: 16px;
   height: 100%;
   min-height: 0;
 }
@@ -558,11 +627,11 @@ tbody tr:hover { background: var(--raised); }
 .instrument-bar {
   display: flex;
   align-items: center;
-  gap: 26px;
+  gap: 24px;
   background: var(--panel);
   border: 1px solid var(--rule);
   border-left: 3px solid var(--up);
-  padding: 10px 14px;
+  padding: 10px 16px;
 }
 .instrument-bar[data-session='auction'] { border-left-color: var(--halt); }
 .instrument-bar[data-session='pre_open'] { border-left-color: var(--amber); }
@@ -577,7 +646,7 @@ tbody tr:hover { background: var(--raised); }
   font-size: 10px;
   letter-spacing: 0.15em;
   text-transform: uppercase;
-  padding: 3px 7px;
+  padding: 4px 8px;
   border: 1px solid currentColor;
   color: var(--up);
 }
@@ -591,7 +660,7 @@ tbody tr:hover { background: var(--raised); }
 .verdict-ok { color: var(--up); }
 .verdict-no { color: var(--halt); }
 
-.controls { padding: 12px; display: flex; flex-direction: column; gap: 11px; }
+.controls { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
 .check { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--ink-dim); }
 .check input { accent-color: var(--amber); width: 14px; height: 14px; }
 
@@ -614,7 +683,7 @@ tbody tr:hover { background: var(--raised); }
   background: var(--raised);
   border: 1px solid var(--rule-bright);
   border-left: 2px solid var(--amber);
-  padding: 9px 13px;
+  padding: 10px 12px;
   font-family: var(--mono);
   font-size: 12px;
   animation: rise 0.2s ease-out;
@@ -650,15 +719,15 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 
 /* ── header live regions ────────────────────────────────────────────── */
 
-.stats { display: flex; gap: 22px; }
+.stats { display: flex; gap: 24px; }
 .health { margin: 0; }
 
 
 /* ── ticket preview and quick sizes ─────────────────────────────────── */
 
-.quick { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+.quick { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
 .quick button {
-  padding: 5px 0;
+  padding: 6px 0;
   min-height: 24px;
   font-family: var(--mono);
   font-size: 11px;
@@ -735,8 +804,8 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 
 .card {
   display: grid;
-  gap: 9px;
-  padding: 14px;
+  gap: 10px;
+  padding: 16px;
   min-height: 176px;
   grid-template-rows: auto auto auto 1fr auto;
 }
@@ -751,7 +820,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   color: var(--ink);
   text-wrap: balance;
 }
-.card-figure { display: flex; align-items: baseline; gap: 9px; }
+.card-figure { display: flex; align-items: baseline; gap: 10px; }
 .card-figure .price { font-size: 28px; letter-spacing: -0.035em; }
 .card-figure .chg { font-size: 12px; }
 .card-foot {
@@ -772,26 +841,26 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .market {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 330px;
-  gap: 14px;
-  padding: 14px;
+  gap: 16px;
+  padding: 16px;
   align-items: start;
 }
-.market-main { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
-.market-side { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 14px; }
+.market-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.market-side { display: flex; flex-direction: column; gap: 16px; position: sticky; top: 14px; }
 
 .contract {
   background: var(--panel);
   border: 1px solid var(--rule);
   border-left: 3px solid var(--up);
-  padding: 16px 18px;
+  padding: 16px 16px;
 }
 .contract[data-session='auction'] { border-left-color: var(--halt); }
 .contract[data-session='pre_open'] { border-left-color: var(--amber); }
 .contract[data-session='closed'] { border-left-color: var(--closed); }
 .contract-id { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .contract-id .sym { font-size: 12px; font-weight: 600; letter-spacing: -0.02em; }
-.contract h1.question { font-size: 21px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 14px; }
-.contract-figures { display: flex; flex-wrap: wrap; gap: 26px; }
+.contract h1.question { font-size: 21px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 16px; }
+.contract-figures { display: flex; flex-wrap: wrap; gap: 24px; }
 .stat.big b { font-size: 25px; letter-spacing: -0.035em; }
 
 /* Resolution rules sit here, above the price history and above the book,
@@ -800,17 +869,20 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   background: var(--sunk);
   border: 1px solid var(--rule);
   border-left: 2px solid var(--amber);
-  padding: 14px 18px;
+  padding: 16px 16px;
 }
 .resolution h2 {
   font-family: var(--mono);
-  font-size: 10px;
+  /* Same tier as every other section heading. It carries the contract terms,
+   * which is the one thing a stranger has to read before they can trade at
+   * all, so it has no business being the smallest heading on the screen. */
+  font-size: var(--t-xs);
   letter-spacing: 0.17em;
   text-transform: uppercase;
   color: var(--amber);
-  margin-bottom: 9px;
+  margin-bottom: 10px;
 }
-.resolution p { font-size: 13px; line-height: 1.5; margin-bottom: 11px; text-wrap: pretty; }
+.resolution p { font-size: 13px; line-height: 1.5; margin-bottom: 12px; text-wrap: pretty; }
 .resolution ul { list-style: none; display: flex; flex-direction: column; gap: 6px; }
 .resolution li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; font-size: 12px; }
 .resolution li > span {
@@ -833,7 +905,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .drop > summary {
   list-style: none;
   cursor: pointer;
-  padding: 9px 11px;
+  padding: 10px 12px;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -854,7 +926,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .drop > summary h2 { border: none; padding: 0; }
 .hint { font-size: 11px; color: var(--ink-faint); }
 
-.advanced { border-top: 1px solid var(--rule); padding-top: 9px; }
+.advanced { border-top: 1px solid var(--rule); padding-top: 10px; }
 .advanced > summary {
   list-style: none;
   cursor: pointer;
@@ -863,13 +935,13 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   letter-spacing: 0.13em;
   text-transform: uppercase;
   color: var(--ink-faint);
-  padding: 3px 0;
+  padding: 4px 0;
 }
 .advanced > summary::-webkit-details-marker { display: none; }
 .advanced > summary::before { content: '+ '; color: var(--amber); }
 .advanced[open] > summary::before { content: '\2212 '; }
 .advanced > summary:hover { color: var(--amber); }
-.advanced > * + * { margin-top: 9px; }
+.advanced > * + * { margin-top: 10px; }
 
 /* ── ticket ─────────────────────────────────────────────────────────── */
 
@@ -883,7 +955,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   opacity: 0.7;
 }
 
-.pos { display: flex; flex-direction: column; gap: 7px; padding: 11px; }
+.pos { display: flex; flex-direction: column; gap: 8px; padding: 12px; }
 .pos > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .pos span {
   font-family: var(--mono);
@@ -902,7 +974,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   gap: 12px;
   margin-bottom: 12px;
 }
-.figure { padding: 14px; gap: 5px; }
+.figure { padding: 16px; gap: 6px; }
 .figure span {
   font-family: var(--mono);
   font-size: 10px;
@@ -921,7 +993,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 /* ── nav grouping ───────────────────────────────────────────────────── */
 
 .nav-group {
-  padding: 10px 16px 5px;
+  padding: 10px 16px 6px;
   font-family: var(--mono);
   font-size: 10px;
   letter-spacing: 0.16em;
@@ -947,7 +1019,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   color: var(--ink);
   font-family: var(--mono);
   font-size: 12px;
-  padding: 7px 9px;
+  padding: 8px 10px;
   outline: none;
   transition: border-color 130ms cubic-bezier(0.2, 0, 0, 1);
 }
@@ -969,7 +1041,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 
 /* ── asset classes ──────────────────────────────────────────────────── */
 
-.class-block + .class-block { margin-top: 22px; }
+.class-block + .class-block { margin-top: 24px; }
 .class-head {
   display: flex;
   align-items: baseline;
@@ -989,7 +1061,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   font-size: 11px;
   color: var(--amber);
   border: 1px solid var(--control-edge);
-  padding: 1px 7px;
+  padding: 1px 8px;
 }
 
 
@@ -1003,8 +1075,8 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
     grid-template-columns: 1fr;
     grid-template-rows: auto auto 1fr;
   }
-  header { flex-wrap: wrap; height: auto; padding: 8px 12px; gap: 14px; }
-  header .stats { gap: 14px; order: 3; width: 100%; }
+  header { flex-wrap: wrap; height: auto; padding: 8px 12px; gap: 16px; }
+  header .stats { gap: 16px; order: 3; width: 100%; }
   .speed { order: 2; }
 
   nav { border-right: none; border-bottom: 1px solid var(--rule); }
@@ -1020,7 +1092,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
     white-space: nowrap;
     border-left: none;
     border-bottom: 2px solid transparent;
-    padding: 10px 14px;
+    padding: 10px 16px;
   }
   .nav-links button[aria-current='page'] {
     border-left-color: transparent;
@@ -1030,7 +1102,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
     border-top: none;
     border-left: 1px solid var(--rule);
     margin: 0;
-    padding: 10px 12px 10px 14px;
+    padding: 10px 12px 10px 16px;
     align-self: center;
   }
   /* The watchlist duplicates the Markets screen; on a narrow viewport that is
@@ -1082,7 +1154,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
   background: none;
   border: 1px solid var(--rule);
   border-radius: 4px;
-  padding: 5px 10px;
+  padding: 6px 10px;
   min-height: 26px;
   color: var(--ink-dim);
   font-family: var(--mono);
@@ -1104,7 +1176,7 @@ table, td, th, .stat b, .card .price, .ladder { font-variant-numeric: tabular-nu
 .halted {
   display: inline-block;
   margin: 6px 0 0;
-  padding: 3px 9px;
+  padding: 4px 10px;
   border: 1px solid var(--amber);
   border-radius: 3px;
   color: var(--amber);

@@ -175,3 +175,65 @@ def test_the_figures_outrank_their_labels():
     # a figure that is sized by hand drifts away from its caption again.
     assert size_of(".stat b {") == "var(--t-lg)"
     assert size_of(".watch .px {") == "var(--t-lg)"
+
+
+def test_spacing_lands_on_a_grid():
+    """Padding, gap and margin came in seventeen distinct values.
+
+    1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 24, 56 for padding, and
+    twelve more for gap. The odd numbers are the tell: 7, 9, 11 and 13 are
+    nudges made one at a time, and a reader registers the absence of rhythm
+    without being able to name it. Snapped onto 2/4/6/8/10/12/16/24, which
+    leaves the two deliberate one-off indents alone.
+    """
+    text = CSS.read_text(encoding="utf-8")
+    allowed = {1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 39, 56, 156}
+    seen: dict[int, str] = {}
+    for match in re.finditer(r"\b(padding|gap|margin)(-[a-z]+)?\s*:([^;}]*)", text):
+        for value in re.findall(r"(\d+)px", match.group(3)):
+            seen.setdefault(int(value), match.group(0)[:48])
+
+    stray = {v: seen[v] for v in sorted(set(seen) - allowed)}
+    assert not stray, f"spacing off the grid: {stray}"
+
+
+def test_the_depth_bars_are_scaled_and_not_widthed():
+    """A percentage width on an absolutely positioned bar measures the wrong box.
+
+    The ladder's depth bars sit either side of a 78px price column, so each owns
+    `50% - 39px` of the row. They were sized with an inline `width: N%`, which
+    resolves against the whole containing block instead, so every bar was drawn
+    against a reference nearly twice its own space. Measured: a 46% ask bar
+    rendered 307px into 295px and pushed the row 12px past its panel; at full
+    depth it would have overrun by 373px.
+
+    Scaling also puts the animation on the one property that composites.
+    Transitioning `width` relayouts the row on every tick, twenty times a
+    second, for every level in the book.
+    """
+    css = CSS.read_text(encoding="utf-8")
+    bar = css.split(".lad-row .bar {", 1)[1].split("}", 1)[0]
+    assert "width: calc(50% - 39px)" in bar, "the bar no longer spans its own half"
+    assert "transition: transform" in bar, "a width transition relayouts the ladder"
+
+    views = CSS.parent.parent / "js" / "views.js"
+    emitted = views.read_text(encoding="utf-8")
+    assert "class=\"bar bid\" style=\"transform:scaleX(" in emitted
+    assert "class=\"bar ask\" style=\"transform:scaleX(" in emitted
+
+
+def test_flexible_grid_columns_can_actually_shrink():
+    """`1fr` is a suggestion until the child is told it may shrink.
+
+    A grid child defaults to `min-width: auto`, which refuses to go below its
+    own min-content width, so a `1fr 1fr` row stops being two equal columns the
+    moment either holds text that will not wrap small enough. Measured in the
+    ticket: 348px of content in a 304px panel, 44px hanging off the edge.
+    """
+    css = CSS.read_text(encoding="utf-8")
+    for selector in (".row2 > *", ".lad-row > *"):
+        block = css.split(selector, 1)
+        assert len(block) > 1, f"{selector} has gone"
+        assert "min-width: 0" in block[1].split("}", 1)[0], (
+            f"{selector} can be pushed past its container again"
+        )
