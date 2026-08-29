@@ -53,6 +53,30 @@ const CLASS_GROUPS = [
 const GROUP_ORDER = ['Prediction Markets', 'Futures', 'Shares', 'Commodities',
                      'Options', 'Volatility', 'Spreads', 'Indices', 'Other'];
 
+/**
+ * The subject a contract is written on, which is what a person thinks they are
+ * trading. Not the same thing as the underlying: `SPIKE_WR_W1` and
+ * `SPIKE_WR_W4` are different underlyings, because the observation windows
+ * differ, but they are the same subject and belong on one row.
+ */
+export function subjectsOf(node) {
+  if (!node) return [];
+  if (node.kind === 'single') return node.ref?.subject ? [node.ref.subject] : [];
+  if (node.kind === 'difference') {
+    return [...subjectsOf(node.left), ...subjectsOf(node.right)];
+  }
+  if (node.kind === 'basket') {
+    return (node.legs || []).flatMap((l) => subjectsOf(l.leg));
+  }
+  return [];
+}
+
+export function subjectOf(book) {
+  const found = [...new Set(subjectsOf(book?.contract?.underlying))];
+  if (!found.length) return 'Other';
+  return found.length === 1 ? found[0] : found.join(' + ');
+}
+
 export function groupOf(assetClass) {
   return CLASS_GROUPS.find(([key]) => key === assetClass)?.[1] ?? 'Other';
 }
@@ -83,62 +107,137 @@ export function markets(store) {
     </div></div>`;
   }
 
-  const card = (symbol) => {
-      const book = books[symbol];
-      const meta = instruments.find((x) => x.symbol === symbol) || {};
-      const series = (history[symbol] || []).slice(-90);
-      const first = series.find((v) => v != null);
-      const last = series.length ? series[series.length - 1] : null;
-      const change = first != null && last != null ? last - first : 0;
-      const session = snapshot.sessions?.[symbol] ?? 'continuous';
-      const odds = impliedProbability(book.mark, book.contract?.payoff);
-      const headline = odds != null ? percent(odds, 0) : price(book.mark);
-
-      return `<button type="button" class="card" data-symbol="${esc(symbol)}"
-                   data-region="card:${esc(symbol)}"
-                   data-session="${esc(session)}"
-                   aria-label="${esc(symbol)}, ${headline}, ${move(change, first).text}">
-        <span class="card-top">
-          <span class="sym">${esc(symbol)}</span>
-          ${session !== 'continuous'
-            ? `<span class="badge ${esc(session)}">${esc(session.replace('_', ' '))}</span>`
-            : `<span class="kind">${esc(book.class ?? '')}</span>`}
-        </span>
-
-        <span class="question">${question(book.contract)}</span>
-
-        <span class="card-figure">
-          <span class="price mono ${cls(change)}">${headline}</span>
-          <span class="chg mono ${cls(change)}">${move(change, first).text}</span>
-        </span>
-
-        <span class="spark" aria-hidden="true">${sparkline(series)}</span>
-
-        <span class="card-foot">
-          <span>${count(book.trades)} trades</span>
-          <span>${expiry(book.contract, meta)}</span>
-        </span>
-      </button>`;
+  const stats = (symbol) => {
+    const book = books[symbol];
+    const series = (history[symbol] || []).slice(-90);
+    const first = series.find((v) => v != null);
+    const last = series.length ? series[series.length - 1] : null;
+    const change = first != null && last != null ? last - first : 0;
+    const odds = impliedProbability(book.mark, book.contract?.payoff);
+    return {
+      book, series, first, change,
+      headline: odds != null ? percent(odds, 0) : price(book.mark),
+      session: snapshot.sessions?.[symbol] ?? 'continuous',
+    };
   };
 
-  const buckets = new Map();
+  /* One instrument, one line. Identity left, every number right on a shared
+   * grid, so scanning a list is a glance down two fixed columns rather than a
+   * re-read of each item. */
+  const row = (symbol) => {
+    const { book, series, first, change, headline, session } = stats(symbol);
+    const current = symbol === store.symbol;
+    return `<button type="button" class="mrow" data-symbol="${esc(symbol)}"
+                 data-session="${esc(session)}" ${current ? 'aria-current="true"' : ''}
+                 aria-label="${esc(symbol)}, ${headline}, ${move(change, first).text}">
+      <span class="m-caret" aria-hidden="true"></span>
+      <span class="m-id">
+        <b class="m-sym">${esc(symbol)}</b>
+        <span class="question">${question(book.contract)}</span>
+      </span>
+      <span class="m-kind">${session !== 'continuous'
+        ? `<b class="badge ${esc(session)}">${esc(session.replace('_', ' '))}</b>`
+        : esc(book.class ?? '')}</span>
+      <span class="m-px mono ${cls(change)}">${headline}</span>
+      <span class="m-chg mono ${cls(change)}">${move(change, first).text}</span>
+      <span class="m-vol mono">${count(book.trades)}</span>
+      <span class="m-spark" aria-hidden="true">${sparkline(series, { width: 64, height: 16 })}</span>
+    </button>`;
+  };
+
+  /* Grouped by SUBJECT, not by asset class.
+   *
+   * Every listing venue that carries a lot of markets does this, and the
+   * numbers are why: Kalshi's browse page shows 60 entries covering 574
+   * tradeable markets, and Polymarket 40 entries covering 1,625. Both list the
+   * *event* and put the instrument count on the row. This screen listed one
+   * card per instrument, a 1:1 ratio, which is why 28 markets felt heavier
+   * than Kalshi's hundreds -- Kalshi at 1:1 would render 574 cards.
+   *
+   * Grouping these 28 by subject gives 5 rows. The ratio holds as contracts
+   * are added, because new strikes and expiries land inside a subject that is
+   * already listed rather than adding a row of their own.
+   *
+   * Asset class was the old grouping and is now a field on the row. A future,
+   * a call, a put and a weekly on one Brawler are one thing to a person, and
+   * splitting them across four sections is what made 28 look like a wall. */
+  /* Asset class as a filter rather than a heading.
+   *
+   * It was the grouping, which scattered one Brawler's future, calls, puts and
+   * weeklies across four separate sections -- so a person looking for "SPIKE"
+   * had to visit four places, and 28 instruments read as more than 28. As a
+   * chip it stays visible, stays countable, and narrows the list instead of
+   * fragmenting it. */
+  const classCounts = new Map();
   for (const symbol of symbols) {
     const title = groupOf(books[symbol].class);
-    (buckets.get(title) ?? buckets.set(title, []).get(title)).push(symbol);
+    classCounts.set(title, (classCounts.get(title) ?? 0) + 1);
+  }
+  const active = store.classFilter && classCounts.has(store.classFilter)
+    ? store.classFilter
+    : null;
+  const chips = `<div class="chips" role="group" aria-label="Filter by asset class">
+    <button type="button" class="chip${active ? '' : ' on'}" data-class="">
+      All <b class="mono">${symbols.length}</b>
+    </button>
+    ${GROUP_ORDER.filter((title) => classCounts.has(title)).map((title) => `
+      <button type="button" class="chip${active === title ? ' on' : ''}"
+              data-class="${esc(title)}" aria-pressed="${active === title}">
+        ${esc(title)} <b class="mono">${classCounts.get(title)}</b>
+      </button>`).join('')}
+  </div>`;
+
+  const shown = active
+    ? symbols.filter((s) => groupOf(books[s].class) === active)
+    : symbols;
+
+  const groups = new Map();
+  for (const symbol of shown) {
+    const key = subjectOf(books[symbol]);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(symbol);
   }
 
-  const sections = GROUP_ORDER.filter((t) => buckets.has(t))
-    .map((title) => `<section class="class-block">
-      <div class="class-head">
-        <h2>${esc(title)}</h2>
-        <span>${esc(groupBlurb(title))}</span>
-        <b class="mono">${buckets.get(title).length}</b>
-      </div>
-      <div class="grid">${buckets.get(title).map(card).join('')}</div>
-    </section>`)
-    .join('');
+  const ordered = [...groups.entries()].sort(
+    (a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]),
+  );
 
-  return `<div class="view">${sections}</div>`;
+  const sections = ordered.map(([subject, syms]) => {
+    // The group speaks with its most representative instrument: the outright
+    // future where there is one, since that is the subject's own price rather
+    // than a claim about part of it.
+    const lead = syms.find((s) => books[s].class === 'future') ?? syms[0];
+    const { series, first, change, headline } = stats(lead);
+    // A search narrows to what matched, so opening everything is what the
+    // person asked for. Otherwise only the group they are trading is open.
+    const open = store.query || active
+      ? true
+      : (store.expanded?.has(subject) ?? false) || syms.includes(store.symbol);
+
+    return `<section class="subject" data-region="subject:${esc(subject)}">
+      <button type="button" class="subject-head" data-subject="${esc(subject)}"
+              aria-expanded="${open}">
+        <span class="s-caret" aria-hidden="true">${open ? '▾' : '▸'}</span>
+        <span class="s-name">${esc(subject)}</span>
+        <span class="s-px mono ${cls(change)}">${headline}</span>
+        <span class="s-chg mono ${cls(change)}">${move(change, first).text}</span>
+        <span class="s-spark" aria-hidden="true">${sparkline(series, { width: 64, height: 16 })}</span>
+        <span class="s-count mono">${syms.length} market${syms.length === 1 ? '' : 's'}</span>
+      </button>
+      ${open ? `<div class="subject-body">${syms.map(row).join('')}</div>` : ''}
+    </section>`;
+  }).join('');
+
+  return `<div class="view markets-list">
+    ${chips}
+    <div class="list-head">
+      <span aria-hidden="true"></span>
+      <span class="lh-sym">Market</span><span class="lh-kind">Class</span>
+      <span class="lh-px">Price</span><span class="lh-chg">Change</span>
+      <span class="lh-vol">Trades</span><span class="lh-spark"></span>
+    </div>
+    ${sections}
+  </div>`;
 }
 
 /**

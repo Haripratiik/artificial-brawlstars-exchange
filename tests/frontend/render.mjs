@@ -104,9 +104,27 @@ check('trade renders a ladder', trade.includes('lad-row'), 'no ladder rows');
 check('trade renders a chart', trade.includes('<svg'), 'no chart svg');
 check('trade offers post-only', trade.includes('post_only'));
 
+/* Nothing may be unreachable.
+ *
+ * The list opens collapsed -- one row per subject with its instrument count --
+ * so most instruments are deliberately not in the default markup. That is the
+ * whole point of the collapse, and it is also exactly how a market could go
+ * missing without anyone noticing. So the reachability check is done with
+ * every group open, which is the state a search or a class filter produces.
+ */
 const markets = views.markets(store);
+const everySubject = new Set(
+  Object.values(fixture.snapshot.books).map((b) => views.subjectOf(b)),
+);
+for (const subject of everySubject) {
+  check(`the list offers ${subject}`, markets.includes(subject));
+}
+check('the list collapses', everySubject.size < Object.keys(fixture.snapshot.books).length,
+      `${everySubject.size} subjects for ${Object.keys(fixture.snapshot.books).length} instruments`);
+
+const expandedAll = views.markets({ ...store, expanded: everySubject });
 for (const symbol of Object.keys(fixture.snapshot.books)) {
-  check(`markets lists ${symbol}`, markets.includes(symbol));
+  check(`expanding reaches ${symbol}`, expandedAll.includes(symbol));
 }
 
 const blotter = views.portfolio(store);
@@ -213,14 +231,18 @@ for (const [symbol, book] of Object.entries(fixture.snapshot.books)) {
         'the card does not say what it is written on');
 }
 
-// Asset classes have to be visible as classes, not as a flat wall of tiles.
-check('markets are grouped by class', marketsHtml.includes('class-head'));
+// Asset class still has to be visible and countable. It is a filter now rather
+// than a heading: grouping by it scattered one Brawler's future, calls, puts
+// and weeklies across four sections, so finding "SPIKE" meant visiting four
+// places. As a chip it narrows the list instead of fragmenting it.
+check('asset classes are offered as filters', marketsHtml.includes('class="chips"'));
 check('prediction markets are named', marketsHtml.includes('Prediction Markets'));
 check('options are named', marketsHtml.includes('Options'));
 check('the venue vocabulary is translated', views.groupOf('event') === 'Prediction Markets');
 check('an unknown class still groups', views.groupOf('zzz') === 'Other');
 check('shares are named', marketsHtml.includes('Shares'));
 check('commodities are named', marketsHtml.includes('Commodities'));
+check('every chip carries its count', /class="chip[^"]*"[^>]*>[^<]*<b class="mono">\d+/.test(marketsHtml));
 
 /* A share and a commodity each say something a future does not, and each has a
  * way of silently reading as a future instead. The share's terminal payoff is
@@ -245,7 +267,11 @@ for (const [symbol, book] of Object.entries(fixture.snapshot.books)) {
 // Region keys are what stop the screen being rebuilt under the reader.
 const tradeRegions = (views.trade(store).match(/data-region="/g) || []).length;
 check('the trade screen is divided into regions', tradeRegions >= 8, `${tradeRegions}`);
-check('cards are their own regions', /data-region="card:/.test(marketsHtml));
+// Regions are per SUBJECT now, not per instrument: the markets screen groups
+// by the thing being traded and puts the instrument count on the row, the way
+// every venue that carries a lot of markets does. Kalshi's browse page shows
+// 60 entries across 574 tradeable markets; this screen used to be 1:1.
+check('subjects are their own regions', /data-region="subject:/.test(marketsHtml));
 
 /* ── search and counterparties ────────────────────────────────────────── */
 
@@ -321,12 +347,22 @@ check('time in force is behind Advanced', !beforeAdvanced.includes('t-tif'),
       'the ticket opens on time-in-force');
 check('limit price is behind Advanced', !beforeAdvanced.includes('t-px'));
 
-// Cards are for browsing, not for specifications.
+// The browse list is for browsing, not for specifications.
 const cardHtml = views.markets(store);
-check('cards ask the question', /class="question"/.test(cardHtml));
-check('cards carry no spec digest', !cardHtml.includes('digest'));
-check('cards carry no tick size', !/tick size/i.test(cardHtml));
-check('cards show time remaining', /left|settles/.test(cardHtml));
+// A row showing only `SPIKE_GT47` is the mystery-meat identifier NN/g warns
+// about: readable only by someone who already knows the ticker. The plain
+// question rides alongside it.
+check('rows ask the question', /class="question"/.test(cardHtml));
+check('rows carry no spec digest', !cardHtml.includes('digest'));
+check('rows carry no tick size', !/tick size/i.test(cardHtml));
+// Expiry left the browse row deliberately -- it is a specification, and the
+// contract header on the trade screen carries it where it is actually needed.
+check('the trade screen still shows time remaining', /left|settles/.test(views.trade(store)));
+// The collapse itself, asserted: fewer groups than instruments.
+const subjectCount = (cardHtml.match(/data-region="subject:/g) || []).length;
+const rowCount = (cardHtml.match(/class="mrow"/g) || []).length;
+check('the list collapses instruments into subjects',
+      subjectCount > 0 && subjectCount < 12, `${subjectCount} subjects, ${rowCount} rows shown`);
 
 /* ── accessibility, as assertions ─────────────────────────────────────────
  *
@@ -345,7 +381,8 @@ const everyView = ['markets', 'trade', 'portfolio', 'research', 'lab']
 check('no clickable divs remain',
       !/<div[^>]*\bdata-(symbol|price)=/.test(everyView),
       'a div is carrying a click target');
-check('cards are buttons', /<button[^>]*class="card"/.test(everyView));
+check('market rows are buttons', /<button[^>]*class="mrow"/.test(everyView));
+check('subject headers are buttons', /<button[^>]*class="subject-head"/.test(everyView));
 check('ladder rows are buttons', /<button[^>]*class="lad-row/.test(everyView));
 
 // Every button must be announceable: visible text or an explicit label.

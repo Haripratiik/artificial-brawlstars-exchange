@@ -98,7 +98,12 @@ export function move(change, base) {
   const c = Number(change);
   if (!Number.isFinite(c)) return { text: '-', value: 0 };
   const b = Number(base);
-  const pct = Number.isFinite(b) && b !== 0 ? (c / b) * 100 : null;
+  // Strictly positive. A negative base inverts the sign of the ratio, so a
+  // spread falling from -5 to -10 reported **+100%** -- the right magnitude
+  // with exactly the wrong direction, on a contract whose price is allowed to
+  // be negative by construction. Measured on `SPIKE_CROW`: -116.91% on a price
+  // of -10.13.
+  const pct = Number.isFinite(b) && b > 0 ? (c / b) * 100 : null;
   if (pct === null || Math.abs(pct) >= 1000) {
     return { text: `${signed(c)} pts`, value: c };
   }

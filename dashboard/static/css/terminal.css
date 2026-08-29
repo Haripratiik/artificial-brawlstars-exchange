@@ -73,7 +73,12 @@
   --mono: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
   --display: 'Chivo', system-ui, sans-serif;
 
-  --rail: 232px;
+  /* 264px, not 232px. The rail carries a ticker, a price and a change on one
+   * line, and `SPIKE_WR_FUT` needs about 86px of that at the mono size. At 232
+   * the price column -- sized `auto`, so set by the widest number in the list
+   * -- took the difference and the tickers truncated to `ASSASSIN...`. A
+   * navigation list whose names are cut off is not navigation. */
+  --rail: 264px;
   --tick: 0.12s cubic-bezier(0.3, 0, 0.2, 1);
 }
 
@@ -279,6 +284,24 @@ nav {
 }
 
 .watchlist { overflow-y: auto; flex: 1; }
+/* One line, three fields.
+ *
+ * This was three lines and roughly 100px: symbol and price, then class and
+ * change, then a full-width sparkline. That is 2,800px of scroll for 28
+ * markets and it could only ever show about seven of them at once, in a
+ * element whose whole job is navigation.
+ *
+ * Robinhood's web list rows carry exactly three fields -- name, price, percent
+ * change -- and no sparkline, no volume, no bid/ask, no absolute change. The
+ * discipline is the point: three fields on one alignment grid can be scanned a
+ * hundred at a time, because the eye tracks two fixed columns instead of
+ * re-reading each entry.
+ *
+ * The class label goes because the markets screen carries it as a filter chip
+ * and a column, and the sparkline goes because at this width it cannot be the
+ * word-sized mark Tufte describes -- it was a chart, and it cost 60px of row
+ * to say what the change column already said. At 32px the rail shows about
+ * twenty markets instead of seven. */
 .watch {
   width: 100%;
   text-align: left;
@@ -286,9 +309,14 @@ nav {
   color: inherit;
   background: none;
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 2px 8px;
-  padding: 8px 16px;
+  /* Fixed number columns so the ticker keeps its width whatever the prices
+   * happen to be: a rate at 0.39 and a future at 4,725.13 must not resize the
+   * name beside them. */
+  grid-template-columns: minmax(0, 1fr) 72px 56px;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 12px;
   border-left: 2px solid transparent;
   border-bottom: 1px solid var(--rule);
   cursor: pointer;
@@ -296,7 +324,15 @@ nav {
 }
 .watch:hover { background: var(--panel); }
 .watch[aria-current='true'] { background: var(--amber-sunk); border-left-color: var(--amber); }
-.watch .sym { font-family: var(--mono); font-size: var(--t-sm); font-weight: 600; letter-spacing: -0.02em; }
+.watch .sym {
+  font-family: var(--mono);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* The price led the row at 11.5px against a 9px category tag: the number a
  * person scans the list for was within half a pixel of the label describing
  * it. It now leads by a clear step over every other field on the row. */
@@ -308,9 +344,191 @@ nav {
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
-.watch .cls { font-size: 10px; color: var(--ink-faint); letter-spacing: 0.06em; text-transform: uppercase; }
-.watch .chg { font-family: var(--mono); font-size: 11px; text-align: right; }
-.watch .spark { grid-column: 1 / -1; height: 16px; margin-top: 4px; }
+.watch .chg {
+  font-family: var(--mono);
+  font-size: var(--t-xs);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── the markets list ───────────────────────────────────────────────── */
+
+/* One shared grid for the header, the subject rows and the instrument rows, so
+ * every number in the screen sits in the same vertical column. That alignment
+ * is the whole reason a list beats a card grid here: eye-tracking work on
+ * cards finds people look back and forth repeatedly when comparing, because
+ * each card places its figures slightly differently. A list is one glance
+ * down two fixed columns.
+ *
+ * 36px rows. Material's high-density guidance puts a data row at 32px and its
+ * default at 40px; 36 sits between them and still clears WCAG 2.2 SC 2.5.8,
+ * because the whole row is the target rather than a small control inside it. */
+.markets-list { display: flex; flex-direction: column; gap: 2px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 0 10px; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: none;
+  color: var(--ink-dim);
+  font-size: var(--t-xs);
+  cursor: pointer;
+  white-space: nowrap;
+  transition-property: color, border-color, background-color;
+  transition-duration: 130ms;
+}
+.chip:hover { color: var(--ink); border-color: var(--control-edge); }
+.chip b { color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+.chip.on {
+  color: var(--void);
+  background: var(--amber);
+  border-color: var(--amber);
+  font-weight: 600;
+}
+.chip.on b { color: var(--void); opacity: 0.7; }
+
+@media (max-width: 860px) {
+  .chips { overflow-x: auto; flex-wrap: nowrap; scrollbar-width: none; }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip { min-height: 44px; }
+}
+
+/* Seven cells, seven tracks: caret, identity, class, price, change, trades,
+ * sparkline. The first version forced the identity cell to `grid-column: 2`
+ * while emitting six cells, which pushed every later one a track right and
+ * wrapped the sparkline onto a line of its own under the row. */
+.list-head, .mrow, .subject-head {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) 88px 104px 88px 64px 72px;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  text-align: left;
+}
+.list-head > *, .mrow > *, .subject-head > * { min-width: 0; }
+
+.list-head {
+  height: 28px;
+  font-family: var(--mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  border-bottom: 1px solid var(--rule);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--void);
+}
+.list-head .lh-px, .list-head .lh-chg, .list-head .lh-vol { text-align: right; }
+
+.subject-head {
+  height: 40px;
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: background var(--tick);
+}
+.subject-head:hover { background: var(--raised); }
+.s-caret { color: var(--ink-faint); font-size: var(--t-micro); margin-right: -6px; }
+.s-name {
+  font-family: var(--mono);
+  font-size: var(--t-base);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.s-px, .s-chg, .m-px, .m-chg, .m-vol {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.s-px { font-size: var(--t-base); font-weight: 600; }
+.s-chg { font-size: var(--t-sm); }
+.s-spark, .m-spark { display: block; height: 16px; }
+.s-count {
+  text-align: right;
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+.subject-body { display: flex; flex-direction: column; }
+
+.mrow {
+  height: 36px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--rule);
+  border-left: 2px solid transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  transition: background var(--tick);
+}
+.mrow:hover { background: var(--panel); }
+.mrow[aria-current='true'] { background: var(--amber-sunk); border-left-color: var(--amber); }
+/* Ticker then plain language, on one line.
+ *
+ * A row that shows only `SPIKE_GT47` is the "mystery meat identifier" NN/g
+ * warns about in data tables: it can only be read by someone who already knows
+ * the ticker, which defeats browsing. The question is what a stranger reads,
+ * so it rides alongside and truncates rather than wrapping. */
+.m-id {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.m-sym {
+  font-family: var(--mono);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+.m-id .question {
+  font-size: var(--t-xs);
+  color: var(--ink-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.m-kind {
+  font-size: var(--t-micro);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+.m-px { font-size: var(--t-sm); font-weight: 600; }
+.m-chg, .m-vol { font-size: var(--t-xs); }
+.m-vol { color: var(--ink-faint); }
+
+@media (max-width: 860px) {
+  /* Trades and the sparkline are the first two fields to go: they are the
+   * least load-bearing on the row and the first to crowd it. */
+  .list-head, .mrow, .subject-head { grid-template-columns: 14px minmax(0, 1fr) 92px 76px; }
+  .m-vol, .lh-vol, .m-spark, .s-spark, .lh-spark, .m-kind, .lh-kind { display: none; }
+  .mrow { height: 44px; }
+  /* The subject header is the primary control on this screen -- it is what
+   * opens a market group -- and 40px is under the 44px a finger needs. */
+  .subject-head { height: 44px; }
+  .s-count { display: none; }
+}
 
 /* ── main ───────────────────────────────────────────────────────────── */
 

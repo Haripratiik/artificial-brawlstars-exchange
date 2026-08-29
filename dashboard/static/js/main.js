@@ -35,6 +35,12 @@ const store = {
   reveal: false,
   // Last mark seen per symbol, so a change can be shown as a change.
   marks: {},
+  // Subjects whose instrument list is open on the markets screen. Held here
+  // rather than read off the DOM because the renderer replaces whole regions,
+  // and an <details>-style open flag would be lost on the next price tick.
+  expanded: new Set(),
+  // Which asset class the markets list is narrowed to, or null for all.
+  classFilter: null,
 };
 
 const VIEWS = { markets, trade, portfolio, research, lab };
@@ -387,9 +393,7 @@ function renderWatchlist() {
                    aria-label="${symbol}, ${price(book.mark)}, ${signed(pct)} percent">
         <span class="sym">${symbol}</span>
         <span class="px ${cls(change)}">${price(book.mark)}</span>
-        <span class="cls">${book.class ?? ''}</span>
         <span class="chg ${cls(change)}">${move(change, first).text}</span>
-        <span class="spark" aria-hidden="true">${sparklineFor(series)}</span>
       </button>`;
     })
     .join('') || `<p class="empty">No market matches that.</p>`;
@@ -430,6 +434,22 @@ function bind() {
   main.querySelectorAll('[data-symbol]').forEach((node) => {
     if (node.dataset.act) return;              // control buttons carry a symbol too
     node.addEventListener('click', () => select(node.dataset.symbol));
+  });
+
+  main.querySelectorAll('[data-class]').forEach((node) => {
+    node.addEventListener('click', () => {
+      store.classFilter = node.dataset.class || null;
+      render({ force: true });
+    });
+  });
+
+  main.querySelectorAll('[data-subject]').forEach((node) => {
+    node.addEventListener('click', () => {
+      const key = node.dataset.subject;
+      if (store.expanded.has(key)) store.expanded.delete(key);
+      else store.expanded.add(key);
+      render({ force: true });
+    });
   });
 
   main.querySelectorAll('.lad-row').forEach((row) => {
