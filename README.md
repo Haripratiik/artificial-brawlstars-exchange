@@ -1,7 +1,7 @@
 # Artificial Brawl Stars Exchange
 
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=flat&logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-1054%20passing-2ea44f?style=flat)
+![Tests](https://img.shields.io/badge/tests-1092%20passing-2ea44f?style=flat)
 ![Asset classes](https://img.shields.io/badge/asset%20classes-9-0A0A0A?style=flat)
 ![API](https://img.shields.io/badge/API-REST%20%2B%20WebSocket-0ea5e9?style=flat)
 ![Collateral](https://img.shields.io/badge/collateral-exact%2C%20not%20modelled-8b5cf6?style=flat)
@@ -12,7 +12,7 @@
 It was built to answer one question with evidence rather than opinion: **does a market aggregate dispersed information better than the agents trading inside it?** Answering that needs an instrument precise enough to trust, so the exchange is complete and runs end to end. A deterministic discrete-event kernel with per-agent latency. A price-time book carrying the order types real venues actually list. Opening and closing auctions, circuit breakers and a participant kill switch. A clearing house that nets portfolios exactly. Live settlement against measured game statistics. A population of heterogeneous trading agents. A research harness that runs paired ablations from a manifest. And a browser front end that anyone can log into and trade on.
 
 ```
-24,000 lines of exchange, agents and research     1,054 tests, all passing
+24,000 lines of exchange, agents and research     1,092 tests, all passing
 14,000 lines of tests                             47 listed instruments
 9 asset classes on one matching engine            conservation: integer zero
 bit-identical replay from a seed                  collateral: exact, not modelled
@@ -29,7 +29,7 @@ bit-identical replay from a seed                  collateral: exact, not modelle
 - **The market ties the simple mean of its agents and loses to precision weighting.** 200 paired trials scored against a *known* true probability, which no field study can do. Squared error to truth: market **0.03108**, simple mean 0.02957 (p = 0.59, indistinguishable), precision-weighted 0.01436 (**market 2.2x worse**, p < 0.0001), best agent chosen with hindsight 0.00272. See [Findings](#findings).
 - **The mechanism is not the order book.** The natural reading of Experiment 1 is that a limit order book aggregates by capital because it needs a counterparty for every trade. Experiment 2 built an LMSR venue, which always quotes and needs no counterparty, and it lands in the same place, p = 0.97. The binding constraint is the agents' balance sheets, not the matching rule.
 - **Concentrating information makes the price worse.** Holding total evidence fixed at 10,319 battles and moving all of it into a single trader raises market error **2.7x**, because one agent has one balance sheet. Dispersed information reaches the price better than concentrated information, which is the opposite of the usual intuition about an informed monopolist.
-- **A real API, not a demo endpoint.** 17 REST routes plus a streaming socket, covering market data, accounts, positions, fills and the whole order lifecycle across every asset class through one code path. Requests are **signed, not labelled**: HMAC-SHA256 covers the timestamp, method, path and body together, so a captured signature cannot be moved onto a different order. An API order is enqueued onto the same agent, crosses the same latency link and meets the same collateral check as one clicked in the browser, because a privileged lane for machines would make the simulation a lie. See [docs/API.md](docs/API.md).
+- **A real API, not a demo endpoint.** 19 REST routes plus a streaming socket, covering market data, candles, accounts, positions, fills and the whole order lifecycle across every asset class through one code path. The stream resumes after a disconnect and replays what you missed rather than restarting its sequence, so an algorithm that drops a connection does not have to throw its state away. Requests are **signed, not labelled**: HMAC-SHA256 covers the timestamp, method, path and body together, so a captured signature cannot be moved onto a different order. An API order is enqueued onto the same agent, crosses the same latency link and meets the same collateral check as one clicked in the browser, because a privileged lane for machines would make the simulation a lie. See [docs/API.md](docs/API.md).
 - **Nine asset classes on one matching engine.** Futures, binaries, calls, puts, calendar spreads, an index, commodities, equities and a volatility contract. 47 listed instruments sharing one collateral rule, because they all reduce to a bounded payoff function.
 
 ---
@@ -136,21 +136,6 @@ python experiments/information_aggregation/run.py --quick
 ```
 
 ---
-
-## Design commitments
-
-These are the rules the code was held to, and holding them is most of why the measurements mean anything.
-
-- **No hardcoding.** Nothing here nudges a price, a spread or a distribution toward what a real market would show. Every observed regularity has to fall out of the mechanism or not appear at all. A market tuned to look real has stopped being evidence about anything.
-- **Collateral is exact or it is not collateral.** No VaR, no correlation estimates, no margin models. Positions on different underlyings do not net, because netting them would require a correlation, and a correlation is an estimate. That is not a limitation to be fixed later, it is the line between arithmetic and modelling.
-- **Determinism is a test.** The same seed and the same manifest give a bit-identical result digest.
-- **Hypotheses are pre-committed.** The comparison is written into the plan before the run, so the reported result is the specified one.
-
-## What is deliberately absent
-
-- **Margin and leverage.** Each replaces an exact subtraction with an estimate of what a position is worth before it settles. That trade is available and has not been taken.
-- **Multiple venues and order routing.** One venue, so that price formation is the only thing being measured.
-- **Sophisticated market-making and buy-side firms.** Last on the list on purpose. Venue correctness first and participants second, because a clever agent on a broken exchange measures the exchange.
 
 ## Documentation
 

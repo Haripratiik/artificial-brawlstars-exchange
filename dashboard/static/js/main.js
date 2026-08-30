@@ -148,8 +148,68 @@ function announceRejections(payload) {
 
 /* ── slow data ───────────────────────────────────────────────────────── */
 
+/**
+ * The operator token, remembered per browser.
+ *
+ * Five routes on this server reach past the caller and change the market for
+ * everyone in it -- rebuild, halt, uncross, kill, revive -- and they are now
+ * gated. `POST /api/config` discards every account and working order for every
+ * connected user, and `kill` takes an arbitrary agent id, so before the gate
+ * one visitor could end another's session.
+ *
+ * Held in sessionStorage rather than localStorage: an operator token should
+ * not outlive the tab it was pasted into. Wrapped in try/catch because a
+ * browser with site data blocked throws on access rather than returning null,
+ * and the Lab should degrade to asking again rather than failing to render.
+ */
+const OPERATOR_HEADER = 'arena-operator-token';
+
+function operatorToken() {
+  try {
+    return sessionStorage.getItem('operator-token') || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+export function setOperatorToken(value) {
+  try {
+    if (value) sessionStorage.setItem('operator-token', value);
+    else sessionStorage.removeItem('operator-token');
+  } catch (_) { /* storage unavailable; the token lives for this render only */ }
+}
+
 async function json(url, options) {
   const response = await fetch(url, options);
+  if (!response.ok) throw new Error(`${response.status} ${url}`);
+  return response.json();
+}
+
+/**
+ * A call to one of the operator routes, carrying the token.
+ *
+ * They answer 404 rather than 401 without it, deliberately: a 401 confirms the
+ * route exists and invites guessing. That means a missing token and a wrong
+ * one are indistinguishable from here, so the message says what to do rather
+ * than guessing which it was.
+ */
+async function operatorJson(url, options = {}) {
+  const token = operatorToken();
+  if (!token) {
+    const entered = window.prompt(
+      'Operator token. These controls change the market for everyone. '
+      + 'The server prints a token at startup; set ARENA_OPERATOR_TOKEN to '
+      + 'choose your own.',
+    );
+    if (!entered) throw new Error('operator token required');
+    setOperatorToken(entered.trim());
+  }
+  const headers = { ...(options.headers || {}), [OPERATOR_HEADER]: operatorToken() };
+  const response = await fetch(url, { ...options, headers });
+  if (response.status === 404) {
+    setOperatorToken('');
+    throw new Error('operator token rejected, or no such control');
+  }
   if (!response.ok) throw new Error(`${response.status} ${url}`);
   return response.json();
 }
@@ -666,7 +726,7 @@ async function act(action, data) {
   // operator can act on.
   if (action === 'kill' || action === 'revive') {
     try {
-      const result = await json(`/api/participant/${encodeURIComponent(data.agent)}/${action}`,
+      const result = await operatorJson(`/api/participant/${encodeURIComponent(data.agent)}/${action}`,
                                 { method: 'POST' });
       toast(action === 'kill'
         ? `Stopped ${result.agent_id}, pulled ${(result.symbols ?? []).length} book(s)`
@@ -688,7 +748,7 @@ async function act(action, data) {
 
   if (action === 'halt' || action === 'uncross') {
     try {
-      const result = await json(
+      const result = await operatorJson(
         `/api/session/${encodeURIComponent(data.symbol)}/${action}`, { method: 'POST' });
       toast(result.ok ? `${data.symbol} ${result.session}` : result.error, !result.ok);
       refreshSlow();
@@ -739,7 +799,7 @@ async function rebuild() {
     speed: store.snapshot?.speed ?? 1,
   };
   try {
-    const result = await json('/api/config', {
+    const result = await operatorJson('/api/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

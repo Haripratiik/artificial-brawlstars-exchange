@@ -814,6 +814,8 @@ Client to server, one JSON object per message, with an `op`:
 | `subscribe` | start receiving one or more channels |
 | `unsubscribe` | stop receiving them |
 | `auth` | prove which account this connection is, for the private channels |
+| `get_snapshot` | a fresh full frame for a state channel, without changing your subscription |
+| `resume` | reconnect to a session and replay the frames you missed |
 | `ping` | keep the connection alive and confirm it is live |
 
 ```json
@@ -832,8 +834,46 @@ Server to client, every frame carries three fields:
 whole point of publishing it: a client can tell "nothing happened" apart from "I
 missed something". A gap means the connection dropped frames, and the correct
 response is to resynchronise from the REST snapshot rather than to keep applying
-deltas to a book that is already wrong. Reconnecting starts the sequence again,
-because it is a property of the connection.
+deltas to a book that is already wrong.
+
+**A gap is now repairable rather than merely detectable.** Detecting a gap and
+having no way to close it leaves a client with one option, which is to throw
+its state away and start again. Two commands fix that:
+
+* `get_snapshot` returns a fresh full frame for a state channel **without
+  touching your subscription**, so a client that spots a gap can repair the one
+  book it lost rather than resubscribing to everything.
+* `resume` reconnects to a *session* rather than a connection. The `hello`
+  frame carries a `session` id, and a reconnecting client sends that id with
+  the sequence number it expects next. This is Nasdaq SoupBinTCP's contract:
+  "the client can then re-log into the server indicating the current session
+  and its next expected sequence number... guaranteed to always receive every
+  sequenced message in order, despite TCP/IP connection failures."
+
+A resume replays the retained frames **with their original `seq`** and then
+continues that numbering, and it restores every cursor -- tape positions,
+conflation state, the blotter mark -- not merely the subscription list. That
+distinction is the trap: restoring subscriptions but reopening the tape cursor
+at *now* would drop every print from the disconnected window **silently**,
+because the sequence would run gapless straight across the hole.
+
+Past the retained bound the answer is `resume_failed` carrying
+`resnapshot: true`, never a partial replay and never a silent restart. A silent
+restart is the dangerous case, because the client believes it is caught up.
+
+### Bounds, published on `hello`
+
+| Bound | Default | Why |
+| --- | --- | --- |
+| Frames retained per session | 2,000 | CME MDP 3.0 caps a TCP replay request at 2,000 packets |
+| Seconds a session outlives its socket | 120 | Long enough for a TCP reconnect, a DNS stall or a process restart |
+| Disconnected sessions retained | 64 | Without it, a reconnect loop leaks one session per attempt |
+
+These are on the `hello` frame rather than in this document alone, because the
+duration those 2,000 frames buy you depends entirely on what you subscribed to:
+a handful of contracts is about a minute, and `ticker.*` across every listing
+burns it in seconds. A client should read the bound it was given rather than
+assume one.
 
 ### Channels
 
@@ -843,8 +883,15 @@ because it is a property of the connection.
 | `ticker.*` | public | the same for every listed symbol |
 | `book.<symbol>` | public | ladder updates for one symbol |
 | `trades.<symbol>` | public | the public tape for one symbol |
+| `lifecycle.<symbol>` | public | listings, session changes, halts and settlement |
+| `lifecycle.*` | public | the same for every listed symbol |
 | `orders` | signed | this account's order lifecycle: acks, rejects, cancels |
 | `fills` | signed | this account's executions |
+
+`lifecycle` is what lets an algorithm run unattended. Without it a bot has to
+poll to notice that a contract was listed, halted, reopened or settled. The
+shape follows Kalshi's `market_lifecycle_v2`, which carries the open and close
+timestamps on a listing for the same reason.
 
 `orders` and `fills` are the private counterparts of `trades`: the tape says a
 trade happened, and only the two participants learn that it was theirs.

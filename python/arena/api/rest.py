@@ -12,8 +12,18 @@ The shape follows Kalshi and Alpaca, because a client author should not have to
 learn a third convention: ``/v1`` prefixed paths, plural collections, HMAC-signed
 requests, machine codes on every refusal.
 
-Five decisions are worth stating up front, because each of them was arrived at
+Six decisions are worth stating up front, because each of them was arrived at
 by something going wrong rather than by preference.
+
+**Market data is candles, and a candle has three OHLC blocks.**
+``GET /v1/instruments/{symbol}/candles`` publishes open/high/low/close for the
+trade price, for the bid and for the ask separately, which is Kalshi's
+``price``/``yes_bid``/``yes_ask`` shape. On a thin book -- and this venue is
+thin by construction -- the last print is a fact about whenever somebody last
+crossed the spread, while the quotes are facts about the period; only the quote
+candles let a backtester reconstruct what was actually transactable. The
+sampled mid path at ``/history`` remains, and remains a chart's input rather
+than a program's.
 
 **A key is bound to a seat, never to an account id.** ``runner.reconfigure``
 discards the whole market and every account in it, and ``LiveMarket.trader``
@@ -59,7 +69,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any, Callable
 
 from fastapi import APIRouter, Request, Response
@@ -126,6 +136,16 @@ FILLS_CAP = 200
 # Price history. The runner keeps a bounded ring buffer per symbol; the real
 # cap is read off that buffer at request time so the two can never disagree.
 HISTORY_DEFAULT = 600
+
+# Candles. Only the page size lives here: the retained depth, the period enum
+# and the span they buy are all the runner's, read off its rings at request
+# time for the same reason the history cap is -- a number restated in two files
+# is a number that will disagree with itself.
+#
+# 240 as the default because it is a screen's worth and a warm-up's worth at
+# once: 240 one-second bars is four minutes, which is longer than the entire
+# 180-second window this API could answer for before candles existed.
+CANDLES_DEFAULT = 240
 
 # Credentials per seat. Unlike the other lists this one has no natural bound --
 # a session can mint keys until it gets bored -- so it needs a stated one like
@@ -310,6 +330,29 @@ def signed_path(path: str, query: str = "") -> str:
 # --------------------------------------------------------------------------
 
 
+# One refusal this router needs that the catalogue did not have: a duplicate
+# client order id, which is a conflict with a resource that already exists
+# rather than a request that could not be read.
+#
+# Registered into ``ERRORS`` rather than raised as a locally minted
+# ``ApiError``, and the distinction matters. ``_runner`` above argues the case
+# out loud for the opposite decision -- it uses a wrong-shaped code rather than
+# put one on the wire that ``errors.py`` does not list, because "a catalogue a
+# client cannot look a code up in is the exact drift the catalogue exists to
+# prevent". A code raised from here and never registered would be exactly that
+# drift. So it is added to the one catalogue, once, with its status beside it,
+# which keeps the property the catalogue is for: one code, one status,
+# everywhere, discoverable by a client from one table.
+#
+# ``setdefault`` because this module is imported by tests more than once and a
+# re-registration must not be able to change a status that a client has already
+# branched on.
+ERRORS.setdefault(
+    "duplicate_client_order_id",
+    ("this client_order_id has already been used by this seat", 409),
+)
+
+
 def _refuse(code: str, message: str = "", **detail: Any) -> ApiError:
     """One refusal, built from the catalogue so a code and its status agree.
 
@@ -443,6 +486,60 @@ def _limit(raw: Any, default: int, cap: int, field_name: str) -> int:
     if value < 1:
         raise _refuse("invalid_request", f"{field_name} must be at least 1")
     return min(value, cap)
+
+
+def _stamp(raw: Any, default: int, field_name: str) -> int:
+    """One point on the *simulated* clock, in nanoseconds.
+
+    The same clock ``GET /v1/exchange`` publishes as ``clock`` and
+    ``GET /v1/instruments/{symbol}/history`` publishes in ``t``, which is the
+    kernel's elapsed simulated nanoseconds and is deliberately not a wall clock.
+    A market here runs at a speed the operator sets -- up to fifty times real
+    time -- so an hour of this exchange is not an hour of anybody's afternoon,
+    and stamping its data with a wall clock would make every candle's width a
+    function of how fast the server happened to be turning.
+
+    Negative is refused rather than clamped. Simulated time starts at zero, so a
+    negative timestamp is a client that has computed one, and answering it with
+    zero would hide the arithmetic that produced it.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise _refuse(
+            "invalid_request",
+            f"{field_name} must be a whole number of simulated nanoseconds, "
+            f"not {raw!r}",
+        ) from None
+    if value < 0:
+        raise _refuse(
+            "invalid_request",
+            f"{field_name} must not be negative: this clock starts at zero",
+        )
+    return value
+
+
+def _cursor(raw: Any, field_name: str) -> int | None:
+    """One monotonic cursor value, or None when the caller sent none.
+
+    Zero is a legitimate cursor -- "everything from the beginning" -- and is
+    therefore distinguished from absent rather than folded into it. A client
+    reconnecting with a cursor it has never advanced sends 0, and reading that
+    as "no cursor" would hand it the newest page instead of the oldest.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise _refuse(
+            "invalid_request", f"{field_name} must be a whole number, not {raw!r}"
+        ) from None
+    if value < 0:
+        raise _refuse("invalid_request", f"{field_name} must not be negative")
+    return value
 
 
 def _whole(raw: Any, field_name: str, code: str) -> int:
@@ -801,6 +898,59 @@ def _client_id_for(token: str, symbol: str, order_id: int) -> str | None:
     return None
 
 
+def _client_order_row(caller: "_Caller", record: _ClientOrder) -> dict[str, Any]:
+    """What became of one order, addressed by the only id the client chose.
+
+    Three states, and they are the three questions a client that has lost track
+    of a POST actually has.
+
+    ``pending`` -- this API accepted it and no acknowledgement has come back
+    yet. Either it is still crossing the latency link, or the venue refused it
+    on the far side; those are distinguishable, and the refusal is in
+    ``GET /v1/account/fills`` under ``rejections``. No timeout is applied here
+    for the reason ``working_orders`` gives: how long a round trip takes is a
+    property of this seat's link and of how fast the market is being run, and a
+    guessed timeout that fires early reports a failure that has not happened.
+
+    ``working`` -- it rested, and ``order`` carries the live row.
+
+    ``done`` -- the exchange assigned it an id and it is no longer in the book:
+    filled outright, filled through, or cancelled. A market order is typically
+    this from the first moment a client can ask.
+    """
+    listing = _venue().registry.get(record.symbol)
+    status = "pending"
+    order_row: dict[str, Any] | None = None
+    if record.order_id is not None:
+        status = "done"
+        who = _market().trader(caller.account)
+        if (record.symbol, record.order_id) in who.live_orders:
+            order = _venue().engine(record.symbol).book.get(record.order_id)
+            if order is not None:
+                status = "working"
+                order_row = _order_row(record.symbol, order)
+    return {
+        "client_order_id": record.client_order_id,
+        "account_id": str(caller.account),
+        "symbol": record.symbol,
+        "side": record.side,
+        "quantity": record.quantity,
+        # The price as sent, in contract units, with the engine's own integer
+        # beside it under a name that says which is which -- the same pairing
+        # ``_order_row`` publishes and for the same reason.
+        "price": (
+            None
+            if record.ticks is None or listing is None
+            else str(listing.from_ticks(record.ticks))
+        ),
+        "ticks": record.ticks,
+        "submitted_at": record.submitted_at,
+        "status": status,
+        "order_id": record.order_id,
+        "order": order_row,
+    }
+
+
 def _acknowledged(caller: "_Caller") -> list[dict[str, Any]]:
     """Every order the exchange has acknowledged to this account, from its blotter.
 
@@ -914,6 +1064,75 @@ def _instrument_row(symbol: str) -> dict[str, Any]:
         "contract_id": instrument.spec.contract_id,
         "spec_digest": instrument.spec.spec_digest,
         **_touch(instrument, engine.book),
+    }
+
+
+def _candle_row(instrument: Any, candle: Any) -> dict[str, Any]:
+    """One closed period, as three OHLC blocks and the volume behind them.
+
+    The three blocks are the design, and they are copied from Kalshi rather than
+    invented: their candlestick carries ``price``, ``yes_bid`` and ``yes_ask``
+    as separate open/high/low/close structures, and the reason generalises past
+    binary contracts. On a thin book the last trade is close to meaningless --
+    it is a fact about whenever somebody last crossed the spread, which on nine
+    of this venue's forty-seven contracts was more than a simulated second ago
+    -- while the bid and the ask are facts about the period itself. A backtester
+    that wants to know what it could actually have transacted at reads the quote
+    candles; the trade candle only tells it what somebody else did.
+
+    ``mean`` is Kalshi's fifth price field and is the volume-weighted average.
+    It is the one figure on this payload that is not exact, because it is a
+    quotient of two integers and a quotient of two integers is not always a
+    decimal -- 100 lots at 3 and 200 at 4 average to 11/3. So ``notional``
+    travels beside it, exact and integral, and a client that needs the exactness
+    divides it itself and keeps the remainder. Everything else here is an
+    integer or an exact decimal string, and none of it is a float.
+    """
+    tick = instrument.tick_size
+
+    def price(ticks: int | None) -> str | None:
+        return None if ticks is None else str(instrument.from_ticks(ticks))
+
+    notional = Decimal(candle.notional) * tick
+    if candle.volume > 0:
+        # An explicit context, so the digits do not depend on what anything else
+        # in this process has done to the global one. Twenty-eight significant
+        # digits is Decimal's own default and far past any price this venue
+        # lists; the point of pinning it is reproducibility, not range.
+        with localcontext() as context:
+            context.prec = 28
+            mean = str(notional / Decimal(candle.volume))
+    else:
+        # No print in the period, so the mean of nothing is the last thing that
+        # traded -- the same value the open, high, low and close all carry.
+        # Consistent with the block rather than null, so a client averaging
+        # across bars does not have to special-case the quiet ones.
+        mean = price(candle.price_close)
+    return {
+        "end": int(candle.end),
+        "volume": int(candle.volume),
+        "trades": int(candle.trades),
+        "notional": str(notional),
+        "open_interest": int(candle.open_interest),
+        "price": {
+            "open": price(candle.price_open),
+            "high": price(candle.price_high),
+            "low": price(candle.price_low),
+            "close": price(candle.price_close),
+            "mean": mean,
+        },
+        "bid": {
+            "open": price(candle.bid_open),
+            "high": price(candle.bid_high),
+            "low": price(candle.bid_low),
+            "close": price(candle.bid_close),
+        },
+        "ask": {
+            "open": price(candle.ask_open),
+            "high": price(candle.ask_high),
+            "low": price(candle.ask_low),
+            "close": price(candle.ask_close),
+        },
     }
 
 
@@ -1314,6 +1533,149 @@ async def history(symbol: str, limit: str | None = None) -> dict[str, Any]:
     }
 
 
+def _candle_ring(symbol: str, raw_period: str) -> tuple[Any, list[int]]:
+    """The ring for one symbol at one period, or a refusal naming the enum.
+
+    The enum is read off the runner rather than declared here. This module is
+    mounted by an application it must not import, and the periods are that
+    application's -- so the values a client is refused against are the values
+    that are actually being aggregated, and there is no second copy to go stale
+    the way the sampling comment in ``dashboard/state.py`` did.
+    """
+    series = _runner().history.get(symbol)
+    periods = list(getattr(series, "periods", ()) or ())
+    if series is None or not periods:
+        raise _refuse("not_found", f"no candles recorded for {symbol}")
+    if not raw_period:
+        raise _refuse(
+            "invalid_request",
+            "name the candle period, as ?period=<seconds>",
+            supported=periods,
+            unit="seconds",
+        )
+    try:
+        period = int(raw_period)
+    except (TypeError, ValueError):
+        period = 0
+    ring = series.ring(period) if period else None
+    if ring is None:
+        # A closed enum, refused rather than rounded to the nearest kept
+        # period. Kalshi does the same and it is the right way round: a series
+        # of bars that are not the width the client asked for is wrong in a way
+        # nothing downstream can detect, because every bar still looks like a
+        # bar.
+        raise _refuse(
+            "invalid_request",
+            f"{raw_period!r} is not a candle period this venue keeps",
+            supported=periods,
+            unit="seconds",
+        )
+    return ring, periods
+
+
+@router.get("/instruments/{symbol}/candles")
+async def candles(request: Request, symbol: str) -> dict[str, Any]:
+    """Closed candles: trade price, bid and ask, gap-free, in the venue's clock.
+
+    ``?period=&start=&end=&limit=``. ``period`` is required and is a closed
+    enum in seconds of simulated time; ``start`` and ``end`` are simulated
+    nanoseconds, the same clock ``/v1/exchange`` publishes as ``clock``.
+
+    Four decisions, each one measured against a venue that already ships it.
+
+    **Three OHLC blocks, not one.** ``price``, ``bid`` and ``ask``, which is
+    Kalshi's ``price``/``yes_bid``/``yes_ask`` shape. See :func:`_candle_row`
+    for why it is the important one: this book is thin by construction and the
+    last print alone cannot tell a client what was quotable.
+
+    **Empty periods are emitted, not skipped.** A period nobody traded in comes
+    back with zero volume and the previous close in all five price fields, and
+    with its *real* bid and ask candles, because the sampler still saw the book
+    ten times a second through it. Kalshi does this and the reason is
+    mechanical: a gap-free series joins to a clock by arithmetic, and a sparse
+    one has to be reindexed by every client that reads it.
+
+    **The in-progress period is not published.** A partial bar has a high that
+    is not the period's high and a close that is not a close. Nothing here
+    reports it, so a bar that arrives is final.
+
+    **An over-wide range is refused, not truncated.** This is the one worth
+    arguing. Coinbase caps a candle request at 300 and refuses beyond it;
+    Binance caps at 1,000 and silently hands back the first 1,000; Kalshi
+    refuses with ``requested time range with candlesticks: 129600, max
+    candlesticks: 5000``. Refusing is the honest one. A backtester that asked
+    for a day and received an hour, with no field in the response saying which
+    hour it lost, will compute a statistic over a window it does not have and
+    will not find out. So a range wider than the ring retains is refused, and
+    the refusal names both numbers.
+
+    ``limit`` is *not* that check and is clamped like every other list here,
+    because a limit is a page size rather than a claim about coverage -- the
+    response says which one it applied, and ``start``/``end`` come back
+    unchanged so a client can see exactly what it asked for.
+    """
+    listing = _instrument(symbol)
+    params = request.query_params
+    ring, periods = _candle_ring(symbol, (params.get("period") or "").strip())
+
+    now = int(_market().kernel.now)
+    end_ns = _stamp(params.get("end"), now, "end")
+    page = _limit(params.get("limit"), min(CANDLES_DEFAULT, ring.depth), ring.depth, "limit")
+
+    raw_start = params.get("start")
+    if raw_start is None or raw_start == "":
+        # No start given: one page back from the end, so the default request is
+        # exactly the page the client asked for and never a refusal.
+        start_ns = max(0, end_ns - page * ring.period_ns)
+    else:
+        start_ns = _stamp(raw_start, 0, "start")
+        if start_ns > end_ns:
+            raise _refuse(
+                "invalid_request",
+                f"start {start_ns} is after end {end_ns}",
+                start=start_ns,
+                end=end_ns,
+            )
+        # Ceiling, so a range covering exactly the retained depth is allowed and
+        # one nanosecond past it is not.
+        wanted = max(1, -(-(end_ns - start_ns) // ring.period_ns))
+        if wanted > ring.depth:
+            raise _refuse(
+                "invalid_request",
+                f"that range asks for {wanted} candlesticks of {ring.period}s and "
+                f"this venue retains {ring.depth} per period -- narrow the range "
+                f"or ask for a longer period",
+                requested=wanted,
+                cap=ring.depth,
+                period=ring.period,
+                retains_ns=ring.retains_ns,
+            )
+
+    rows = ring.window(start_ns, end_ns, page)
+    held = ring.span()
+    return {
+        "symbol": symbol,
+        "period": ring.period,
+        "period_ns": ring.period_ns,
+        # The whole enum, in the body, so a client learns the closed set from a
+        # successful call rather than from a refusal or from documentation.
+        "periods": periods,
+        "start": start_ns,
+        "end": end_ns,
+        "clock": now,
+        "candles": [_candle_row(listing, candle) for candle in rows],
+        "count": len(rows),
+        "total": len(ring),
+        "limit": page,
+        "cap": ring.depth,
+        # What exists at this period at all, so a client can tell "your window
+        # is empty" from "your window is older than anything kept".
+        "retains_ns": ring.retains_ns,
+        "oldest": None if held is None else held[0],
+        "newest": None if held is None else held[1],
+    }
+
+
 # --------------------------------------------------------------------------
 # Authenticated: the account
 # --------------------------------------------------------------------------
@@ -1365,6 +1727,41 @@ async def positions(request: Request, limit: str | None = None) -> dict[str, Any
     return payload
 
 
+def _numbered(entries: list[dict[str, Any]], total: int, key: str) -> dict[str, Any]:
+    """Stamp a blotter's events with a monotonic id, and say what is missing.
+
+    The id is not invented here and is not an index into anything. ``HumanAgent``
+    appends exactly one log entry per private event and
+    ``TradingAgent._on_private`` increments exactly one counter for the same
+    event, in that order -- so the agent's own ``fills`` counter *is* the
+    sequence number of its last fill, and the k entries the log still holds are
+    the last k of them. Counting backwards from the counter gives every retained
+    event a number that is stable, gap-free, and monotonic across symbols.
+
+    Across symbols is the requirement, and it is why the engine's own
+    ``sequence`` cannot be used: sequence numbers are minted per matching engine
+    and there is one engine per book, so id 41 exists on every contract at once
+    and ordering two fills in different symbols by it is meaningless.
+
+    The counter also makes eviction visible, which is the part that matters
+    after a disconnect. ``HumanAgent.log`` keeps the last 200 private events of
+    every kind, so an account that generated three hundred between two polls has
+    genuinely lost the earliest ones -- and a cursor that renumbered from
+    whatever survived would hand a reconnecting client a contiguous-looking
+    series with a hole in it. ``first_id`` against the client's own cursor is
+    how it finds out instead.
+    """
+    first = total - len(entries) + 1
+    for offset, entry in enumerate(entries):
+        entry[key] = first + offset
+    return {
+        "total": total,
+        "retained": len(entries),
+        "first_id": first if entries else None,
+        "last_id": total if entries else None,
+    }
+
+
 @router.get("/account/fills")
 async def fills(request: Request, limit: str | None = None) -> dict[str, Any]:
     """This account's executions, most recent first -- and its refusals.
@@ -1376,36 +1773,77 @@ async def fills(request: Request, limit: str | None = None) -> dict[str, Any]:
     202 that accepted them. A blotter that showed only what traded would answer
     "nothing happened" to all four.
 
-    The cap is ``HumanAgent.log``'s own bound of 200 events, so this is the
-    whole of what exists rather than a policy of ours.
+    ``?after=<fill_id>`` returns only fills strictly after that id, the way
+    Binance's ``myTrades?fromId=`` does, and ``?after_rejection=`` does the same
+    for the other list. This is the endpoint a reconnecting algorithm resumes
+    from: without a monotonic cursor it cannot tell a fill it has already booked
+    from one it has not, and the only safe reading of an ambiguous blotter is to
+    re-book everything or none of it. Two cursors rather than one because they
+    number two different sequences -- fill 12 and rejection 12 are unrelated
+    events -- and a single ``after`` applied to both would silently drop from
+    one of them.
+
+    Ordering stays newest-first even under a cursor, which is worth stating
+    because Binance's ascending order is the more usual choice for one. It costs
+    nothing here: the cap *is* ``HumanAgent.log``'s own bound of 200 events, so
+    one request at the cap returns everything that exists and there is no second
+    page to walk forward into. The ``cursor`` block publishes ``total``,
+    ``retained`` and ``first_id`` for each sequence, and a client whose own
+    cursor is below ``first_id - 1`` has lost events rather than caught up.
     """
     raw = await request.body()
     caller = _authenticate(request, raw)
     page = _limit(limit, FILLS_DEFAULT, FILLS_CAP, "limit")
+    params = request.query_params
+    after = _cursor(params.get("after"), "after")
+    after_rejection = _cursor(params.get("after_rejection"), "after_rejection")
     # Before the ids are looked up, so that a fill on an order this API has not
     # yet tied to its client id still comes back named.
     _reconciled(caller)
-    log = _market().trader(caller.account).log
+    who = _market().trader(caller.account)
+    log = who.log
     # Copied, not referenced. These dictionaries are the agent's own blotter
     # entries and the WebSocket publishes the same objects, so annotating them
     # in place would have a read of this endpoint quietly change what a browser
     # watching the same account is sent. A read of a simulation must not alter
     # the simulation.
-    executions = [
-        dict(entry) for entry in log if entry.get("type") == "fill"
-    ][-page:][::-1]
-    refusals = [
-        dict(entry) for entry in log if entry.get("type") == "reject"
-    ][-page:][::-1]
+    executions = [dict(entry) for entry in log if entry.get("type") == "fill"]
+    refusals = [dict(entry) for entry in log if entry.get("type") == "reject"]
+    # Numbered before the cursor is applied and before the page is cut, because
+    # an id has to mean the same thing whatever was asked for. Numbering the
+    # page would make the id a property of the request.
+    fill_cursor = _numbered(executions, int(getattr(who, "fills", len(executions))), "fill_id")
+    reject_cursor = _numbered(
+        refusals, int(getattr(who, "rejects", len(refusals))), "rejection_id"
+    )
+    if after is not None:
+        executions = [entry for entry in executions if entry["fill_id"] > after]
+    if after_rejection is not None:
+        refusals = [entry for entry in refusals if entry["rejection_id"] > after_rejection]
+    executions = executions[-page:][::-1]
+    refusals = refusals[-page:][::-1]
     for entry in executions:
         entry["client_order_id"] = _client_id_for(
             caller.token, entry.get("symbol", ""), entry.get("order_id", -1)
         )
     return {
         "account_id": str(caller.account),
+        # A cursor only means something inside the market that issued it: a
+        # rebuild seats this key behind a fresh agent whose counters start at
+        # one, so a client holding fill_id 40 across a rebuild would discard the
+        # new market's first forty fills as already seen. Published beside the
+        # ids so that is checkable rather than a footnote.
+        "generation": int(getattr(_runner(), "generation", 0)),
         "fills": executions,
         "rejections": refusals,
+        "cursor": {
+            "after": after,
+            "after_rejection": after_rejection,
+            "fills": fill_cursor,
+            "rejections": reject_cursor,
+        },
         "count": len(executions),
+        "rejection_count": len(refusals),
         "limit": page,
         "cap": FILLS_CAP,
     }
@@ -1467,6 +1905,52 @@ async def working_orders(request: Request, limit: str | None = None) -> dict[str
     ]
     payload["pending_cap"] = CLIENT_ORDER_MEMORY
     return payload
+
+
+@router.get("/orders:by_client_order_id")
+async def order_by_client_order_id(request: Request) -> dict[str, Any]:
+    """Look one order up by the id the *client* chose. ``?id=...``
+
+    The colon suffix rather than a fourth path segment, which is Alpaca's
+    ``/v2/orders:by_client_order_id`` exactly. A segment would have had to be
+    either ``/orders/{client_order_id}`` -- which collides with the exchange's
+    own ids under ``/orders/{symbol}/{order_id}`` and would make the meaning of
+    a path depend on how many segments follow it -- or a nested collection that
+    does not exist. A colon is a legal path character, it sorts as a sibling of
+    the collection rather than a member of it, and it reads as what it is: a
+    lookup on the collection rather than an item in it.
+
+    This is the half of the reconciliation story that was missing. ``POST
+    /v1/orders`` refuses a ``client_order_id`` this seat has already used, and
+    the argument for refusing is sound and is in :func:`place_order` -- but
+    refusing without giving the client any way to *ask* what happened to the
+    first attempt leaves a retried, timed-out POST exactly where it started. It
+    knows its id was used. It still does not know whether it is long.
+
+    An id this seat never sent answers 404, the same as one that never existed
+    anywhere, because the table is per seat and a client cannot address another
+    seat's ids at all.
+    """
+    raw = await request.body()
+    caller = _authenticate(request, raw)
+    wanted = (request.query_params.get("id") or "").strip()
+    if not wanted:
+        raise _refuse(
+            "invalid_request",
+            "name the client_order_id to look up, as ?id=<client_order_id>",
+        )
+    # First, so an order acknowledged since the last read is reported as
+    # working rather than as still pending.
+    _reconciled(caller)
+    record = _client_orders(caller.token).get(wanted)
+    if record is None:
+        raise _refuse(
+            "not_found",
+            f"this seat has placed no order under the client_order_id {wanted!r}",
+            client_order_id=wanted,
+            remembered=CLIENT_ORDER_MEMORY,
+        )
+    return _client_order_row(caller, record)
 
 
 def _order_request(payload: dict[str, Any]) -> tuple[dict[str, Any], Any]:
@@ -1602,6 +2086,18 @@ async def place_order(request: Request) -> JSONResponse:
     replayed. Replaying it would mean answering "accepted" for an order this
     call did not place, and a client retrying a timed-out POST cannot tell that
     answer from the truth.
+
+    That refusal is a **409 Conflict**, not a bad request, and it carries the
+    existing order in its detail: its exchange id, its status, and its price and
+    quantity as sent. The status code is doing real work here. 400 says "your
+    request is malformed, fix it and resend" and this request is not malformed
+    -- it is a perfectly good order that conflicts with one that already exists,
+    which is what 409 means everywhere else on the web. And the detail is the
+    answer to the question the retrying client is actually asking: it retried
+    because it does not know whether the first attempt landed, and being told
+    only "that id is taken" leaves it exactly as ignorant as it was. The same
+    facts are readable at ``GET /v1/orders:by_client_order_id?id=...`` and are
+    built by the same function, so the refusal and the lookup cannot drift.
     """
     raw, payload = await _body(request)
     caller = _authenticate(request, raw)
@@ -1614,11 +2110,18 @@ async def place_order(request: Request) -> JSONResponse:
             raise _refuse(
                 "invalid_request", "client_order_id must be 64 characters or fewer"
             )
-        if client_order_id in _client_orders(caller.token):
+        existing = _client_orders(caller.token).get(client_order_id)
+        if existing is not None:
+            # Reconciled first, so the conflict reports "working, id 41" rather
+            # than "pending" for an order the exchange acknowledged while the
+            # client was deciding to retry -- which is precisely the window a
+            # retry happens in.
+            _reconciled(caller)
             raise _refuse(
-                "invalid_request",
+                "duplicate_client_order_id",
                 f"this seat has already used the client_order_id "
-                f"{client_order_id!r}",
+                f"{client_order_id!r}; that order is below",
+                **_client_order_row(caller, existing),
             )
 
     _throttle(caller.token)

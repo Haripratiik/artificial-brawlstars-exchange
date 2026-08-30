@@ -257,6 +257,79 @@ def fresh():
         venue.close()
 
 
+# How many one-second candles the candle tests want in front of them. Twelve is
+# enough for a gap to be visible if there were one, for a quiet period to turn
+# up somewhere on forty-seven thin books, and for the ten-second period to have
+# closed at least once.
+CANDLES_WANTED = 12
+
+
+def closed_candles(venue: Exchange, period: int = 1) -> int:
+    """How many candles of one period this market has finished, through the API."""
+    symbol = venue.symbols()[0]
+    response = venue.client.get(f"/v1/instruments/{symbol}/candles?period={period}")
+    assert response.status_code == 200, response.text
+    return response.json()["total"]
+
+
+@pytest.fixture(scope="module")
+def candled():
+    """A market pumped until whole candle periods have closed.
+
+    Separate from ``exchange``, which pumps 600 simulated milliseconds. A candle
+    is published when its period *ends*, so a market that has run for less than
+    one simulated second has no candles at all, and every assertion below would
+    pass over an empty list.
+
+    Pumped in a loop against the ring's own length rather than for a fixed
+    number of milliseconds, for the reason ``test_dashboard``'s history test
+    gives: ``MarketRunner.step`` also advances simulated time in proportion to
+    elapsed *wall* clock, so how much market a fixed pump buys depends on how
+    loaded the machine is. Asking for candles until there are candles is the
+    same market everywhere; asking for milliseconds is not.
+    """
+    venue = Exchange()
+    venue.pump(1_000, slices=20)
+    for _ in range(12):
+        if closed_candles(venue) >= CANDLES_WANTED:
+            break
+        venue.pump(2_000, slices=40)
+    yield venue
+    venue.close()
+
+
+def busiest(venue: Exchange) -> str:
+    return max(venue.symbols(), key=lambda s: len(venue.venue.engine(s).tape))
+
+
+def quietest(venue: Exchange) -> str:
+    return min(venue.symbols(), key=lambda s: len(venue.venue.engine(s).tape))
+
+
+def candles(venue: Exchange, symbol: str, query: str = "period=1&limit=1000") -> dict:
+    response = venue.client.get(f"/v1/instruments/{symbol}/candles?{query}")
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def floats_in(node, path: str = "") -> list[str]:
+    """Every place a JSON float appears under this node, named by where it is.
+
+    Named rather than counted so a failure says which field went wrong. ``bool``
+    is checked first because it is an ``int`` in Python and would otherwise be
+    reported as neither.
+    """
+    if isinstance(node, bool):
+        return []
+    if isinstance(node, float):
+        return [path or "<root>"]
+    if isinstance(node, dict):
+        return [hit for key, value in node.items() for hit in floats_in(value, f"{path}.{key}")]
+    if isinstance(node, list):
+        return [hit for i, value in enumerate(node) for hit in floats_in(value, f"{path}[{i}]")]
+    return []
+
+
 def resting_price(exchange: Exchange, symbol: str, side: str = "buy") -> Decimal:
     """A price that will rest rather than trade, on the instrument's own grid.
 
@@ -395,6 +468,12 @@ def test_an_unknown_symbol_is_refused_with_a_catalogued_code(exchange):
         "/v1/instruments/NOPE/book",
         "/v1/instruments/NOPE/trades",
         "/v1/instruments/NOPE/history",
+        "/v1/instruments/NOPE/candles?period=1",
+        # An unknown symbol is refused before an unreadable period is, because
+        # the symbol is the more fundamental mistake: telling a client its
+        # period is wrong when the contract does not exist sends it to fix the
+        # wrong thing.
+        "/v1/instruments/NOPE/candles?period=nonsense",
     ):
         response = exchange.client.get(path)
         assert response.status_code == 400, path
@@ -518,6 +597,306 @@ def test_history_publishes_the_sampled_path_as_strings(exchange):
         assert mid is None or isinstance(mid, str)
         if mid is not None:
             Decimal(mid)  # exact, or this raises
+
+
+# --------------------------------------------------------------------------
+# Candles
+#
+# The market-data surface a systematic client actually reads. Everything here
+# is measured against Kalshi's candlestick contract rather than invented: three
+# OHLC blocks, gap-free periods, a closed period enum, and a refusal rather
+# than a truncation when the range asked for is wider than the venue keeps.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("instrument_class", ALL_CLASSES)
+def test_every_asset_class_candles_through_one_code_path(candled, instrument_class):
+    """Nine classes, one aggregator, no branch anywhere on what kind of claim it is.
+
+    The same test the instruments endpoint gets, for the same reason: the venue
+    is uniform over its classes and nothing in the candle path knows what a
+    future or an option or a spread is. A class that needed special handling
+    here would mean the aggregator had started reading the contract instead of
+    the book.
+    """
+    symbol = candled.symbol_of(instrument_class)
+    payload = candles(candled, symbol)
+    assert payload["symbol"] == symbol
+    assert payload["period"] == 1
+    assert payload["period_ns"] == 1_000_000_000
+    assert payload["candles"], f"no closed candle for {instrument_class}"
+    for candle in payload["candles"]:
+        assert isinstance(candle["end"], int)
+        assert isinstance(candle["volume"], int) and candle["volume"] >= 0
+        assert isinstance(candle["open_interest"], int)
+        assert Decimal(candle["notional"]) >= 0
+        for block in ("price", "bid", "ask"):
+            for edge in ("open", "high", "low", "close"):
+                value = candle[block][edge]
+                assert value is None or isinstance(value, str), (block, edge)
+
+
+def test_a_candle_carries_three_separate_ohlc_blocks(candled):
+    """Trade price, bid and ask, each candled on its own.
+
+    This is the design decision the endpoint exists for, and it is Kalshi's
+    ``price`` / ``yes_bid`` / ``yes_ask`` shape. On a book this thin the last
+    print is a fact about whenever somebody last crossed the spread; the quotes
+    are facts about the period. A backtester asking "what could I have
+    transacted at during that second" is answered by the bid and ask candles and
+    is not answered by the trade candle at all -- which is why a bid block that
+    merely echoed the trade block would be worthless, and why this asserts they
+    come apart.
+    """
+    symbol = busiest(candled)
+    payload = candles(candled, symbol)
+    assert payload["candles"]
+
+    for candle in payload["candles"]:
+        assert set(candle["price"]) == {"open", "high", "low", "close", "mean"}
+        assert set(candle["bid"]) == {"open", "high", "low", "close"}
+        assert set(candle["ask"]) == {"open", "high", "low", "close"}
+        for block in ("price", "bid", "ask"):
+            edges = [candle[block][edge] for edge in ("open", "high", "low", "close")]
+            if edges[0] is None:
+                assert all(edge is None for edge in edges), (symbol, block)
+                continue
+            low = Decimal(candle[block]["low"])
+            high = Decimal(candle[block]["high"])
+            assert low <= high
+            assert low <= Decimal(candle[block]["open"]) <= high
+            assert low <= Decimal(candle[block]["close"]) <= high
+
+    quoted = [
+        candle
+        for candle in payload["candles"]
+        if candle["bid"]["close"] is not None and candle["ask"]["close"] is not None
+    ]
+    assert quoted, "no candle carried a two-sided quote"
+    # A spread. If the bid block were the trade block under another name this
+    # would be zero everywhere, and the endpoint would be publishing one series
+    # three times.
+    assert any(
+        Decimal(candle["ask"]["close"]) > Decimal(candle["bid"]["close"])
+        for candle in quoted
+    )
+
+
+def test_the_mean_is_the_volume_weighted_price_and_its_numerator_travels_with_it(
+    candled,
+):
+    """``mean`` is a quotient, so the exact numerator is published beside it.
+
+    A volume-weighted average of integers is not always a decimal -- 100 lots at
+    3 and 200 at 4 average to 11/3 -- so this is the one figure on a candle that
+    is rounded. It is published to the same precision the server computed it at
+    and ``notional`` carries the exact sum it came from, so a client that needs
+    the exactness divides for itself.
+    """
+    payload = candles(candled, busiest(candled))
+    traded = [candle for candle in payload["candles"] if candle["volume"] > 0]
+    assert traded, "nothing printed in any period"
+    for candle in traded:
+        notional = Decimal(candle["notional"])
+        assert isinstance(candle["notional"], str)
+        assert Decimal(candle["price"]["mean"]) == notional / Decimal(candle["volume"])
+        assert (
+            Decimal(candle["price"]["low"])
+            <= Decimal(candle["price"]["mean"])
+            <= Decimal(candle["price"]["high"])
+        )
+
+    quiet = [candle for candle in payload["candles"] if candle["volume"] == 0]
+    for candle in quiet:
+        assert Decimal(candle["notional"]) == 0
+        # The mean of nothing is the last thing that traded, which is what the
+        # other four price fields carry too. Consistent with its own block
+        # rather than null, so a client averaging across bars has no quiet case.
+        assert candle["price"]["mean"] == candle["price"]["close"]
+
+
+def test_no_float_appears_anywhere_in_a_candle_payload(candled):
+    """The premise of this whole venue is exact arithmetic, and it starts at the wire.
+
+    A JSON number with a fraction is a binary double. A high and a low that a
+    backtester will difference must not be one, or every statistic computed from
+    these bars inherits an error the exchange's own ledger does not have.
+    """
+    symbol = busiest(candled)
+    for period in candles(candled, symbol)["periods"]:
+        response = candled.client.get(
+            f"/v1/instruments/{symbol}/candles?period={period}&limit=1000"
+        )
+        assert response.status_code == 200
+        found = floats_in(json.loads(response.text))
+        assert not found, f"floats at period {period}: {found[:5]}"
+
+
+def test_the_candle_period_is_a_closed_enum(candled):
+    """Refused rather than rounded to the nearest period the venue does keep.
+
+    Kalshi accepts 1, 60 and 1440 and refuses 5, 15 and 360. Rounding would be
+    the friendlier-looking choice and is the wrong one: a series of bars that
+    are not the width that was asked for is wrong in a way nothing downstream
+    can detect, because every bar still looks like a bar.
+    """
+    symbol = candled.symbols()[0]
+    supported = candles(candled, symbol)["periods"]
+    assert supported == sorted(set(supported)) and supported
+
+    for period in supported:
+        accepted = candled.client.get(
+            f"/v1/instruments/{symbol}/candles?period={period}"
+        )
+        assert accepted.status_code == 200, period
+        assert accepted.json()["period"] == period
+
+    # Including 5 and 15, which Kalshi refuses for the same reason, and 1440,
+    # which is one of *their* periods and is not one of ours.
+    for refused in ("5", "15", "0", "-1", "1440", "banana", "1.0", "1e0", " ", ""):
+        response = candled.client.get(
+            f"/v1/instruments/{symbol}/candles?period={refused}"
+        )
+        assert response.status_code == 400, refused
+        error = response.json()["error"]
+        assert error["code"] == "invalid_request", refused
+        # The enum comes back in the refusal, so a client learns the closed set
+        # from the failure rather than from documentation.
+        assert error["detail"]["supported"] == supported, refused
+        assert error["detail"]["unit"] == "seconds"
+
+    missing = candled.client.get(f"/v1/instruments/{symbol}/candles")
+    assert missing.status_code == 400
+    assert missing.json()["error"]["detail"]["supported"] == supported
+
+
+def test_a_range_wider_than_the_venue_keeps_is_refused_not_truncated(candled):
+    """Binance truncates at 1,000 and Coinbase refuses at 300. Refusing is honest.
+
+    A backtester that asks for a day, receives an hour, and is told nothing
+    about which hour it lost will compute a statistic over a window it does not
+    have. The refusal names the count that was asked for and the count that is
+    kept, the way Kalshi's does -- ``requested time range with candlesticks:
+    129600, max candlesticks: 5000`` -- so the client can narrow the range or
+    ask for a longer period without guessing.
+    """
+    symbol = candled.symbols()[0]
+    payload = candles(candled, symbol)
+    cap = payload["cap"]
+    second = payload["period_ns"]
+
+    # One hundred thousand seconds. Far past the one-second ring, comfortably
+    # inside the sixty-second one, which is the advice the refusal gives.
+    span = 100_000 * second
+    refused = candled.client.get(
+        f"/v1/instruments/{symbol}/candles?period=1&start=0&end={span}"
+    )
+    assert refused.status_code == 400
+    error = refused.json()["error"]
+    assert error["code"] == "invalid_request"
+    assert error["detail"]["requested"] == 100_000
+    assert error["detail"]["cap"] == cap
+    assert "100000" in error["message"] and str(cap) in error["message"]
+
+    coarser = candled.client.get(
+        f"/v1/instruments/{symbol}/candles?period=60&start=0&end={span}"
+    )
+    assert coarser.status_code == 200, coarser.text
+
+    # The boundary itself: exactly the retained depth is served, one nanosecond
+    # more is refused. A cap a client cannot sit against is a cap it has to
+    # binary-search for.
+    exact = candled.client.get(
+        f"/v1/instruments/{symbol}/candles?period=1&start=0&end={cap * second}"
+    )
+    assert exact.status_code == 200, exact.text
+    over = candled.client.get(
+        f"/v1/instruments/{symbol}/candles?period=1&start=0&end={cap * second + 1}"
+    )
+    assert over.status_code == 400
+    assert over.json()["error"]["detail"]["requested"] == cap + 1
+
+    backwards = candled.client.get(
+        f"/v1/instruments/{symbol}/candles?period=1&start=900&end=100"
+    )
+    assert backwards.status_code == 400
+    assert backwards.json()["error"]["code"] == "invalid_request"
+
+
+def test_the_series_is_gap_free_and_a_quiet_period_carries_the_previous_close(candled):
+    """Every period gets a bar, traded or not. Kalshi does this; the reason is joins.
+
+    A gap-free series lines up with a clock by arithmetic. A sparse one has to
+    be reindexed by every client that reads it, and each of those clients then
+    writes its own interpolation policy in a hurry -- which is how two
+    backtests of the same strategy over the same data disagree.
+
+    A quiet period is the case that proves the quote candles are worth having:
+    zero volume, the previous close repeated across all five price fields, and a
+    *real* bid and ask, because the sampler still saw the book ten times a
+    second through a period nobody traded in.
+    """
+    step = candles(candled, candled.symbols()[0])["period_ns"]
+
+    for symbol in (busiest(candled), quietest(candled)):
+        ends = [candle["end"] for candle in candles(candled, symbol)["candles"]]
+        assert len(ends) >= 2, symbol
+        assert ends == sorted(ends)
+        assert ends == list(range(ends[0], ends[0] + step * len(ends), step)), symbol
+        # And every stamp is the end of a period rather than an arbitrary moment.
+        assert all(end % step == 0 for end in ends), symbol
+
+    # A quiet period that follows a traded one, anywhere on the venue: the
+    # forty-seven books here are thin by construction and nine of them went a
+    # whole simulated second without a print when this was measured.
+    carried = None
+    for symbol in candled.symbols():
+        series = candles(candled, symbol)["candles"]
+        for before, after in zip(series, series[1:]):
+            if before["volume"] > 0 and after["volume"] == 0:
+                carried = (symbol, before, after)
+                break
+        if carried:
+            break
+    assert carried, "no book was quiet for a whole period"
+
+    symbol, before, after = carried
+    assert Decimal(after["notional"]) == 0
+    assert after["trades"] == 0
+    for edge in ("open", "high", "low", "close", "mean"):
+        assert after["price"][edge] == before["price"]["close"], (symbol, edge)
+    # The point of the exercise: nothing traded, and the client is still told
+    # where the market was.
+    assert after["bid"]["close"] is not None or after["ask"]["close"] is not None
+
+
+def test_the_candles_endpoint_publishes_what_it_holds_and_what_it_applied(candled):
+    """A client has to be able to tell an empty window from a window that fell off.
+
+    ``oldest`` and ``newest`` say what exists at this period at all, ``cap`` and
+    ``retains_ns`` say how far back it can ever reach, and ``count`` against
+    ``total`` says whether the page is the whole of it.
+    """
+    symbol = candled.symbols()[0]
+    payload = candles(candled, symbol, "period=1&limit=3")
+    assert payload["limit"] == 3
+    assert payload["count"] <= 3
+    assert payload["cap"] >= payload["limit"]
+    assert payload["total"] >= payload["count"]
+    assert payload["retains_ns"] == payload["cap"] * payload["period_ns"]
+    assert payload["oldest"] <= payload["newest"]
+    assert payload["clock"] >= payload["newest"]
+
+    # A window from before this market existed is empty rather than a refusal:
+    # nothing is wrong with the request, there is simply nothing there.
+    empty = candles(candled, symbol, "period=1&start=0&end=1")
+    assert empty["count"] == 0
+    assert empty["oldest"] is not None, "the ring should still say what it holds"
+
+    # And the page is the newest of the window, not the oldest, so a default
+    # request is about the present.
+    wide = candles(candled, symbol, "period=1&limit=1000")
+    assert payload["candles"] == wide["candles"][-3:]
 
 
 # --------------------------------------------------------------------------
@@ -781,20 +1160,223 @@ def test_a_resting_order_is_reconcilable_by_its_client_order_id(fresh):
     assert detail["client_order_id"] == "cid-rest"
 
 
-def test_a_reused_client_order_id_is_refused_rather_than_replayed(fresh):
+def test_a_reused_client_order_id_is_a_conflict_carrying_the_existing_order(fresh):
     """Replaying it would mean answering "accepted" for an order this call did
     not place, and a client retrying a timed-out POST cannot tell that answer
-    from the truth."""
+    from the truth. So it is refused -- but as a 409 rather than a 400, and with
+    the first order attached.
+
+    The status code is doing work. 400 says "your request is malformed, fix it
+    and resend", and this request is not malformed: it is a perfectly good order
+    that conflicts with one that already exists. And the detail is the answer to
+    the question the retrying client is actually asking, which is not "is that
+    id taken" but "am I long".
+    """
     venue = fresh()
-    venue.pump(200, slices=8)
+    venue.pump(400, slices=16)
     trader = venue.trader("Duplicate")
     symbol = venue.symbols()[0]
-    order = {"symbol": symbol, "side": "buy", "quantity": 1, "client_order_id": "same"}
+    price = resting_price(venue, symbol, "buy")
+    order = {
+        "symbol": symbol,
+        "side": "buy",
+        "quantity": 1,
+        "price": str(price),
+        "time_in_force": "gtc",
+        "client_order_id": "same",
+    }
 
     assert trader.post("/v1/orders", order).status_code == 202
-    repeat = trader.post("/v1/orders", order)
-    assert repeat.status_code == 400
-    assert repeat.json()["error"]["code"] == "invalid_request"
+
+    # Retried before the acknowledgement has crossed back: the conflict is
+    # reported and the order is honestly described as still in flight.
+    immediate = trader.post("/v1/orders", order)
+    assert immediate.status_code == 409
+    error = immediate.json()["error"]
+    assert error["code"] == "duplicate_client_order_id"
+    assert error["detail"]["client_order_id"] == "same"
+    assert error["detail"]["status"] == "pending"
+    assert error["detail"]["order_id"] is None
+
+    venue.pump(400, slices=16)
+
+    # Retried after it rested: same conflict, and now it names the exchange's
+    # own id and the live order behind it.
+    settled = trader.post("/v1/orders", order)
+    assert settled.status_code == 409
+    detail = settled.json()["error"]["detail"]
+    assert detail["status"] == "working"
+    assert isinstance(detail["order_id"], int)
+    assert detail["order"]["order_id"] == detail["order_id"]
+    assert Decimal(detail["price"]) == price
+    # And nothing was placed by either refusal: one order id, one working order.
+    working = trader.get("/v1/orders").json()["orders"]
+    assert [row["client_order_id"] for row in working].count("same") == 1
+
+
+def test_an_order_is_findable_by_the_client_order_id_that_placed_it(fresh):
+    """``GET /v1/orders:by_client_order_id?id=...``, which is Alpaca's path exactly.
+
+    The colon suffix rather than a fourth segment, because
+    ``/orders/{client_order_id}`` would collide with the exchange's own ids
+    under ``/orders/{symbol}/{order_id}``.
+
+    This is the half of reconciliation that the duplicate refusal above cannot
+    supply on its own: a client that retried a timed-out POST learns that its id
+    was used, and still needs somewhere to ask what became of it.
+    """
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Finder")
+    symbol = venue.symbols()[0]
+    price = resting_price(venue, symbol, "buy")
+
+    placed = trader.post(
+        "/v1/orders",
+        {
+            "symbol": symbol,
+            "side": "buy",
+            "quantity": 3,
+            "price": str(price),
+            "time_in_force": "gtc",
+            "client_order_id": "look-me-up",
+        },
+    )
+    assert placed.status_code == 202, placed.text
+
+    in_flight = trader.get("/v1/orders:by_client_order_id?id=look-me-up")
+    assert in_flight.status_code == 200, in_flight.text
+    assert in_flight.json()["status"] == "pending"
+    assert in_flight.json()["order_id"] is None
+    assert in_flight.json()["order"] is None
+    assert Decimal(in_flight.json()["price"]) == price
+
+    venue.pump(400, slices=16)
+
+    resting = trader.get("/v1/orders:by_client_order_id?id=look-me-up").json()
+    assert resting["status"] == "working"
+    assert resting["symbol"] == symbol
+    assert resting["side"] == "buy"
+    assert resting["quantity"] == 3
+    assert resting["order"]["remaining"] == 3
+    assert resting["order"]["order_id"] == resting["order_id"]
+    assert resting["account_id"] == trader.account_id
+
+    # The same order, found the other way round, agrees with itself.
+    detail = trader.get(f"/v1/orders/{symbol}/{resting['order_id']}").json()
+    assert detail["client_order_id"] == "look-me-up"
+
+    trader.delete(f"/v1/orders/{symbol}/{resting['order_id']}")
+    venue.pump(400, slices=16)
+    gone = trader.get("/v1/orders:by_client_order_id?id=look-me-up").json()
+    assert gone["status"] == "done"
+    assert gone["order_id"] == resting["order_id"]
+    assert gone["order"] is None
+
+    unknown = trader.get("/v1/orders:by_client_order_id?id=never-sent")
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "not_found"
+
+    blank = trader.get("/v1/orders:by_client_order_id?id=")
+    assert blank.status_code == 400
+    assert blank.json()["error"]["code"] == "invalid_request"
+
+    # And it is another seat's business, not this one's: an id one trader used
+    # is not addressable by another, which is the same rule the order detail
+    # endpoint keeps.
+    stranger = venue.trader("Stranger")
+    assert stranger.get("/v1/orders:by_client_order_id?id=look-me-up").status_code == 404
+
+
+def test_the_fills_cursor_returns_strictly_after_and_never_repeats(fresh):
+    """A reconnecting algorithm has to be able to say which fills it has booked.
+
+    Without a monotonic id the only safe readings of a blotter after a
+    disconnect are "re-book everything" and "book nothing", and both are wrong.
+    ``?after=`` is Binance's ``myTrades?fromId=``, and the id is derived from
+    the agent's own fill counter rather than from a position in the log -- so it
+    is stable across evictions, and it orders fills in different symbols, which
+    the matching engine's per-book sequence number cannot.
+    """
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Reconciler")
+
+    for symbol in venue.symbols()[:4]:
+        trader.post("/v1/orders", _order(symbol, quantity=2))
+    venue.pump(500, slices=20)
+
+    everything = trader.get("/v1/account/fills?limit=200").json()
+    assert everything["fills"], "nothing filled"
+    ids = [entry["fill_id"] for entry in everything["fills"]]
+    assert len(set(ids)) == len(ids)
+    # Newest first, which the response is documented to stay whatever cursor is
+    # applied, because the cap is the blotter's own bound and one request at the
+    # cap is the whole of it.
+    assert ids == sorted(ids, reverse=True)
+
+    cursor = everything["cursor"]["fills"]
+    assert cursor["total"] == max(ids)
+    assert cursor["last_id"] == max(ids)
+    assert cursor["first_id"] == min(ids)
+    assert cursor["retained"] == len(ids)
+
+    # Strictly after: the id handed in never comes back.
+    middle = sorted(ids)[len(ids) // 2]
+    after = trader.get(f"/v1/account/fills?after={middle}&limit=200").json()
+    assert after["cursor"]["after"] == middle
+    seen = [entry["fill_id"] for entry in after["fills"]]
+    assert seen == [i for i in ids if i > middle]
+    assert middle not in seen
+
+    # Caught up: nothing new, and no exception about it.
+    caught_up = trader.get(f"/v1/account/fills?after={max(ids)}&limit=200").json()
+    assert caught_up["fills"] == []
+    assert caught_up["count"] == 0
+    # The cursor block still describes what exists, so a client that has caught
+    # up can still tell whether it lost anything on the way.
+    assert caught_up["cursor"]["fills"]["total"] == max(ids)
+
+    # Zero is a cursor, not an absence: a client that has never advanced its own
+    # asks for everything and gets everything.
+    from_zero = trader.get("/v1/account/fills?after=0&limit=200").json()["fills"]
+    assert [entry["fill_id"] for entry in from_zero] == ids
+
+    # Nothing is dropped and nothing is repeated across a resume: page once,
+    # then resume from the last id seen, and the union is exactly the whole.
+    first_half = trader.get("/v1/account/fills?after=0&limit=200").json()["fills"]
+    resumed = trader.get(
+        f"/v1/account/fills?after={min(ids)}&limit=200"
+    ).json()["fills"]
+    assert {e["fill_id"] for e in resumed} | {min(ids)} == {e["fill_id"] for e in first_half}
+
+    for bad in ("-1", "many", "1.5"):
+        refused = trader.get(f"/v1/account/fills?after={bad}")
+        assert refused.status_code == 400, bad
+        assert refused.json()["error"]["code"] == "invalid_request"
+
+    # Rejections are a second sequence with a cursor of its own, because
+    # fill 3 and rejection 3 are unrelated events and one ``after`` applied to
+    # both would silently drop from one of them.
+    refusals = trader.get("/v1/account/fills?after_rejection=0&limit=200").json()
+    assert refusals["cursor"]["after_rejection"] == 0
+    assert refusals["cursor"]["after"] is None
+    assert set(refusals["cursor"]["rejections"]) == {
+        "total",
+        "retained",
+        "first_id",
+        "last_id",
+    }
+    for entry in refusals["rejections"]:
+        assert isinstance(entry["rejection_id"], int)
+    assert trader.get("/v1/account/fills?after_rejection=-1").status_code == 400
+
+    # The generation travels with the cursor. A rebuild seats this key behind a
+    # fresh agent whose counters start at one, so a client holding fill 40
+    # across one would discard the new market's first forty fills as already
+    # seen -- and the only thing that lets it notice is being told which market
+    # the numbers belong to.
+    assert everything["generation"] == 0
 
 
 def test_cancelling_is_idempotent(fresh):
@@ -916,6 +1498,7 @@ def test_every_list_endpoint_publishes_the_cap_it_applied(exchange):
         "/v1/instruments?limit=2",
         f"/v1/instruments/{symbol}/trades?limit=2",
         f"/v1/instruments/{symbol}/history?limit=2",
+        f"/v1/instruments/{symbol}/candles?period=1&limit=2",
     ):
         payload = exchange.client.get(path).json()
         assert payload["limit"] == 2, path

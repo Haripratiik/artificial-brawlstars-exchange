@@ -20,6 +20,13 @@ Layout of the surface:
     POST /api/config           rebuild the market with a new configuration
     POST /api/session/{sym}/halt      suspend trading
     POST /api/session/{sym}/uncross   clear the call and resume
+
+Those last three, plus kill and revive, are OPERATOR routes: they reach past
+the caller and change the market for everyone in it. They need the token in
+`dashboard.operator_auth` and answer 404 without it. `POST /api/config`
+discards every account, position and working order for every connected user,
+and `kill` takes an arbitrary agent id -- so before they were gated, one
+visitor could end another's session.
     WS   /ws                   live snapshot at the tick rate, and order entry
 
 Those are the *page's* endpoints, shaped for one browser: they answer whatever
@@ -65,7 +72,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -75,6 +82,7 @@ from arena.api.keys import KeyStore
 from arena.exchange.types import AgentId
 from arena.portfolio.money import from_money
 from dashboard.identity import COOKIE, display_name, sign, verify
+from dashboard.operator_auth import is_operator, operator_token, token_was_generated
 from dashboard.state import FEE_SCHEDULES, MarketConfig, MarketRunner
 
 # Starlette serves static files with whatever `mimetypes` reports, and on
@@ -162,6 +170,12 @@ async def _run_market() -> None:
 @app.on_event("startup")
 async def _startup() -> None:
     global _pump
+    # Printed once, and only when nobody chose one. A default token is the
+    # shape of every embarrassing breach, because the deployment that forgot to
+    # override it looks exactly like the one that did.
+    if token_was_generated():
+        print(f"operator token: {operator_token()}")
+        print("  set ARENA_OPERATOR_TOKEN to choose your own")
     _pump = asyncio.create_task(_run_market())
 
 
@@ -372,30 +386,55 @@ async def api_book(symbol: str, levels: int = 20) -> JSONResponse:
 # --------------------------------------------------------------------------
 
 
+def _require_operator(request: Request) -> None:
+    """Refuse anyone without the operator token.
+
+    These five routes are the ones that reach past the caller and change the
+    market for everybody in it, so they are the ones that need a credential a
+    visitor does not have. `POST /api/config` in particular discards every
+    account, position and working order for every connected user; before this
+    guard, any visitor could send it. `kill` was quieter and no better: it
+    takes an arbitrary agent id, so one visitor could reach across and disable
+    another human's seat while they watched.
+
+    Raised as 404 rather than 401. A 401 confirms the route exists and invites
+    guessing at the token; a stranger who cannot operate this venue has no
+    business learning its control surface. An operator who has the token sees
+    no difference either way.
+    """
+    if not is_operator(request):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
 @app.post("/api/config")
-async def api_config(payload: dict[str, Any]) -> dict[str, Any]:
+async def api_config(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
     """Rebuild the market. Starts a fresh session, and says so."""
+    _require_operator(request)
     return runner.reconfigure(MarketConfig.from_dict(payload or {}))
 
 
 @app.post("/api/session/{symbol}/halt")
-async def api_halt(symbol: str) -> dict[str, Any]:
+async def api_halt(request: Request, symbol: str) -> dict[str, Any]:
+    _require_operator(request)
     return runner.halt(symbol)
 
 
 @app.post("/api/participant/{agent_id}/kill")
-async def api_kill(agent_id: str) -> dict[str, Any]:
+async def api_kill(request: Request, agent_id: str) -> dict[str, Any]:
     """Stop a participant: pull everything it has working, refuse it more."""
+    _require_operator(request)
     return runner.kill(agent_id)
 
 
 @app.post("/api/participant/{agent_id}/revive")
-async def api_revive(agent_id: str) -> dict[str, Any]:
+async def api_revive(request: Request, agent_id: str) -> dict[str, Any]:
+    _require_operator(request)
     return runner.revive(agent_id)
 
 
 @app.post("/api/session/{symbol}/uncross")
-async def api_uncross(symbol: str) -> dict[str, Any]:
+async def api_uncross(request: Request, symbol: str) -> dict[str, Any]:
+    _require_operator(request)
     return runner.uncross(symbol)
 
 
@@ -625,6 +664,37 @@ class _FreshStatic(StaticFiles):
         response = await super().get_response(path, scope)
         response.headers["Cache-Control"] = "no-store, must-revalidate"
         return response
+
+
+@app.middleware("http")
+async def _stamp_simulated(request: Request, call_next):
+    """Put `simulated: true` on every JSON response.
+
+    Every sandbox surveyed separates itself from production by *hostname* and
+    nothing else -- `apisb.etrade.com`, `api-fxpractice.oanda.com`,
+    `testnet.binance.vision`, `sandbox.tradier.com`. Kraken stated the design
+    intent outright: "the only difference... is that the base URL is not
+    futures.kraken.com but instead demo-futures.kraken.com."
+
+    The failure mode that convention leaves open is the one worth guarding:
+    a misconfigured base URL is **undetectable from inside the client**. OANDA
+    ships an Account object with no environment field at all, so a captured
+    payload is indistinguishable between practice and live. Interactive
+    Brokers reduces the safeguard to a plea in its own documentation: "make
+    sure your client application is connecting to the right TWS!"
+
+    Deribit is the only venue in the survey that solves it properly, by
+    stamping a `testnet` boolean on every JSON-RPC envelope, so a client can
+    assert its environment from any response without trusting its own config.
+    This is that, and it costs one header's worth of work.
+
+    Also emitted as a response header, so a client can check it without
+    parsing a body -- including on an error, which is exactly when a confused
+    client most needs to know which venue answered.
+    """
+    response = await call_next(request)
+    response.headers["arena-simulated"] = "true"
+    return response
 
 
 if STATIC.is_dir():

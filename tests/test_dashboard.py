@@ -37,6 +37,18 @@ REPO = Path(__file__).resolve().parents[1]
 SYMBOL = "SPIKE_WR_FUT"
 
 
+def as_operator() -> dict[str, str]:
+    """The header that reaches the controls which change the market for all.
+
+    Imported lazily inside the function so this module still imports cleanly if
+    the auth module is ever moved -- the tests that do not touch operator
+    routes should not fail on an import they never use.
+    """
+    from dashboard.operator_auth import OPERATOR_HEADER, operator_token
+
+    return {OPERATOR_HEADER: operator_token()}
+
+
 @pytest.fixture(scope="module")
 def client():
     """A live server with a market that has actually traded.
@@ -45,6 +57,35 @@ def client():
     the market is stepped by the server's own pump, never by the test, because
     two things advancing one event kernel corrupts it.
     """
+    # Re-apply the server's OWN api configuration before yielding.
+    #
+    # `arena.api.rest` is configured through module globals, and
+    # `dashboard/server.py` sets them at import with the cookie-reading seat
+    # hook this file's tests depend on. But `tests/test_api.py` builds its own
+    # app and calls `rest.configure(...)` with a header-based hook, which
+    # replaces those globals process-wide -- and pytest collects `test_api.py`
+    # before `test_dashboard.py`, so by the time these tests run the cookie
+    # path has been swapped out from under them. Every test here passed in
+    # isolation and one failed in the suite, which is the signature of exactly
+    # this and not of a bug in the thing under test.
+    #
+    # Restoring it here rather than in the other file, because a test file
+    # should establish the state it needs instead of relying on nothing else
+    # having disturbed it.
+    import dashboard.server as server
+    from arena.api import rest
+
+    rest.configure(
+        keys=server.api_keys,
+        runner=runner,
+        browser_seat=lambda request: (
+            rest.Seat(sid, server._SEATS[sid].name)
+            if (sid := server._session_id(request)) in server._SEATS
+            else None
+        ),
+        seat_now=server._seat_now,
+    )
+
     with TestClient(app) as test_client:
         runner.set_speed(40.0)
         time.sleep(8)
@@ -317,22 +358,22 @@ def test_unknown_symbols_are_refused(client, path):
 
 def test_halting_and_reopening_round_trips(client):
     """A halt accumulates orders; the reopen is an auction, not a free-for-all."""
-    halted = client.post(f"/api/session/{SYMBOL}/halt").json()
+    halted = client.post(f"/api/session/{SYMBOL}/halt", headers=as_operator()).json()
     assert halted["ok"] and halted["session"] == "auction"
 
-    reopened = client.post(f"/api/session/{SYMBOL}/uncross").json()
+    reopened = client.post(f"/api/session/{SYMBOL}/uncross", headers=as_operator()).json()
     assert reopened["ok"] and reopened["session"] == "continuous"
 
 
 def test_uncrossing_a_continuous_symbol_is_refused(client):
     """There is no call phase to clear, and saying so beats pretending."""
-    client.post(f"/api/session/{SYMBOL}/uncross")
-    again = client.post(f"/api/session/{SYMBOL}/uncross").json()
+    client.post(f"/api/session/{SYMBOL}/uncross", headers=as_operator())
+    again = client.post(f"/api/session/{SYMBOL}/uncross", headers=as_operator()).json()
     assert again["ok"] is False
 
 
 def test_halting_an_unknown_symbol_is_refused(client):
-    assert client.post("/api/session/NOPE/halt").json()["ok"] is False
+    assert client.post("/api/session/NOPE/halt", headers=as_operator()).json()["ok"] is False
 
 
 # --------------------------------------------------------------------------
@@ -1049,4 +1090,149 @@ def test_the_fee_ledger_is_published_in_contract_units():
     expected = from_money(runner.market.venue.fees_collected)
     assert Decimal(published) == expected, (
         f"published {published}, venue holds {expected}"
+    )
+
+
+# --------------------------------------------------------------------------
+# The controls that reach past the caller
+# --------------------------------------------------------------------------
+
+
+OPERATOR_ROUTES = [
+    ("/api/config", {}),
+    (f"/api/session/{SYMBOL}/halt", None),
+    (f"/api/session/{SYMBOL}/uncross", None),
+    ("/api/participant/mm-1/kill", None),
+    ("/api/participant/mm-1/revive", None),
+]
+
+
+@pytest.mark.parametrize("path,body", OPERATOR_ROUTES)
+def test_an_operator_route_refuses_a_visitor(client, path, body):
+    """Five routes change the market for everybody, and had no guard at all.
+
+    `POST /api/config` calls `MarketRunner.reconfigure`, whose own docstring
+    says "The old one is discarded, not paused" -- every account, position,
+    working order and price series, for every connected user, gone. Any visitor
+    could send it. `kill` was quieter and no better: it takes an **arbitrary**
+    agent id, so one visitor could reach across and disable another human's
+    seat, pulling their working orders while they watched.
+
+    That is survivable while this is one person's demo and fatal the moment two
+    strangers trade against each other, which is what the exchange is for.
+
+    404 rather than 401 is deliberate: a 401 confirms the route exists and
+    invites guessing at the token, and a stranger who cannot operate this venue
+    has no business learning its control surface.
+    """
+    from dashboard.operator_auth import OPERATOR_HEADER
+
+    unguarded = client.post(path) if body is None else client.post(path, json=body)
+    assert unguarded.status_code == 404, f"{path} answered a visitor"
+
+    wrong = (
+        client.post(path, headers={OPERATOR_HEADER: "not-the-token"})
+        if body is None
+        else client.post(path, json=body, headers={OPERATOR_HEADER: "not-the-token"})
+    )
+    assert wrong.status_code == 404, f"{path} accepted a wrong token"
+
+
+def test_an_operator_route_answers_the_operator(client):
+    """The gate has to let the right person through, or it is just a wall."""
+    allowed = client.post(f"/api/session/{SYMBOL}/halt", headers=as_operator())
+    assert allowed.status_code == 200
+    client.post(f"/api/session/{SYMBOL}/uncross", headers=as_operator())
+
+
+def test_the_operator_token_is_never_a_default():
+    """A default token is the shape of every embarrassing breach.
+
+    The deployment that forgot to override it looks exactly like the one that
+    did, so there is no moment at which anybody notices. When the environment
+    sets nothing, a fresh random token is minted and printed once at startup
+    instead.
+    """
+    from dashboard import operator_auth
+
+    token = operator_auth.operator_token()
+    assert token, "there is no token at all"
+    assert len(token) >= 16, f"token is only {len(token)} characters"
+    assert token.lower() not in {"admin", "operator", "changeme", "token", "secret"}
+
+
+def test_a_key_survives_a_rebuild_and_keeps_its_seat(client):
+    """Invalidating credentials on reset breaks every algorithm running.
+
+    The industry splits on this and one side is plainly right. Binance
+    preserves API keys across its periodic testnet wipes and says so:
+    "Starting from August 2020, API Keys are preserved during resets. Users no
+    longer need to re-register new API Keys after a reset." tastytrade wipes
+    state nightly and makes the same carve-out: "Users, customers, and accounts
+    are untouched." Alpaca went the other way, replacing reset with
+    create-and-delete, and warns "Don't forget to generate new API keys for any
+    newly created account" -- which means every reset breaks every running bot.
+
+    A rebuild here discards the whole market, so the risk is not just the key
+    record surviving. It is that `LiveMarket.trader` answers an unknown id with
+    the SHARED account, so a credential that captured an account id would come
+    back pointing at a communal seat rather than failing loudly. This asserts
+    the key still works AND still reaches its own seat.
+    """
+    from arena.api.keys import HEADER_KEY, HEADER_SIGNATURE, HEADER_TIMESTAMP, sign
+
+    client.get("/")
+    issued = client.post("/v1/keys", json={"label": "survives"})
+    assert issued.status_code == 201, issued.text
+    key = issued.json()
+
+    def as_key(path: str):
+        stamp = str(time.time())
+        return client.get(
+            path,
+            headers={
+                HEADER_KEY: key["key_id"],
+                HEADER_TIMESTAMP: stamp,
+                HEADER_SIGNATURE: sign(key["secret"], "GET", path, stamp, b""),
+            },
+        )
+
+    before = as_key("/v1/account")
+    assert before.status_code == 200
+    seat_before = before.json()["account_id"]
+
+    client.post("/api/config", json={"seed": 11}, headers=as_operator())
+    time.sleep(2)
+
+    after = as_key("/v1/account")
+    assert after.status_code == 200, "the rebuild invalidated a live credential"
+    assert after.json()["account_id"] == seat_before, (
+        f"the key moved from {seat_before} to {after.json()['account_id']} -- "
+        "which is what landing on the shared account looks like"
+    )
+
+
+def test_every_response_says_it_is_simulated(client):
+    """A misconfigured base URL is otherwise undetectable from inside a client.
+
+    Every sandbox surveyed separates itself from production by hostname alone.
+    Kraken stated the intent outright: "the only difference... is that the base
+    URL is not futures.kraken.com but instead demo-futures.kraken.com." OANDA
+    ships an Account object carrying no environment field, so a captured
+    payload is indistinguishable between practice and live. Interactive Brokers
+    reduces the safeguard to a plea in its own docs: "make sure your client
+    application is connecting to the right TWS!"
+
+    Deribit is the one venue that solves it, stamping a `testnet` boolean on
+    every response envelope. This is that. Asserted on an error response too,
+    because that is exactly when a confused client most needs to know which
+    venue answered it.
+    """
+    for path in ("/v1/exchange", "/v1/instruments", "/api/session"):
+        assert client.get(path).headers.get("arena-simulated") == "true", path
+
+    refused = client.get("/v1/account")
+    assert refused.status_code == 401
+    assert refused.headers.get("arena-simulated") == "true", (
+        "an error response does not say which venue produced it"
     )
