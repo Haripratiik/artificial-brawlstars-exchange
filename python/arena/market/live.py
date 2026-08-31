@@ -30,10 +30,11 @@ from decimal import Decimal
 from typing import Any
 
 from arena.agents.base import TradingAgent
-from arena.exchange.events import Cancel, Submit
+from arena.exchange.events import Cancel, Replace, Submit
 from arena.exchange.types import (
     AgentId,
     OrderType,
+    PegReference,
     Price,
     Quantity,
     Side,
@@ -109,6 +110,19 @@ class HumanAgent(TradingAgent):
         self.log: list[dict[str, Any]] = []
 
     def enqueue(self, command: SymbolCommand) -> None:
+        """Queue one command for the next wakeup, noting what it is.
+
+        An amendment is declared to the base class as it goes out, because the
+        answer to one is indistinguishable from the answer to a new order once
+        it comes back: the engine refuses a Submit and a Replace with the same
+        ``Rejected`` shape and the same order id, and only the sender knows
+        which it asked for. See ``TradingAgent.note_replace``. Read off the
+        command rather than passed in by ``LiveMarket.replace``, so a second
+        caller that builds its own ``Replace`` cannot forget to say so.
+        """
+        inner = command.command
+        if isinstance(inner, Replace):
+            self.note_replace(command.symbol, inner.order_id)
         self._outbox.append(command)
 
     def act(self, ctx: SimulationContext) -> None:
@@ -152,9 +166,16 @@ class LiveMarket:
     traders: dict[AgentId, HumanAgent] = field(default_factory=dict)
     latency: Any = None
     seat_cash: int = 0
+    # The clock a contract's window is measured against, and the function that
+    # produces a settlement once one closes. Both optional so every existing
+    # caller and every test keeps working unchanged: without them the market
+    # behaves exactly as it did, which is to say nothing ever expires.
+    calendar: Any = None
+    settlement_source: Any = None
     _wall_last: float = 0.0
     _sim_seconds: float = 0.0
     _running: bool = False
+    _settlement_log: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.traders.setdefault(self.human.agent_id, self.human)
@@ -228,9 +249,59 @@ class LiveMarket:
         self._wall_last = now
         self._sim_seconds += delta * self.speed
         target = Timestamp(int(self._sim_seconds * 1_000_000_000))
+        # The contract calendar moves with simulated time, not wall time. Done
+        # before the kernel runs so a contract whose window closes during this
+        # slice is closed to new orders for the whole of it, rather than taking
+        # orders for a slice against an outcome that is already determined.
+        if self.calendar is not None:
+            self.calendar.advance_to(self._sim_seconds)
         # A cap per slice, so a burst of activity cannot stall the event loop
         # that is serving the browser. Anything left simply runs next slice.
-        return self.kernel.advance(until=target, max_events=20_000)
+        ran = self.kernel.advance(until=target, max_events=20_000)
+        self.settle_due()
+        return ran
+
+    def settle_due(self) -> list[str]:
+        """Settle every contract whose window has closed. Returns what settled.
+
+        This is the step that was missing, and its absence was the largest
+        remaining gap in the product. Measured before it existed: after a
+        simulated hour all 47 contracts were still `continuous` and the settled
+        set was empty, so a position was marked forever and realised never --
+        an algorithm left running had no terminal event to score against.
+
+        The settlement machinery itself was complete and heavily tested the
+        whole time. `build_market.prior_levels` already calls
+        `settle(spec, oracle)` successfully on every listed instrument, which is
+        the proof the oracle can answer. Nothing in the live path ever asked.
+
+        Failures are recorded rather than raised. A contract the oracle cannot
+        answer for is a real outcome -- the evidence was never collected -- and
+        it must not take the market down with it; the venue's own settlement
+        already distinguishes a VOID from a payout for exactly this reason.
+        """
+        if self.settlement_source is None:
+            return []
+        done: list[str] = []
+        for symbol in tuple(self.venue.registry.symbols):
+            if symbol in self.venue.settled_symbols:
+                continue
+            instrument = self.venue.registry.get(symbol)
+            if instrument is None:
+                continue
+            if self.calendar is None or self.calendar.now() < instrument.expiry:
+                continue
+            try:
+                result = self.settlement_source(instrument.spec)
+                self.venue.settle(symbol, result)
+            except Exception as failure:  # noqa: BLE001 -- recorded, never fatal
+                self._settlement_log.append((symbol, repr(failure)))
+                continue
+            self._settlement_log.append(
+                (symbol, getattr(result.status, "value", str(result.status)))
+            )
+            done.append(symbol)
+        return done
 
     # -- human actions -----------------------------------------------------
 
@@ -244,7 +315,26 @@ class LiveMarket:
         trader: AgentId | None = None,
         stop: Decimal | None = None,
         display: int = 0,
+        *,
+        peg: str | PegReference | None = None,
+        peg_offset: int = 0,
     ) -> dict[str, Any]:
+        """Send one order. ``peg`` makes it a pegged one; everything else is derived.
+
+        The peg arguments are keyword-only and default to "not a peg", so every
+        existing caller -- the browser ticket, the REST route, the tests --
+        keeps its current signature and its current behaviour exactly.
+
+        ``peg`` is the engine's own vocabulary rather than a second one: it
+        takes a :class:`PegReference` or one of its values (``bid``, ``ask``,
+        ``mid``), read off the enum rather than restated, so a fourth reference
+        added to the exchange is reachable from here without anybody editing
+        this method. ``peg_offset`` stays a signed count of *ticks* for the same
+        reason it is one on ``Submit``: on a contract carrying a tick table the
+        same decimal is a different number of ticks at different levels, so an
+        offset expressed as a price would silently change size as the reference
+        moved -- which is precisely the thing a peg exists to stop happening.
+        """
         instrument = self.venue.registry.get(symbol)
         if instrument is None:
             return {"ok": False, "error": f"unknown symbol {symbol}"}
@@ -263,25 +353,70 @@ class LiveMarket:
         if display < 0:
             return {"ok": False, "error": "display size cannot be negative"}
 
+        reference: PegReference | None = None
+        if peg is not None:
+            if isinstance(peg, PegReference):
+                reference = peg
+            else:
+                try:
+                    reference = PegReference(str(peg).strip().lower())
+                except ValueError:
+                    return {
+                        "ok": False,
+                        "error": f"unknown peg reference {peg!r}; this venue tracks "
+                        + ", ".join(sorted(choice.value for choice in PegReference)),
+                    }
+        try:
+            offset = int(peg_offset)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "peg offset must be a whole number of ticks"}
+        if reference is None and offset:
+            # The engine refuses this as INVALID_PEG and is right to: an offset
+            # from nothing is not an instruction. Refused here so the caller is
+            # told which of the two fields it forgot, rather than watching the
+            # order vanish into a blotter.
+            return {"ok": False, "error": "a peg offset needs a peg reference"}
+
         # A market order can only ever be immediate; a limit order defaults to
         # resting. Anything else the caller asks for is honoured, so the browser
         # can reach post-only and fill-or-kill rather than only the two defaults.
-        if stop_ticks is not None:
+        #
+        # A peg is checked before the other two because it looks like a market
+        # order from here -- it names no price -- and the unpriced branch would
+        # have made it immediate-or-cancel, which is the one instruction a peg
+        # cannot obey.
+        if reference is not None:
+            if ticks is not None:
+                return {
+                    "ok": False,
+                    "error": "a pegged order names no price of its own: its price is "
+                    "the reference plus the offset",
+                }
+            if stop_ticks is not None:
+                return {"ok": False, "error": "a pegged order cannot also be a stop"}
+            try:
+                duration = TimeInForce(tif.lower()) if tif else TimeInForce.GTC
+            except ValueError:
+                return {"ok": False, "error": f"unknown time in force {tif!r}"}
+            if duration in (TimeInForce.IOC, TimeInForce.FOK):
+                return {
+                    "ok": False,
+                    "error": f"a pegged order cannot be {duration.value}: a peg is an "
+                    "instruction to keep tracking and that one says not to rest",
+                }
+            kind = OrderType.PEGGED
+        elif stop_ticks is not None:
             duration = TimeInForce.GTC
+            kind = OrderType.STOP_LIMIT if ticks is not None else OrderType.STOP
         elif ticks is None:
             duration = TimeInForce.IOC
+            kind = OrderType.MARKET
         else:
             try:
                 duration = TimeInForce(tif.lower()) if tif else TimeInForce.GTC
             except ValueError:
                 return {"ok": False, "error": f"unknown time in force {tif!r}"}
-
-        if stop_ticks is not None:
-            kind = OrderType.STOP_LIMIT if ticks is not None else OrderType.STOP
-        elif ticks is not None:
             kind = OrderType.LIMIT
-        else:
-            kind = OrderType.MARKET
 
         who = self.trader(trader)
         command = Submit(
@@ -293,6 +428,8 @@ class LiveMarket:
             duration,
             display,
             stop_ticks,
+            peg_to=reference,
+            peg_offset=offset if reference is not None else 0,
         )
         who.enqueue(SymbolCommand(symbol, command))
         return {"ok": True}
@@ -321,6 +458,77 @@ class LiveMarket:
             # a stranger something about that account.
             return {"ok": False, "error": "no such live order"}
         who.enqueue(SymbolCommand(symbol, Cancel(who.agent_id, order_id)))
+        return {"ok": True}
+
+    def replace(
+        self,
+        order_id: int,
+        quantity: int,
+        price: Decimal | None = None,
+        trader: AgentId | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        """Amend a working order's price, its size, or both, keeping its id.
+
+        The alternative available until now was cancel-and-resubmit, and it is
+        strictly worse in two ways that matter. It loses queue priority
+        *unconditionally*, including in the one case the engine would have kept
+        it. And the two commands race a fill: between the cancel and the
+        resubmit the order is not in the book at all, so a client amending a
+        quote in a moving market is repeatedly out of the market for a round
+        trip, or -- if the cancel loses the race -- ends up holding both.
+
+        **What it costs in queue priority, measured rather than assumed.** Two
+        bids for ten at 100, ours first, then a sell of five sweeps the level:
+
+            shrink 10 -> 6 at the same price    kept_priority=True   we fill
+            grow   10 -> 14 at the same price   kept_priority=False  they fill
+            10 -> 10 at the same price          kept_priority=False  they fill
+            10 -> 6 at a different price        kept_priority=False  they fill
+
+        So the usual summary -- "raising size loses it, lowering it keeps it" --
+        is right about the two ends and silent about the middle, and the middle
+        is the case a client hits by accident. Priority survives a **strict
+        reduction at an unchanged price and nothing else**: an amendment that
+        re-sends the size it already had goes to the back of the queue for
+        asking for nothing. Send only what is changing.
+
+        Quantity is counted the way the engine counts it, against ``remaining``
+        rather than against the original size, so amending a partly filled order
+        for 4 leaves 4 lots working and not 4 minus what already traded.
+
+        Addressed and owner-checked exactly as :meth:`cancel` is, and refused
+        identically for an order that is somebody else's, already filled, or
+        never existed -- confirming that an id exists but belongs to another
+        account tells a stranger something about that account.
+        """
+        who = self.trader(trader)
+        if symbol is None:
+            matches = [key for key in who.live_orders if key[1] == order_id]
+            if len(matches) != 1:
+                return {"ok": False, "error": "no such live order"}
+            symbol = matches[0][0]
+        if (symbol, order_id) not in who.live_orders:
+            return {"ok": False, "error": "no such live order"}
+
+        instrument = self.venue.registry.get(symbol)
+        if instrument is None:
+            return {"ok": False, "error": f"unknown symbol {symbol}"}
+        if quantity <= 0:
+            # The engine refuses this as INVALID_QUANTITY and leaves the order
+            # exactly where it was, which is right -- an amendment to zero is
+            # not a cancel and must not be read as one.
+            return {"ok": False, "error": "quantity must be positive"}
+        try:
+            ticks = None if price is None else instrument.to_ticks(price)
+        except ValueError as bad_price:
+            return {"ok": False, "error": str(bad_price)}
+
+        who.enqueue(
+            SymbolCommand(
+                symbol, Replace(who.agent_id, order_id, Quantity(quantity), ticks)
+            )
+        )
         return {"ok": True}
 
     def cancel_all(self, trader: AgentId | None = None) -> dict[str, Any]:
