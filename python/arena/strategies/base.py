@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
+from arena.agents.base import _on_grid
 from arena.exchange.types import Side
 from arena.market.instrument import Instrument
 
@@ -75,7 +76,18 @@ def snap(instrument: Instrument, side: Side, price: Decimal | float) -> Decimal:
     ticks = floor if side is Side.BUY else (floor if steps == floor else floor + 1)
     low, high = instrument.tick_bounds
     ticks = max(int(low), min(int(high), ticks))
-    return instrument.from_ticks(ticks)
+    # Then onto the increment the contract's band requires, which is not the
+    # tick everywhere: PIPER_WR_FUT steps by 1.00 above 4,000, so rounding to
+    # the tick alone returns 5232.25, a price the venue refuses. Delegated
+    # rather than repeated, because the subtle part is that one pass can round
+    # *into* a coarser band and land off its grid, and `_on_grid` already
+    # handles that and says why.
+    #
+    # `TradingAgent.quote` applies the same function before anything is sent,
+    # so no bad order ever reached the venue. What was wrong is that the price
+    # a strategy computed was not the price it would get, which is exactly the
+    # comparison it makes against `working_bid` to decide whether to requote.
+    return instrument.from_ticks(_on_grid(instrument, side, ticks))
 
 
 @dataclass(frozen=True)
@@ -194,8 +206,22 @@ class SymbolView:
     @property
     def reference(self) -> Decimal | None:
         """Mid where there is one, last print otherwise, midpoint of the range
-        if the book has never traded. Somewhere to start, not a fair value."""
-        return self.mid or self.last or (sum(self.bounds) / 2)
+        if the book has never traded. Somewhere to start, not a fair value.
+
+        Tested with `is None` rather than for truth, because a price of zero is
+        a real price here and `or` discards it. Latent when found -- zero of
+        1,200 sampled mids across 47 books were exactly zero -- but one
+        cancelled offer away in seven option books, where a genuinely worthless
+        put would have reported the midpoint of its settlement range instead,
+        which on SPIKE_C4550 is 2,350 against a fair value of nothing.
+        """
+        mid = self.mid
+        if mid is not None:
+            return mid
+        if self.last is not None:
+            return self.last
+        low, high = self.bounds
+        return (low + high) / 2
 
 
 @dataclass(frozen=True)
