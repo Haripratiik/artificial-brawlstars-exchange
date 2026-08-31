@@ -682,10 +682,45 @@ def test_a_distribution_leaves_no_account_short_of_collateral():
             f"{abs(quantity) * payment * 1_000_000 - required_before}"
         )
 
-    assert floored, (
-        "nobody was pinned to the floor, so the exception went untested; "
-        "the fixture no longer sells the share above its surviving ceiling"
+    # The live sweep above proves the rule for whoever happens to be holding.
+    # The exception -- a requirement already at zero, so the payment has to come
+    # out of headroom -- is then constructed rather than waited for.
+    #
+    # It used to be waited for, and that was a fixture depending on a bug.
+    # `VenueAgent.top_of_book` was publishing the market-on-open sentinel, so
+    # some account reliably ended up short the share at an absurd average, and
+    # this test read that accident as its scenario. Fixing the feed removed the
+    # accident and the test began reporting, accurately, that it was no longer
+    # exercising the path it names. Measured: it passes on `best_price` and
+    # fails on `best_priced`, which is the wrong way round for a test of
+    # collateral arithmetic to depend on a market-data defect.
+    instrument = venue.registry.require("SPIKE_EQ")
+    _low, high = venue.bounds_in_minor(instrument)
+    venue.open_account("floor-probe", 10_000_000)
+    probe = venue.accounts["floor-probe"]
+    # Short at the very top of what the claim can settle for, so the next
+    # payment drops the ceiling below the basis and the requirement floors.
+    probe.apply_fill(
+        "SPIKE_EQ", -20, Money(int(high)), venue.bounds_in_minor(instrument)
     )
+    cash_before = int(probe.free_cash)
+    required_before = int(probe.collateral.get("SPIKE_EQ", Money(0)))
+    venue.distribute("SPIKE_EQ", Money(payment * 1_000_000))
+
+    assert int(probe.collateral.get("SPIKE_EQ", Money(0))) == 0, (
+        "the constructed short was not pinned to the floor, so the exception "
+        "is still untested"
+    )
+    lost = cash_before - int(probe.free_cash)
+    assert lost == 20 * payment * 1_000_000 - required_before, (
+        f"the floored short lost {lost} of headroom, against a shortfall of "
+        f"{20 * payment * 1_000_000 - required_before}"
+    )
+    # Deliberately no conservation check on the probe. The position was booked
+    # onto one account with no counterparty, which breaks the identity by
+    # construction rather than by any fault in the ledger, and asserting it
+    # here would be asserting that the fixture is a market. The conserving
+    # path is covered by every test that trades through the venue.
 
 
 def test_a_share_cannot_pay_more_than_it_promised():
@@ -846,3 +881,90 @@ def test_an_unknown_metric_kind_is_refused():
     with pytest.raises(ValueError, match="must be 'rate', 'quantity' or 'dispersion'"):
         MetricRef(metric="stratum_dispersion", subject="SPIKE", kind="moment")
 
+
+
+# --------------------------------------------------------------------------
+# The clock a contract's window is measured against
+# --------------------------------------------------------------------------
+
+
+def test_a_live_market_reaches_expiry_and_settles():
+    """Nothing ever settled in a running server, and that was the largest gap.
+
+    There are two clocks here and they were not connected. The kernel counts
+    simulated nanoseconds from zero; a contract's window closes on a calendar
+    date. `Venue._enforce_lifecycle` asks `self._clock() >= instrument.expiry`,
+    and in the live market `_clock` was `None`, so the question was never
+    asked. Wiring it to a wall clock would not have helped either: the kernel
+    would have had to run for a month of real time to reach the date.
+
+    Measured before the calendar existed: after a simulated hour all 47 listed
+    contracts were still `continuous` and the settled set was empty. A position
+    was marked forever and realised never, which leaves an algorithm no
+    terminal event to score itself against.
+
+    The settlement machinery was complete and heavily tested the whole time.
+    `build_market.prior_levels` has always called `settle(spec, oracle)`
+    successfully on every listing, which is the proof the oracle can answer.
+    Nothing in the live path ever asked it.
+
+    The mapping is the one the venue already used rather than a new one:
+    `build_market` scales the breaker windows by `session_seconds / trading
+    day`, so `session_seconds` of simulated time is already one trading day.
+    Here a ten second day makes the four-week window close after 280 simulated
+    seconds instead of 16,800.
+    """
+    market = build(seed=7, session_seconds=10.0)
+    market.kernel.start()
+    venue = market.venue
+
+    assert market.calendar is not None, "the live market has no contract clock"
+    opened = market.calendar.now()
+
+    settled_at = {}
+    for moment in range(20, 340, 20):
+        market.kernel.advance(until=seconds(moment))
+        market.calendar.advance_to(moment)
+        for symbol in market.settle_due():
+            settled_at.setdefault(symbol, moment)
+        assert int(venue.conservation_check()) == 0, f"leaked at t={moment}"
+
+    assert market.calendar.now() > opened, "the contract calendar never moved"
+
+    listed = set(venue.registry.symbols)
+    assert set(venue.settled_symbols) == listed, (
+        f"{len(listed) - len(venue.settled_symbols)} contracts never settled"
+    )
+
+    # The weeklies expire first, and that ordering is the check that the
+    # calendar is being compared against each contract's *own* window rather
+    # than against one exchange-wide deadline.
+    weekly = {s for s in listed if s.endswith(("_W1", "_W2"))}
+    monthly = {s for s in listed if s.endswith("_WR_FUT")}
+    assert weekly and monthly, "the fixture no longer lists both tenors"
+    assert max(settled_at[s] for s in weekly) < max(settled_at[s] for s in monthly), (
+        "a one-week contract outlived a four-week one"
+    )
+
+
+def test_nothing_trades_after_its_window_closes():
+    """The outcome is determined, so anyone still trading knows the answer.
+
+    This is the rule `_enforce_lifecycle` exists for, and until the live venue
+    had a clock it could not fire there at all.
+    """
+    market = build(seed=7, session_seconds=10.0)
+    market.kernel.start()
+    for moment in range(20, 340, 20):
+        market.kernel.advance(until=seconds(moment))
+        market.calendar.advance_to(moment)
+        market.settle_due()
+
+    from arena.exchange.session import SessionState
+
+    venue = market.venue
+    for symbol in venue.registry.symbols:
+        assert venue.session(symbol) is SessionState.CLOSED, (
+            f"{symbol} is still open after its window closed"
+        )
+    assert int(venue.conservation_check()) == 0
