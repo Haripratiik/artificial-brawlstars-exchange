@@ -46,6 +46,18 @@ answer rather than a belief:
     options market maker actually faces -- but it is wrong in a way that
     responds to evidence rather than in a way that was typed in.
 
+The event contracts are on the same ladder, for the same reason and by the
+same arithmetic. A binary struck at a level is a digital on the forward the
+calls are written on, so ``P(F > K)`` prices it and that is the same quantity
+``call_delta`` already computes for the ladder. Left off it, they were quoted
+by the plain maker's exponential average of their own prints, which on a claim
+settling at zero or one is an average of a quantity that takes neither value
+until it resolves, and which stops being an estimator at all once the book
+stops trading. Measured on seed 7 over 600s: every event contract was dead
+inside two minutes, `CROW_GT47` spent the remaining eight marked at 0.40
+against a settlement of 1.00, and `SPIKE_GT47` took every one of its passive
+fills on the same side.
+
 Inventory is skewed in the underlying, not per strike, and that is not a
 detail. The plain maker skews each book by a fraction of *that contract's*
 settlement range, which is sensible for a future worth half its range and
@@ -63,7 +75,7 @@ from scipy.special import betainc
 
 from arena.agents.market_maker import MarketMaker
 from arena.agents.base import TradePrint
-from arena.contracts.payoff import Call, Linear, Put
+from arena.contracts.payoff import Binary, Call, Linear, Put
 from arena.contracts.spec import ObservationWindow
 from arena.contracts.underlying import Underlying
 from arena.determinism import canonical_json
@@ -72,7 +84,14 @@ from arena.market.instrument import Instrument
 from arena.sim.kernel import SimulationContext
 from arena.sim.time import Duration, millis, seconds
 
-__all__ = ["SurfaceMarketMaker", "ChainMember", "derive_chains", "option_value", "call_delta"]
+__all__ = [
+    "SurfaceMarketMaker",
+    "ChainMember",
+    "derive_chains",
+    "option_value",
+    "digital_value",
+    "call_delta",
+]
 
 
 def _key(underlying: Underlying, window: ObservationWindow) -> str:
@@ -82,24 +101,71 @@ def _key(underlying: Underlying, window: ObservationWindow) -> str:
 
 
 class ChainMember:
-    """One option, and the future whose price it is quoted off."""
+    """One derivative, and the future whose price it is quoted off.
 
-    __slots__ = ("underlying_symbol", "strike", "scale", "is_call")
+    ``strike`` is always in the future's price units, which is what lets a
+    binary sit in the same ladder as the options. An option's strike is
+    already quoted that way; a binary's threshold is stated in the metric's
+    own units, so it is carried onto the price grid by the future's scale.
+    That is not a convention chosen here, it is the same identity the payoff
+    classes already use: a future settles at ``scale * level``, so the level
+    crossing ``threshold`` is the future crossing ``threshold * scale``.
+    """
 
-    def __init__(self, underlying_symbol: str, strike: float, scale: float, is_call: bool):
+    __slots__ = (
+        "underlying_symbol",
+        "strike",
+        "scale",
+        "is_call",
+        "is_digital",
+        "above",
+        "payout",
+    )
+
+    def __init__(
+        self,
+        underlying_symbol: str,
+        strike: float,
+        scale: float,
+        is_call: bool,
+        is_digital: bool = False,
+        above: bool = True,
+        payout: float = 0.0,
+    ):
         self.underlying_symbol = underlying_symbol
         self.strike = strike
         self.scale = scale
         self.is_call = is_call
+        self.is_digital = is_digital
+        # Which side of the threshold pays, read off the contract's own
+        # comparison rather than assumed. Under a continuous law ``>`` and
+        # ``>=`` are the same probability, so only the direction survives.
+        self.above = above
+        self.payout = payout
 
 
 def derive_chains(instruments: dict[str, Instrument]) -> dict[str, ChainMember]:
-    """Match every listed option to the listed future it is written on.
+    """Match every listed derivative to the listed future it is written on.
 
     Read out of the contracts rather than configured, so listing a new strike
     makes it quotable with no code change -- and an option whose underlying
     future is not listed is simply left to the plain maker, because there is
     nothing to anchor it to.
+
+    Binaries belong here for the same reason the calls do, and leaving them out
+    was the same defect arriving through a different door. A binary struck at
+    a level is a digital on the same forward as the call struck at that level
+    times the scale, so a distribution that prices one prices the other; a
+    process that has never heard of the strike next to it prices neither.
+    Measured on seed 7 before they joined, over 600s: every event contract in
+    the market stopped trading inside two minutes, the maker's print average
+    froze wherever it happened to be when the last trade printed, and
+    `CROW_GT47` spent the remaining eight minutes marked at 0.40 against a
+    settlement of 1.00. Its passive flow imbalance was +0.43 and `SPIKE_GT47`
+    was +1.00, meaning every passive fill on it landed on the same side without
+    exception. A print average is not merely a poor estimator of a probability,
+    it is not an estimator at all once the book it feeds on has stopped
+    trading, and a book quoted at 0.40 against a certainty is what stops it.
     """
     futures: dict[str, tuple[str, float]] = {}
     for symbol, instrument in sorted(instruments.items()):
@@ -115,15 +181,40 @@ def derive_chains(instruments: dict[str, Instrument]) -> dict[str, ChainMember]:
     chain: dict[str, ChainMember] = {}
     for symbol, instrument in sorted(instruments.items()):
         payoff = instrument.spec.payoff
-        if not isinstance(payoff, (Call, Put)):
+        if not isinstance(payoff, (Call, Put, Binary)):
             continue
         found = futures.get(_key(instrument.spec.underlying, instrument.spec.window))
-        if found is None or found[1] != payoff.scale:
+        if found is None:
+            continue
+        underlying_symbol, scale = found
+        if isinstance(payoff, Binary):
+            # A binary carries no scale of its own, because its settlement
+            # range is the payout and says nothing about the underlying. The
+            # future supplies the only scale in the relationship, and the
+            # threshold is stated in the same units the future's scale
+            # multiplies, so the two compose without a conversion.
+            if not scale or payoff.payout == 0.0:
+                continue
+            chain[symbol] = ChainMember(
+                underlying_symbol=underlying_symbol,
+                strike=payoff.threshold * scale,
+                scale=scale,
+                # Nothing reads ``is_call`` on a digital: every path that
+                # branches on it checks ``is_digital`` first. It is set rather
+                # than left to a default so the field never carries a claim
+                # that a reader could take at face value.
+                is_call=True,
+                is_digital=True,
+                above=payoff.comparison.startswith(">"),
+                payout=payoff.payout,
+            )
+            continue
+        if scale != payoff.scale:
             continue
         chain[symbol] = ChainMember(
-            underlying_symbol=found[0],
+            underlying_symbol=underlying_symbol,
             strike=payoff.strike,
-            scale=payoff.scale,
+            scale=scale,
             is_call=isinstance(payoff, Call),
         )
     return chain
@@ -146,6 +237,34 @@ def call_delta(forward: float, strike: float, scale: float, concentration: float
         return 0.0
     a, b = concentration * mean, concentration * (1.0 - mean)
     return float(1.0 - betainc(a, b, threshold))
+
+
+def digital_value(
+    forward: float,
+    strike: float,
+    scale: float,
+    concentration: float,
+    above: bool,
+    payout: float,
+) -> float:
+    """What a contract paying ``payout`` on one side of ``strike`` is worth.
+
+    The same distribution the calls are priced off, read at one point instead
+    of integrated over a tail, so the digital and the call ladder cannot
+    disagree about the probability of the same event. That is the property the
+    whole class exists to hold: a digital struck at K priced independently of
+    the call struck at K is two beliefs about one question, and the difference
+    between them is free money in whichever direction it happens to fall.
+
+    It is also the reason a binary can be quoted at all here. The plain maker
+    prices it from an average of its own prints, which on a contract settling
+    at zero or one is an average of a quantity that only ever takes two values
+    and mostly takes neither, because the book stops trading long before it
+    resolves. This is a probability computed from a forward that is still
+    trading, so it keeps moving when the binary's own book does not.
+    """
+    probability = call_delta(forward, strike, scale, concentration)
+    return payout * (probability if above else 1.0 - probability)
 
 
 def option_value(
@@ -237,6 +356,34 @@ class SurfaceMarketMaker(MarketMaker):
         # Net delta, in underlying-equivalent lots, at which that skew is
         # reached. Defaults to a full position in the underlying itself.
         self.delta_limit = float(delta_limit or self.position_limit)
+        # There is no vega limit here, and one was written, measured and taken
+        # back out rather than left as an omission. The gap it was aimed at is
+        # real and is recorded in :meth:`_net_options`: a delta limit is
+        # structurally blind to a short straddle, and this maker finishes short
+        # 30,768 option lots on seed 7 over 600s, short on 56 of the 60
+        # contract and maker pairs it holds, pinned at the per contract limit
+        # on several strikes and therefore showing no offer on them at all.
+        #
+        # Skewing the dispersion on net option lots, one over ``1 + k * pull``
+        # with ``pull`` the net position over a limit, does not touch it. With
+        # the limit at a full position in one contract, 1,200 lots, and a net
+        # option position near -15,000, the pull is clamped to -1 on every
+        # requote from the first minute onward, so it is not a limit at all,
+        # it is a constant multiplier on the width. Measured with ``k = 0.5``,
+        # a doubling: the net option position moved from -14,618 to -14,278,
+        # a 2% dent, and `test_every_strike_stays_quotable` failed on a
+        # different strike rather than passing.
+        #
+        # It saturates because the miss is not a couple of standard deviations,
+        # it is a factor of six, and it is a factor of six for a reason no
+        # inventory signal can supply. Realised print dispersion is a one step
+        # forecast error; settlement uncertainty is that error compounded over
+        # the steps remaining. The correction is a square root of a horizon,
+        # and the horizon is a calendar quantity while everything this agent
+        # can see is kernel nanoseconds. Those are the two clocks nothing
+        # connects. A limit set to bind would have to be a number chosen to
+        # land on the informed traders' own posterior width, which is fitting
+        # the answer.
         self._variance: dict[str, float] = {}
         self._prints: dict[str, int] = {}
         self._variance_at: dict[str, int] = {}
@@ -287,10 +434,22 @@ class SurfaceMarketMaker(MarketMaker):
         return variance**0.5 * float(self.instruments[symbol].tick_size)
 
     def concentration_for(
-        self, symbol: str, forward: float, scale: float, now: int = 0
+        self,
+        symbol: str,
+        forward: float,
+        scale: float,
+        now: int = 0,
+        sigma: float | None = None,
     ) -> float | None:
-        """Beta concentration implied by that dispersion."""
-        sigma = self.dispersion_for(symbol, now)
+        """Beta concentration implied by that dispersion.
+
+        ``sigma`` overrides the tape's own estimate, so a caller that has
+        already shaded the width for its inventory gets a concentration that
+        agrees with the width it is quoting. Omitted, it reads the tape, which
+        is what every caller outside :meth:`_requote` wants.
+        """
+        if sigma is None:
+            sigma = self.dispersion_for(symbol, now)
         if sigma is None:
             return None
         level = forward / scale
@@ -334,11 +493,50 @@ class SurfaceMarketMaker(MarketMaker):
             return None
         return float(ticks) * float(self.instruments[symbol].tick_size)
 
+    def _net_options(self, underlying_symbol: str) -> float:
+        """Net option lots held on this underlying, long minus short.
+
+        Reported and not acted on. It is the exposure a delta limit cannot
+        see, because a call and a put struck at the same price have deltas of
+        opposite sign and identical sensitivity to width: the put here is
+        *defined* as ``C - (F - K)`` and neither ``F`` nor ``K`` moves with the
+        dispersion, so a short straddle nets to roughly zero delta while
+        carrying the whole of the width risk. Measured on seed 7 over 600s
+        this reaches -14,618 lots on one maker against a per contract limit of
+        1,200, which is the shape of the surface being too narrow rather than
+        the shape of a position anybody chose. See the constructor for what
+        was tried against it and why it was taken out.
+
+        Digitals are left out and it is not an oversight. An option is worth
+        more the wider the law is, whatever its strike, so its exposure to
+        width has one sign. A digital's does not: struck out of the money it
+        gains from a wider law and struck in the money it loses, so adding one
+        here would cancel an option position that carries real risk against a
+        binary that carries the opposite.
+        """
+        total = 0.0
+        for symbol, member in self.chain.items():
+            if member.underlying_symbol != underlying_symbol or member.is_digital:
+                continue
+            total += float(self.position.get(symbol, 0))
+        return total
+
     def _net_delta(self, underlying_symbol: str, forward: float, now: int = 0) -> float:
-        """Delta of everything held on this underlying, in future-equivalents."""
+        """Delta of everything held on this underlying, in future-equivalents.
+
+        Digitals are counted at zero rather than at ``call_delta``, and the
+        difference is not small. A digital's sensitivity to the forward is the
+        density at its strike, not the probability above it, so charging it the
+        probability would read a position of 300 binary lots as roughly 200
+        future lots. In future-equivalents the real figure is nearer nothing:
+        a lot of `SPIKE_WR_FUT` is worth up to 4,000 currency and a lot of
+        `SPIKE_GT47` is worth at most one, so the whole event ladder is a
+        rounding error against a single future position and pretending
+        otherwise would swing the skew on the option chain for no risk.
+        """
         total = float(self.position.get(underlying_symbol, 0))
         for symbol, member in self.chain.items():
-            if member.underlying_symbol != underlying_symbol:
+            if member.underlying_symbol != underlying_symbol or member.is_digital:
                 continue
             held = self.position.get(symbol, 0)
             if not held:
@@ -362,8 +560,9 @@ class SurfaceMarketMaker(MarketMaker):
         if forward is None:
             super()._requote(ctx, symbol)
             return
+        sigma = self.dispersion_for(member.underlying_symbol, int(ctx.now))
         concentration = self.concentration_for(
-            member.underlying_symbol, forward, member.scale, int(ctx.now)
+            member.underlying_symbol, forward, member.scale, int(ctx.now), sigma
         )
 
         # Inventory moves the underlying, and the whole ladder follows. Skewing
@@ -377,7 +576,6 @@ class SurfaceMarketMaker(MarketMaker):
                 / self.delta_limit,
             ),
         )
-        sigma = self.dispersion_for(member.underlying_symbol, int(ctx.now))
         if sigma is None:
             shifted = forward
         else:
@@ -393,9 +591,27 @@ class SurfaceMarketMaker(MarketMaker):
             # under 20 and put-call parity was out by a thousand. Intrinsic is
             # wrong about time value and right about everything else, including
             # being monotone and convex across strikes.
-            fair = max(0.0, shifted - member.strike)
-            if not member.is_call:
-                fair = max(0.0, member.strike - shifted)
+            #
+            # A digital's zero-volatility limit is the whole payout on one side
+            # of the strike and nothing on the other, which is the same
+            # statement: it is what the contract settles at if the forward is
+            # where it will end.
+            if member.is_digital:
+                pays = shifted > member.strike
+                fair = member.payout if pays is member.above else 0.0
+            else:
+                fair = max(0.0, shifted - member.strike)
+                if not member.is_call:
+                    fair = max(0.0, member.strike - shifted)
+        elif member.is_digital:
+            fair = digital_value(
+                shifted,
+                member.strike,
+                member.scale,
+                concentration,
+                member.above,
+                member.payout,
+            )
         else:
             fair = option_value(
                 shifted, member.strike, member.scale, concentration, member.is_call

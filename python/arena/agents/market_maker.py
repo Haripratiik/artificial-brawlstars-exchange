@@ -105,6 +105,25 @@ class MarketMaker(TradingAgent):
         the flow that is actually lifting or hitting it -- which is precisely
         the adverse-selection channel these experiments exist to measure, and it
         should be visible rather than assumed away.
+
+        The gain is fixed, and one adaptive alternative was measured and
+        rejected rather than merely considered. Splitting the residual into a
+        drift and a magnitude, both smoothed at ``trade_weight``, and using
+        Trigg and Leach's tracking signal ``|drift| / magnitude`` to raise the
+        gain toward one on a run of same-signed residuals is the textbook
+        answer, and here it made the maker 2.2 times worse: on seed 7 over 180s
+        the three makers lost 65.7M against 29.3M, while the share of passive
+        fills carrying a negative effective half spread went the wrong way,
+        from 10.5% to 12.3%. The reason is specific to this market and worth
+        recording. These makers are about 98% of the book, so almost every
+        print lands on one of their own quotes and the residual is ``-half`` or
+        ``+half`` by construction rather than because the price moved. A
+        tracking signal reads that as a trend, the gain saturates at one, the
+        anchor steps onto the last print, and the informed flow then walks the
+        maker's own price wherever it likes. It is the same failure as widening
+        against the markout, arriving through the estimator instead of through
+        the spread: on a market this thin the maker moves the thing it is
+        measuring itself against.
         """
         current = self._anchor.get(print_.symbol)
         price = float(int(print_.price))
@@ -118,47 +137,6 @@ class MarketMaker(TradingAgent):
     def act(self, ctx: SimulationContext) -> None:
         for symbol in sorted(self.instruments):
             self._requote(ctx, symbol)
-
-    def _requote(self, ctx: SimulationContext, symbol: str) -> None:
-        instrument = self.instruments[symbol]
-        inventory = self.position.get(symbol, 0)
-
-        anchor = self._anchor.get(symbol)
-        if anchor is None:
-            anchor = self.reference.get(symbol)
-        if anchor is None:
-            if not self.quote_without_reference:
-                return
-            low, high = instrument.tick_bounds
-            anchor = (int(low) + int(high)) / 2.0
-
-        low, high = instrument.tick_bounds
-        span = max(1.0, float(int(high) - int(low)))
-        skew_per_lot = (span * self.max_skew_fraction) / max(1, self.position_limit)
-        reservation = anchor - inventory * skew_per_lot
-
-        # Widen with inventory. A maker deep in a position is more likely to be
-        # on the wrong side of whatever is driving the market, so the extra
-        # width is compensation for that risk rather than greed.
-        pressure = abs(inventory) / max(1, self.position_limit)
-        half = self.half_spread * (1.0 + 2.0 * pressure)
-
-        bid = Price(int(reservation - half))
-        ask = Price(int(reservation + half) + 1)
-
-        # Respect the limit by simply not adding to the side that would breach
-        # it. Quoting and relying on the venue to reject is worse: it burns
-        # order ids and hides the constraint from the agent's own logic.
-        if inventory < self.position_limit:
-            self.post(ctx, symbol, Side.BUY, bid,
-                       min(self.quote_size, self.position_limit - inventory))
-        else:
-            self.withdraw(ctx, symbol, Side.BUY)
-        if -inventory < self.position_limit:
-            self.post(ctx, symbol, Side.SELL, ask,
-                       min(self.quote_size, self.position_limit + inventory))
-        else:
-            self.withdraw(ctx, symbol, Side.SELL)
 
     def _requote(self, ctx: SimulationContext, symbol: str) -> None:
         instrument = self.instruments[symbol]
