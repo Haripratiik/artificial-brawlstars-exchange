@@ -35,6 +35,7 @@ from arena.contracts.spec import (
 )
 from arena.contracts.underlying import Basket, Difference, Single
 from arena.exchange.types import AgentId
+from arena.market.calendar import Calendar
 from arena.market.instrument import Instrument, InstrumentClass
 from arena.market.live import HUMAN_ID, VENUE_ID, HumanAgent, LiveMarket
 from arena.market.fees import FREE, MAKER_TAKER, FeeSchedule
@@ -443,6 +444,46 @@ def true_levels(listed: list[Instrument]) -> dict[str, float]:
 PRIOR_WINDOW = ObservationWindow(WINDOW.start - timedelta(weeks=4), WINDOW.start)
 
 
+def _prior_scale(spec: ContractSpec) -> float | None:
+    """Carrying a level measured over the prior window onto a contract's own.
+
+    A rate is intensive in window length: a win rate over four weeks and over
+    one week are the same kind of number, so re-dating measures it directly and
+    the answer needs no conversion. A quantity is not, and ``MetricRef.kind``
+    already says so in as many words -- "the amount delivered in March is a
+    different thing from the amount delivered in April". The prior path
+    declared that distinction upstream and then ignored it here.
+
+    Measured before this existed, against the four-week prior window: the two
+    weekly commodities observe one week each, and every informed trader was
+    handed a four-week count as though it were a one-week count. SPIKE_VOL_W1
+    settles at 71.09 and its prior said 274.92, off by 3.87x against a window
+    ratio of 3.87; CROW_VOL_W1, 56.75 against 214.96, 3.79x. The four win-rate
+    futures came back at 1.00 to 1.04x on the same run, which is what says the
+    error was the unit and not the fixture. The market wore it exactly as you
+    would expect: at t=180s SPIKE_VOL_W1 traded 171.93 against a fair 71.10,
+    because six informed agents all believed the same wrong number.
+
+    The conversion is a belief, not a measurement, and that is the right
+    standard for this function -- a prior is what somebody thinks on day one,
+    and this whole fixture exists because opening on history opens wrong. It
+    would not be an acceptable standard anywhere near collateral.
+
+    ``None`` for an underlying that mixes kinds: a difference between a rate
+    and a count is not homogeneous in window length, so there is no conversion
+    to make, and a prior that cannot be converted is no prior.
+    """
+    kinds = {ref.kind for ref in spec.underlying.atoms()}
+    if kinds <= {"rate", "dispersion"}:
+        return 1.0
+    if kinds != {"quantity"}:
+        return None
+    prior_span = PRIOR_WINDOW.end - PRIOR_WINDOW.start
+    if prior_span <= timedelta(0):
+        return None
+    return (spec.window.end - spec.window.start) / prior_span
+
+
 def prior_levels(listed: list[Instrument]) -> dict[str, float]:
     """Where each contract's underlying sat *before* its window opened.
 
@@ -491,8 +532,12 @@ def prior_levels(listed: list[Instrument]) -> dict[str, float]:
             result = settle(spec, oracle)
         except Exception:  # noqa: BLE001 - a prior that cannot be measured is no prior
             continue
-        if result.settled and result.underlying_level is not None:
-            levels[instrument.symbol] = float(result.underlying_level)
+        if not (result.settled and result.underlying_level is not None):
+            continue
+        scale = _prior_scale(instrument.spec)
+        if scale is None:
+            continue
+        levels[instrument.symbol] = float(result.underlying_level) * scale
     return levels
 
 
@@ -620,9 +665,22 @@ def build(
     trading_day = 6.5 * 60 * 60
     scale = session_seconds / trading_day
 
+    # The contract calendar, on the same footing as the breaker windows above:
+    # `session_seconds` of simulated time is one trading day, so a four-week
+    # observation window runs its course in twenty-eight of them.
+    #
+    # Without this the live venue had no clock at all, so
+    # `Venue._enforce_lifecycle` never asked whether a window had closed and
+    # nothing ever settled. Measured before it existed: after a simulated hour
+    # all 47 contracts were still `continuous` and the settled set was empty.
+    # A position was marked forever and realised never, which leaves an
+    # algorithm no terminal event to score itself against.
+    calendar = Calendar(start=WINDOW.start, seconds_per_day=session_seconds)
+
     venue_class = LmsrVenue if scoring_rule else Venue
     venue = venue_class(
         "arena-lmsr" if scoring_rule else "arena",
+        clock=calendar.now,
         starting_cash=40_000_000,
         fees=fees,
         price_band=price_band,
@@ -817,6 +875,11 @@ def build(
         human=human,
         agents=agents,
         speed=speed,
+        calendar=calendar,
+        # Bound to the same oracle every other settlement in this module uses,
+        # so a contract that settles live gets exactly the value
+        # `prior_levels` and `true_values` would have computed for it.
+        settlement_source=lambda spec: settle(spec, _world()[2]),
         # So a person who signs in gets an account they can read a profit
         # against, at the same distance from the exchange as anyone else at a
         # browser -- rather than the bots' balance sheet and the default wire.
