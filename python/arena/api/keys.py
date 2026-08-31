@@ -145,6 +145,14 @@ class KeyStore:
     """
 
     keys: dict[str, ApiKey] = field(default_factory=dict)
+    # Signatures already accepted, and when they stop being worth remembering.
+    #
+    # The skew window is the hole this closes. A signature covers the request
+    # it accompanies, so a captured one cannot be moved onto a different order,
+    # but nothing stopped it being sent again *as itself* for up to thirty
+    # seconds. `DELETE /v1/orders` is in that window, and so is any order worth
+    # replaying twice.
+    _spent: dict[str, float] = field(default_factory=dict, repr=False)
 
     def issue(self, agent_id: str, label: str = "") -> ApiKey:
         """Mint a credential for one seat.
@@ -180,6 +188,10 @@ class KeyStore:
 
     def clear(self) -> None:
         self.keys.clear()
+        # The spent set goes with them. Every signature in it was made against
+        # a secret that no longer exists, so it can never be presented again,
+        # and keeping it would leak a little memory on every rebuild.
+        self._spent.clear()
 
     def verify(
         self,
@@ -214,4 +226,24 @@ class KeyStore:
         expected = sign(key.secret, method, path, timestamp, body)
         if not hmac.compare_digest(expected, signature or ""):
             raise SignatureError("could not authenticate this request")
+
+        # Authentic, and now also spent.
+        #
+        # Checked here rather than with the timestamp, even though checking it
+        # earlier would be cheaper, because an unauthentic signature must not be
+        # able to put anything in this table. Remembering every forged signature
+        # a stranger sends is a memory exhaustion attack that needs no
+        # credential at all, and the cheap-refusal ordering that makes the skew
+        # check come first is exactly what would have caused it.
+        if signature in self._spent:
+            raise SignatureError("could not authenticate this request")
+        # Nothing outside the skew window can be replayed anyway, so an entry
+        # older than that is dead weight. Swept on insert rather than on a timer
+        # because there is no timer here, and bounded by a size check so the
+        # sweep cost is amortised rather than paid on every request.
+        if len(self._spent) > 512:
+            self._spent = {
+                seen: expires for seen, expires in self._spent.items() if expires > clock
+            }
+        self._spent[signature] = sent_at + MAX_SKEW_SECONDS
         return key

@@ -73,7 +73,7 @@ silently reintroduces the error the venue spent its life avoiding.
 
 ---
 
-## Five bug classes that have each bitten more than once
+## Six bug classes that have each bitten more than once
 
 If you are about to touch one of these areas, read the relevant entry first.
 Each of these recurred *after* being fixed once, which is why they are here
@@ -81,12 +81,26 @@ rather than in a changelog.
 
 ### 1. Units crossing a boundary in the wrong unit
 
-**Four instances.** A settlement value stored in ticks and rendered as a price
+**Five instances.** A settlement value stored in ticks and rendered as a price
 (18,677 against a real 4,663). Account equity published in minor units and
 rendered by the money formatter (`"143745.00M"` next to a header reading
-`143.7k`). Halt records published in ticks under columns headed "Price". And
+`143.7k`). Halt records published in ticks under columns headed "Price".
 `fees_collected` published in minor units with the browser silently correcting
-it with `/ 1e6`.
+it with `/ 1e6`. And the one that was not a display bug at all:
+`build_market.prior_levels` re-dated every contract onto a four-week prior
+window without rescaling a **quantity**, so `SPIKE_VOL_W1` observes one week,
+settles at 71.09, and handed all six informed traders a prior of 274.92. The
+ratio was 3.87x against a window ratio of 3.87. The four win-rate futures came
+back at 1.00 to 1.04x on the same run, which is what said the error was the
+unit and not the fixture, because a rate is scale-invariant in window length
+and a count is not.
+
+That last one is worth dwelling on, because the type system had already said
+so. `MetricRef.kind` distinguishes `rate` from `quantity` and its comment reads
+"the amount delivered in March is a different thing from the amount delivered
+in April". The distinction was declared upstream and ignored downstream, and
+the market wore it: at t=180s the contract traded 171.93 against a fair 71.10,
+so any strategy measured on that book was harvesting the artifact.
 
 The pattern is always the same: a number crosses a boundary in a unit its label
 does not claim, **one consumer compensates**, and every other consumer is
@@ -159,6 +173,42 @@ straight across the hole.
 
 **Rule: never silently discard something a consumer has not seen. Hold it,
 flush it, or tell them explicitly that they lost it.**
+
+### 6. A check that never fires because its input was never wired
+
+The venue has always had the right rule: `_enforce_lifecycle` closes a symbol
+once `self._clock() >= instrument.expiry`, so nobody trades against an outcome
+that is already determined. It was correct, it was tested, and in the live
+market it never ran once -- because `_clock` was `None` and the question was
+therefore never asked.
+
+Measured: after a simulated hour, all 47 listed contracts were still
+`continuous` and the settled set was empty. Positions were marked forever and
+realised never. The settlement machinery was complete the whole time;
+`build_market.prior_levels` had been calling `settle(spec, oracle)`
+successfully on every listing since long before anyone noticed the live path
+never did.
+
+The root cause is worth naming because it generalises: **there were two clocks
+and nothing connected them.** The kernel counts simulated nanoseconds from
+zero; a contract expires on a calendar date. Neither is wrong and they could
+never meet.
+
+The same shape, arriving by a different door, in `StrategyAgent`: a `Filled`
+does not carry its symbol. The venue runs one private channel per book and the
+symbol arrives with the envelope, so a handler written as
+`getattr(event, "symbol", None)` reads `None` on every fill, returns early, and
+books nothing. Measured before it was found: 386 fills moved the agent's ledger
+by exactly zero, no exception, no warning, and the positions still looked right
+because the base class tracked those separately. `getattr` with a default is
+the same hazard as an unwired clock, because both turn a missing input into a
+silent no-op rather than a failure.
+
+**Rule: a guard whose input can be `None` is a guard that can silently not
+exist, and `getattr(x, "field", None)` manufactures exactly that. When you find
+one, check what supplies it in production, not in the test that covers it.**
+The test suite had settlement covered thoroughly, and every one of those tests
+supplied its own clock.
 
 ---
 
