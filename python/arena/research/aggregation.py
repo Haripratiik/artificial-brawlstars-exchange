@@ -320,9 +320,30 @@ def benjamini_hochberg(comparisons: Sequence[Comparison]) -> list[Comparison]:
     which matters when the comparisons are correlated -- and these are, since
     every rung is computed from the same agents.
     """
-    ordered = sorted(range(len(comparisons)), key=lambda i: comparisons[i].p_value)
-    total = len(comparisons)
-    adjusted = [float("nan")] * total
+    # A comparison whose p-value could not be computed is not a test, and
+    # counting it as one corrupts every comparison that *was* computed.
+    #
+    # `paired_comparison` returns an all-NaN result below three trials rather
+    # than raising, and scipy's paired t-test on two identical arms is 0/0, so
+    # a NaN here is an ordinary thing to be handed rather than a pathology.
+    #
+    # Measured on p-values 0.001, 0.04, 0.30 and 0.90, which adjust to 0.004,
+    # 0.080, 0.400 and 0.900. Adding a single NaN row moved them to 0.005,
+    # 0.100, 0.500 and 1.000: it inflated `total` from four to five, so every
+    # real p-value was multiplied by 5/4 and one of them crossed 0.05 in the
+    # wrong direction. The NaN row itself came out as **1.0** rather than NaN,
+    # because `min(previous, nan)` returns `previous`, so a comparison nobody
+    # could compute reported "not significant" as though it had been tested.
+    # Sorting was unreliable for the same reason: every comparison against NaN
+    # is False, so the NaN sat wherever the sort happened to leave it.
+    real = [
+        index
+        for index in range(len(comparisons))
+        if math.isfinite(comparisons[index].p_value)
+    ]
+    ordered = sorted(real, key=lambda i: comparisons[i].p_value)
+    total = len(real)
+    adjusted = [float("nan")] * len(comparisons)
     previous = 1.0
     for rank, index in enumerate(reversed(ordered), start=1):
         position = total - rank + 1

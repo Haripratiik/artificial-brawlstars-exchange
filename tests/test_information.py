@@ -281,6 +281,37 @@ def test_benjamini_hochberg_matches_a_hand_computed_case():
     assert adjusted == pytest.approx([0.004, 0.016, 0.041, 0.041])
 
 
+def test_a_comparison_that_could_not_be_computed_does_not_correct_the_others():
+    """A NaN is not a test, and counting it as one weakened every real result.
+
+    `paired_comparison` returns all-NaN below three trials rather than raising,
+    and scipy's paired t-test on two identical arms is 0/0, so being handed one
+    is ordinary. Measured before the fix, on 0.001, 0.04, 0.30 and 0.90, which
+    correct to 0.004, 0.080, 0.400 and 0.900: adding one NaN row moved them to
+    0.005, 0.100, 0.500 and 1.000, because it counted toward the total and
+    multiplied every real p-value by 5/4. One of them crossed 0.05 the wrong
+    way purely because a fifth comparison had failed to compute.
+
+    The NaN row itself came back as 1.0 rather than NaN, since
+    `min(previous, nan)` returns `previous`, so a comparison nobody could
+    compute reported "not significant" as though it had been tested.
+    """
+    raw = [0.001, 0.04, 0.30, 0.90]
+    expected = [c.p_adjusted for c in benjamini_hochberg([_comparison(p) for p in raw])]
+
+    with_nan = benjamini_hochberg(
+        [_comparison(p) for p in raw] + [_comparison(float("nan"))]
+    )
+    assert [c.p_adjusted for c in with_nan[:-1]] == pytest.approx(expected)
+    assert math.isnan(with_nan[-1].p_adjusted)
+
+
+def test_every_comparison_failing_to_compute_corrects_nothing():
+    """No tests were run, so no correction is owed and none is invented."""
+    adjusted = benjamini_hochberg([_comparison(float("nan")) for _ in range(3)])
+    assert all(math.isnan(c.p_adjusted) for c in adjusted)
+
+
 def test_benjamini_hochberg_is_monotone_and_never_lowers_a_p_value():
     raw = [0.5, 0.01, 0.2, 0.049]
     results = benjamini_hochberg([_comparison(p) for p in raw])
