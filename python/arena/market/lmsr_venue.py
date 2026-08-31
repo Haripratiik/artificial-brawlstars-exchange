@@ -120,6 +120,22 @@ class LmsrBook:
             ask = self._clamp(ask + 1)
         return Price(ask) if ask <= self.high else None
 
+    def best_priced(self, side: Side) -> Price | None:
+        """The same touch, because there is nothing here to leave out.
+
+        The order book's version of this filters market-on-open interest,
+        which rests at a sentinel so that it crosses everything in the call.
+        A scoring-rule market holds no orders at all -- the touch is a function
+        of the outstanding quantity -- so there is no sentinel to hide and the
+        two questions have one answer.
+
+        Present so that the two venues answer the same question by the same
+        name. `VenueAgent.top_of_book` serves both and had to move to
+        `best_priced` to stop publishing the sentinel; without this it raised
+        `AttributeError` on every LMSR market instead.
+        """
+        return self.best_price(side)
+
     def shares_to_reach(self, ticks: int) -> float:
         """Net position at which the marginal price would be ``ticks``."""
         return self.market.shares_for_price(ticks * self.tick)

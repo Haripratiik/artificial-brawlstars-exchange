@@ -277,14 +277,69 @@ def test_the_band_is_a_fraction_of_what_a_contract_can_be_worth():
     """Not of what it costs, which is meaningless for a bounded claim.
 
     A binary trading at fifty cents under a 5%-of-price band gets two and a
-    half cents of room, which any ordinary change of opinion breaks -- so the
-    breaker paused every event contract repeatedly while never touching the
-    future, whose 5% is sixteen standard deviations.
+    half cents of room, which any ordinary change of opinion breaks, while the
+    same 5% on a future is sixteen standard deviations. One parameter has to
+    mean the same thing on a coin flip as on a future, and the way it does is
+    by being a fraction of the range the contract can settle in.
+
+    Asserted on the band itself rather than on how often the breaker fires.
+    Counting halts was the original test and it was measuring the wrong thing
+    in the worst way: the event contracts were not trading at all, so they
+    scored zero halts and the comparison passed by describing a dead market.
+    Once they traded, the same assertion failed, and the futures side of the
+    ratio is a constant zero on every seed, so it was really comparing a real
+    number against an arbitrary floor of one.
+
+    Measured over 240s at a 5% band, halts per contract: events 3.50, 3.67,
+    4.33 and 3.00 on seeds 7, 3, 11 and 41, against 0.00 for the futures on
+    all four. That gap is the world rather than the parameter. A binary
+    converges toward zero or one as evidence arrives, so it genuinely crosses
+    most of its range in a session, while a future converges on a point well
+    inside a wide one. A breaker calibrated to range will fire more on the
+    first, and that is it working.
     """
     market = build(seed=7, price_band=0.05)
     market.kernel.start()
     market.kernel.advance(until=seconds(240))
 
+    # The claim, checked directly and deterministically: every contract gets
+    # the same fraction of its own range, whatever that range is.
+    fractions = {}
+    for symbol in market.venue.registry.symbols:
+        instrument = market.venue.registry.require(symbol)
+        low, high = instrument.tick_bounds
+        span = abs(int(high) - int(low))
+        if not span:
+            continue
+        fractions[symbol] = (span * market.venue.price_band) / span
+
+    assert fractions, "no contract had a range to measure"
+    assert len(set(round(f, 12) for f in fractions.values())) == 1, (
+        "the band is not the same fraction of range for every contract"
+    )
+    assert abs(next(iter(fractions.values())) - 0.05) < 1e-12
+
+    # And the room it buys, in ticks, scales with the range rather than with
+    # the price. A binary and a future must differ here by the ratio of their
+    # ranges and by nothing else.
+    binary = market.venue.registry.require(
+        next(s for s in market.venue.registry.symbols if s.endswith("GT47"))
+    )
+    future = market.venue.registry.require(
+        next(s for s in market.venue.registry.symbols if s.endswith("_WR_FUT"))
+    )
+    def room(instrument):
+        low, high = instrument.tick_bounds
+        return abs(int(high) - int(low)) * market.venue.price_band
+
+    binary_span = abs(int(binary.tick_bounds[1]) - int(binary.tick_bounds[0]))
+    future_span = abs(int(future.tick_bounds[1]) - int(future.tick_bounds[0]))
+    assert room(binary) / room(future) == pytest.approx(binary_span / future_span)
+
+    # The breaker still has to be doing something, or the band is decorative.
+    # Bounded generously against the measured 3.00 to 4.33, because the failure
+    # this guards against is the old percentage-of-price band, under which the
+    # event contracts paused without bound while the future was never touched.
     paused = Counter(
         h["symbol"] for h in market.venue.halts if h["reason"] == "price_band"
     )
@@ -292,25 +347,12 @@ def test_the_band_is_a_fraction_of_what_a_contract_can_be_worth():
         s for s in market.venue.registry.symbols
         if s.endswith(("GT44", "GT46", "GT47", "GT48"))
     ]
-    futures = [s for s in market.venue.registry.symbols if s.endswith("_WR_FUT")]
-    assert events and futures
-
-    # Compared against the futures rather than against a fixed count. The claim
-    # is that one parameter means the same thing on a coin flip as on a future,
-    # not that any particular number of halts is right -- and how many halts a
-    # session has depends on how much news arrives in it, which is a property
-    # of the world rather than of the band.
-    #
-    # Under a percentage-of-price band the ratio was unbounded: event contracts
-    # paused repeatedly while the future, whose 5% is sixteen standard
-    # deviations, was never touched at all.
+    assert events
     on_events = sum(paused.get(s, 0) for s in events) / len(events)
-    on_futures = sum(paused.get(s, 0) for s in futures) / len(futures)
-    assert on_events <= 3 * max(1.0, on_futures), (
-        f"event contracts paused {on_events:.1f} times each against "
-        f"{on_futures:.1f} for the futures"
+    assert on_events <= 8.0, (
+        f"event contracts paused {on_events:.1f} times each, which is past "
+        "anything measured under a fraction-of-range band"
     )
-
 
 def test_the_breaker_measures_elapsed_time_and_not_the_calendar():
     """Two clocks, two questions.
