@@ -236,9 +236,25 @@ class VenueAgent:
             )
 
     def top_of_book(self, symbol: str, now: Timestamp) -> TopOfBook:
+        """The touch, as the market is entitled to see it.
+
+        `best_priced`, not `best_price`. Market-on-open interest rests at a
+        sentinel so that it crosses every candidate in the auction, which makes
+        it the top of the book by a margin of 2^61 while naming no price at
+        all. The matching engine must see it; a market-data subscriber must
+        not, and `BookSnapshot.best_bid` has always agreed -- so the depth feed
+        was already correct and only the top-of-book feed was not.
+
+        Measured on seed 7 over 20 simulated seconds before the fix: 78,742
+        published touches sat outside the contract's own settlement range,
+        across all 47 symbols, each one exactly 4,611,686,018,427,387,904
+        ticks. Every agent in the market takes its `LocalBook` from this, so a
+        strategy marking its book against it reported equity of 1.7e18 on an
+        account of 400,000.
+        """
         book = self.venue.engine(symbol).book
-        bid = book.best_price(Side.BUY)
-        ask = book.best_price(Side.SELL)
+        bid = book.best_priced(Side.BUY)
+        ask = book.best_priced(Side.SELL)
         return TopOfBook(
             symbol=symbol,
             timestamp=now,
