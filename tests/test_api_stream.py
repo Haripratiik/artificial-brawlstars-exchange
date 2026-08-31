@@ -1540,19 +1540,32 @@ def test_a_reset_arrives_when_the_private_cursor_is_invalidated():
         # right to say nothing.
         stalled = {blotter_identity(entry) for entry in log}
 
-        # Driven until that is true rather than for a fixed number of rounds:
-        # the same wall-clock second buys a different amount of simulated
-        # market depending on what else the suite is doing.
-        deadline = time.monotonic() + 30.0
-        while any(blotter_identity(entry) in stalled for entry in log):
-            if time.monotonic() > deadline:
-                raise AssertionError(
-                    f"the blotter window never slid past the cursor: "
-                    f"{len(log)} entries, {len(stalled)} of them from the stall"
-                )
+        # Bounded by ROUNDS, not by wall-clock seconds.
+        #
+        # It was a 30 second deadline, and that made the test a measurement of
+        # how busy the machine was rather than of whether the window slides.
+        # Every round here does a deterministic amount of work -- `push` queues
+        # a fixed number of orders and `step_market` advances the kernel by
+        # simulated time, neither of which cares how long a second takes -- so
+        # a slow machine needs the same number of rounds, just more seconds to
+        # run them. Under the full suite it ran out of seconds and failed while
+        # making perfectly good progress. Passing alone and failing in the
+        # suite is the signature of exactly this, and never of a real defect.
+        #
+        # The blotter holds 200 entries and each round pushes 150, so a
+        # handful of rounds is enough; forty is loose enough to never be the
+        # thing that fails and tight enough to catch a genuine stall.
+        for _ in range(40):
+            if not any(blotter_identity(entry) in stalled for entry in log):
+                break
             push(150)
             await step_market(6)
             log = runner.market.traders[seat].log
+        else:
+            raise AssertionError(
+                f"the blotter window never slid past the cursor in 40 rounds: "
+                f"{len(log)} entries, {len(stalled)} of them from the stall"
+            )
 
         turned_over = len(log)
         socket.gate.set()

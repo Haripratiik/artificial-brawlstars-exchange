@@ -87,7 +87,7 @@ from arena.api.keys import (
     KeyStore,
     SignatureError,
 )
-from arena.exchange.types import OrderType, TimeInForce
+from arena.exchange.types import OrderType, PegReference, TimeInForce
 from arena.portfolio.money import from_money
 
 __all__ = ["router", "configure", "Seat", "signed_path"]
@@ -1773,15 +1773,26 @@ async def fills(request: Request, limit: str | None = None) -> dict[str, Any]:
     202 that accepted them. A blotter that showed only what traded would answer
     "nothing happened" to all four.
 
+    ``amendments`` is the third list, and it is here rather than nowhere for
+    the same argument. A replace's whole observable outcome is
+    ``kept_priority``, which is a fact about what the engine did and cannot be
+    inferred from the resulting order -- an order for six at 100 looks
+    identical whether it kept its place in the queue or went to the back of it.
+    Without this list a client could send an amendment through
+    ``PATCH /v1/orders/{symbol}/{order_id}`` and never learn what it cost,
+    which would make a REST client less capable than the page. It is also the
+    only place a **pegged** order's tracking is visible: the engine emits one
+    of these every time the reference moves.
+
     ``?after=<fill_id>`` returns only fills strictly after that id, the way
-    Binance's ``myTrades?fromId=`` does, and ``?after_rejection=`` does the same
-    for the other list. This is the endpoint a reconnecting algorithm resumes
-    from: without a monotonic cursor it cannot tell a fill it has already booked
-    from one it has not, and the only safe reading of an ambiguous blotter is to
-    re-book everything or none of it. Two cursors rather than one because they
-    number two different sequences -- fill 12 and rejection 12 are unrelated
-    events -- and a single ``after`` applied to both would silently drop from
-    one of them.
+    Binance's ``myTrades?fromId=`` does, and ``?after_rejection=`` and
+    ``?after_amendment=`` do the same for the other two. This is the endpoint a
+    reconnecting algorithm resumes from: without a monotonic cursor it cannot
+    tell a fill it has already booked from one it has not, and the only safe
+    reading of an ambiguous blotter is to re-book everything or none of it.
+    Three cursors rather than one because they number three different sequences
+    -- fill 12, rejection 12 and amendment 12 are unrelated events -- and a
+    single ``after`` applied to all of them would silently drop from two.
 
     Ordering stays newest-first even under a cursor, which is worth stating
     because Binance's ascending order is the more usual choice for one. It costs
@@ -1797,6 +1808,7 @@ async def fills(request: Request, limit: str | None = None) -> dict[str, Any]:
     params = request.query_params
     after = _cursor(params.get("after"), "after")
     after_rejection = _cursor(params.get("after_rejection"), "after_rejection")
+    after_amendment = _cursor(params.get("after_amendment"), "after_amendment")
     # Before the ids are looked up, so that a fill on an order this API has not
     # yet tied to its client id still comes back named.
     _reconciled(caller)
@@ -1809,6 +1821,7 @@ async def fills(request: Request, limit: str | None = None) -> dict[str, Any]:
     # the simulation.
     executions = [dict(entry) for entry in log if entry.get("type") == "fill"]
     refusals = [dict(entry) for entry in log if entry.get("type") == "reject"]
+    amendments = [dict(entry) for entry in log if entry.get("type") == "replace"]
     # Numbered before the cursor is applied and before the page is cut, because
     # an id has to mean the same thing whatever was asked for. Numbering the
     # page would make the id a property of the request.
@@ -1816,13 +1829,21 @@ async def fills(request: Request, limit: str | None = None) -> dict[str, Any]:
     reject_cursor = _numbered(
         refusals, int(getattr(who, "rejects", len(refusals))), "rejection_id"
     )
+    amend_cursor = _numbered(
+        amendments, int(getattr(who, "amendments", len(amendments))), "amendment_id"
+    )
     if after is not None:
         executions = [entry for entry in executions if entry["fill_id"] > after]
     if after_rejection is not None:
         refusals = [entry for entry in refusals if entry["rejection_id"] > after_rejection]
+    if after_amendment is not None:
+        amendments = [
+            entry for entry in amendments if entry["amendment_id"] > after_amendment
+        ]
     executions = executions[-page:][::-1]
     refusals = refusals[-page:][::-1]
-    for entry in executions:
+    amendments = amendments[-page:][::-1]
+    for entry in executions + amendments:
         entry["client_order_id"] = _client_id_for(
             caller.token, entry.get("symbol", ""), entry.get("order_id", -1)
         )
@@ -1836,14 +1857,18 @@ async def fills(request: Request, limit: str | None = None) -> dict[str, Any]:
         "generation": int(getattr(_runner(), "generation", 0)),
         "fills": executions,
         "rejections": refusals,
+        "amendments": amendments,
         "cursor": {
             "after": after,
             "after_rejection": after_rejection,
+            "after_amendment": after_amendment,
             "fills": fill_cursor,
             "rejections": reject_cursor,
+            "amendments": amend_cursor,
         },
         "count": len(executions),
         "rejection_count": len(refusals),
+        "amendment_count": len(amendments),
         "limit": page,
         "cap": FILLS_CAP,
     }
@@ -2010,28 +2035,57 @@ def _order_request(payload: dict[str, Any]) -> tuple[dict[str, Any], Any]:
     if shown < 0:
         raise _refuse("invalid_quantity", "display size cannot be negative")
 
+    peg, offset = _peg_request(payload)
+
     # The order type is derived from what was sent -- a price makes it a limit,
-    # a trigger makes it a stop -- exactly as ``LiveMarket.submit`` derives it.
-    # A declared ``type`` is therefore checked against that rather than obeyed,
-    # so a client whose fields and whose declaration disagree is told which,
-    # instead of having one of them silently win.
-    if stop is not None:
+    # a trigger makes it a stop, a reference makes it a peg -- exactly as
+    # ``LiveMarket.submit`` derives it. A declared ``type`` is therefore checked
+    # against that rather than obeyed, so a client whose fields and whose
+    # declaration disagree is told which, instead of having one of them
+    # silently win.
+    #
+    # A peg is tested before the other two for the reason ``LiveMarket.submit``
+    # tests it first: from here a peg looks like a market order, because it
+    # names no price of its own.
+    if peg is not None:
+        derived = OrderType.PEGGED.value
+    elif stop is not None:
         derived = OrderType.STOP_LIMIT.value if price is not None else OrderType.STOP.value
     elif price is not None:
         derived = OrderType.LIMIT.value
     else:
         derived = OrderType.MARKET.value
 
+    # Every combination below is a permanent fact about the request rather than
+    # a fact about the market, which is why each one is a 400 here instead of
+    # the 422 it would become if it were left to ``LiveMarket.submit``. The
+    # catalogue's own grouping makes that distinction load-bearing:
+    # ``rejected_by_venue`` means "the market may allow it later", and no
+    # market will ever allow a pegged order that also names a price.
+    if peg is not None:
+        if price is not None:
+            raise _refuse(
+                "invalid_order_type",
+                "a pegged order names no price of its own: its price is the "
+                "reference plus the offset, recomputed as the reference moves",
+                peg=peg,
+            )
+        if stop is not None:
+            raise _refuse(
+                "invalid_order_type", "a pegged order cannot also be a stop", peg=peg
+            )
+        if tif in (TimeInForce.IOC.value, TimeInForce.FOK.value):
+            raise _refuse(
+                "invalid_time_in_force",
+                f"a pegged order cannot be {tif}: a peg is an instruction to keep "
+                "tracking and that one says not to rest",
+                peg=peg,
+            )
+
     declared = str(payload.get("type", "") or "").strip().lower()
     if declared:
-        supported = sorted(
-            choice.value for choice in OrderType if choice is not OrderType.PEGGED
-        )
+        supported = sorted(choice.value for choice in OrderType)
         if declared not in supported:
-            # Pegged orders are refused by name rather than lumped in with
-            # nonsense: the engine has them, and this API has no way to send
-            # one, because ``LiveMarket.submit`` carries no peg reference. That
-            # is a gap in the surface, not a gap in the exchange.
             raise _refuse(
                 "invalid_order_type",
                 f"{declared!r} is not an order type this API can send",
@@ -2055,9 +2109,63 @@ def _order_request(payload: dict[str, Any]) -> tuple[dict[str, Any], Any]:
             "tif": tif,
             "stop": stop,
             "display": shown,
+            "peg": peg,
+            "peg_offset": offset,
         },
         listing,
     )
+
+
+def _peg_request(payload: dict[str, Any]) -> tuple[str | None, int]:
+    """The two fields that make an order a pegged one, or ``(None, 0)``.
+
+    The vocabulary is read off :class:`PegReference` rather than restated, so a
+    fourth reference added to the exchange is reachable from here without
+    anybody editing this module -- the same argument the time-in-force check
+    twenty lines up makes about ``TimeInForce``.
+
+    Both failures answer ``invalid_order_type`` rather than earning a code of
+    their own. That is deliberate: ``derived`` is ``pegged`` exactly when a
+    reference is present, so these fields *are* the order type, and a catalogue
+    entry for a field only one order type has would be a code almost no client
+    would ever branch on.
+
+    ``peg_offset`` is a signed whole number of **ticks**, not a price, for the
+    reason ``Submit.peg_offset`` is one: on a contract carrying a tick table the
+    same decimal is a different number of ticks at different levels, so an
+    offset expressed as a price would silently change size as the reference
+    moved -- which is precisely what a peg exists to stop happening.
+    """
+    raw_peg = payload.get("peg")
+    peg: str | None = None
+    if raw_peg not in (None, "", "none"):
+        supported = sorted(choice.value for choice in PegReference)
+        candidate = str(raw_peg).strip().lower()
+        if candidate not in supported:
+            raise _refuse(
+                "invalid_order_type",
+                f"{raw_peg!r} is not a reference this venue tracks",
+                supported=supported,
+            )
+        peg = candidate
+
+    raw_offset = payload.get("peg_offset")
+    offset = (
+        0
+        if raw_offset in (None, "")
+        else _whole(raw_offset, "peg_offset", "invalid_order_type")
+    )
+    if peg is None and offset:
+        # The engine refuses this as INVALID_PEG and is right to: an offset from
+        # nothing is not an instruction. Refused here so the client is told
+        # which of the two fields it forgot.
+        raise _refuse(
+            "invalid_order_type",
+            "a peg_offset is a number of ticks away from a reference; name the "
+            "reference with peg",
+            supported=sorted(choice.value for choice in PegReference),
+        )
+    return peg, offset
 
 
 @router.post("/orders", status_code=202)
@@ -2074,6 +2182,22 @@ async def place_order(request: Request) -> JSONResponse:
     default. No price means a market order, which is always immediate. A
     ``client_order_id`` is echoed back and is the identifier the order is
     reconcilable by until the exchange has assigned its own.
+
+    A **pegged** order names ``peg`` -- one of ``bid``, ``ask``, ``mid`` -- and
+    an optional signed ``peg_offset`` in ticks, and names no ``price``::
+
+        {"symbol": "SPIKE_WR_FUT", "side": "buy", "quantity": 5,
+         "peg": "bid", "peg_offset": -1}
+
+    It exists because quoting a *number* and quoting a *position* are different
+    intentions and only the second survives the market moving. What it costs is
+    queue priority: each reprice is a new price and so a new place in the queue,
+    and each one arrives in this account's blotter as a ``replace`` event
+    carrying the same order id. The id does not change, which is why
+    ``PATCH``/``DELETE /v1/orders/{symbol}/{order_id}`` keep working on a peg
+    that has moved -- measured, and it did not before: a peg left this account's
+    working-order list at its first reprice and could then not be cancelled at
+    all.
 
     The acknowledgement echoes the fields as they were *sent*, not as the venue
     resolved them, so ``time_in_force`` comes back null when none was given
@@ -2160,6 +2284,13 @@ async def place_order(request: Request) -> JSONResponse:
             "stop": None if order["stop"] is None else str(order["stop"]),
             "time_in_force": order["tif"] or None,
             "display": order["display"],
+            "peg": order["peg"],
+            # Echoed as a number rather than a string, because it is a count of
+            # ticks and not a price. The rule that prices cross the wire as
+            # strings is about decimals a binary double cannot hold exactly; a
+            # signed integer of ticks is exact as JSON already, and quoting it
+            # would tell a client it is the one thing it is not.
+            "peg_offset": order["peg_offset"],
             "accepted_at": _clock_ns(),
             # Said out loud, because a client author reading a 202 for the first
             # time should not have to infer it from the status code.
@@ -2201,6 +2332,224 @@ async def order_detail(request: Request, symbol: str, order_id: str) -> dict[str
     row = _order_row(symbol, order)
     row["client_order_id"] = _client_id_for(caller.token, symbol, identifier)
     return row
+
+
+# What an amendment may change. Everything else on an order -- its side, its
+# time in force, its display size, its trigger -- is a property of the order
+# rather than of the claim it has on the queue, and ``Replace`` cannot carry
+# any of them.
+#
+# A field outside this set is refused rather than ignored, and the reason is a
+# bug this venue has already had once in the other direction: a replace used to
+# drop ``display_size``, so an iceberg came back fully displayed and published
+# the size its owner was working in slices precisely so that nobody could see
+# it. The engine now carries it across. Silently accepting ``display`` here
+# would rebuild exactly that failure from the client's side -- it would believe
+# it had changed the visible size, and nothing would have.
+_AMENDABLE = ("quantity", "price")
+
+
+@router.patch("/orders/{symbol}/{order_id}", status_code=202)
+async def amend_order(request: Request, symbol: str, order_id: str) -> JSONResponse:
+    """Amend a working order's price, its size, or both, keeping its id.
+
+    Body::
+
+        {"quantity": 6}                     -- size only, price unchanged
+        {"price": "4700.25"}                -- price only, size unchanged
+        {"quantity": 6, "price": "4700.25"} -- both
+
+    **Why PATCH and not POST.** POST on an item URL means "create a subordinate
+    resource under this one", and nothing is created here: the exchange's order
+    id survives the amendment, which is the entire reason to prefer this over
+    cancel-and-resubmit. PATCH means "a set of changes to be applied to the
+    resource", which is exactly what a ``Replace`` is.
+
+    The partial semantics are not decoration either, and this is the argument
+    that decided it. Measured on two bids for ten at 100, ours first, a sell of
+    five sweeping the level:
+
+        shrink 10 -> 6 at the same price     kept_priority=True    we fill
+        grow   10 -> 14 at the same price    kept_priority=False   they fill
+        10 -> 10 at the same price           kept_priority=False   they fill
+        10 -> 6 at a different price         kept_priority=False   they fill
+
+    Queue priority survives a strict reduction at an unchanged price and
+    nothing else -- so an amendment that re-sends a field it is not changing
+    goes to the back of the queue for asking for nothing. PATCH's contract is
+    "send only what is changing", which makes the priority-preserving call the
+    natural one to write. PUT's contract is "send the whole representation",
+    which would have made the priority-destroying call the natural one, and a
+    client would have paid for the method choice in fills it did not get.
+
+    Answers **202** for the reason ``POST /v1/orders`` does: at the moment it
+    answers, the amendment is still crossing this seat's latency link and the
+    matching engine has not seen it. Whether priority survived is a fact about
+    what the engine did, so it arrives one round trip later in
+    ``GET /v1/account/fills`` under ``amendments``, carrying ``kept_priority``
+    and its own cursor; the resulting order is at
+    ``GET /v1/orders/{symbol}/{order_id}``. It cannot be inferred from that
+    order -- one for six at 100 looks identical whether it kept its place in
+    the queue or went to the back of it -- which is why the event is published
+    rather than left to be worked out.
+
+    Omitting ``quantity`` re-sends the order's current ``remaining``, which is
+    what the engine counts an amendment against -- so amending a partly filled
+    order to 4 leaves 4 lots working rather than 4 minus what already traded.
+    Note the race that omission accepts: if a fill lands while the amendment is
+    in flight, the quantity sent is above the new remaining and the engine reads
+    it as an increase, which loses priority. A client that cares sends the
+    number it wants.
+
+    Omitting both is refused. An amendment that changes nothing still costs
+    queue position, so answering it with success would charge a client for a
+    call that did nothing it asked for.
+
+    Not idempotent, and deliberately unlike ``DELETE``. A cancel for an order
+    that is not resting is a correct outcome the client asked for; an amendment
+    to an order that is not resting is not -- there is nothing to carry the new
+    terms. So it answers 404, exactly as ``GET`` on the same address does, and
+    for the same non-disclosure reason: an order belonging to somebody else
+    answers exactly as one that never existed does.
+    """
+    raw, payload = await _body(request)
+    caller = _authenticate(request, raw)
+    listing = _instrument(symbol)
+    identifier = _whole(order_id, "order_id", "invalid_request")
+
+    unamendable = sorted(set(payload) - set(_AMENDABLE))
+    if unamendable:
+        raise _refuse(
+            "invalid_request",
+            f"an amendment can change {' and '.join(_AMENDABLE)}; "
+            f"{', '.join(repr(field) for field in unamendable)} cannot be "
+            "amended, so cancel and resubmit instead",
+            amendable=list(_AMENDABLE),
+            refused=unamendable,
+        )
+
+    # Addressed exactly as ``order_detail`` addresses it, including the case
+    # where the account believes it has an order the book does not: a peg whose
+    # reference has gone rests in no level and has no price, and the engine
+    # refuses an amendment to one as INVALID_PEG. Refused here instead, so the
+    # client learns it a round trip earlier and by the same 404 it would get for
+    # any other order it cannot read.
+    who = _market().trader(caller.account)
+    order = None
+    if (symbol, identifier) in who.live_orders:
+        order = _venue().engine(symbol).book.get(identifier)
+    if order is None:
+        raise _refuse("not_found", f"no working order {identifier} in {symbol}")
+
+    wants_quantity = payload.get("quantity") is not None
+    wants_price = payload.get("price") not in (None, "")
+    if not (wants_quantity or wants_price):
+        raise _refuse(
+            "invalid_request",
+            "an amendment must change something: send quantity, price, or both",
+            amendable=list(_AMENDABLE),
+        )
+
+    if wants_quantity:
+        quantity = _whole(payload["quantity"], "quantity", "invalid_quantity")
+        if quantity <= 0:
+            # The engine refuses this as INVALID_QUANTITY and leaves the order
+            # exactly where it was, which is right -- an amendment to zero is
+            # not a cancel and must not be read as one. Said here so a client
+            # that meant to cancel is told to use DELETE.
+            raise _refuse(
+                "invalid_quantity",
+                "quantity must be a positive whole number; an amendment to zero "
+                "is not a cancel -- DELETE the order instead",
+            )
+        # The listing rule the submit path applies, applied here too. It is the
+        # half of the grid that nobody enforced for a long time: a contract
+        # listed in lots of ten took an order for seven.
+        if quantity % listing.lot_size:
+            raise _refuse(
+                "invalid_quantity",
+                f"{symbol} is listed in lots of {listing.lot_size}; {quantity} is "
+                "not a whole number of them",
+            )
+    else:
+        quantity = int(order.remaining)
+
+    # ``_quotable`` is the same call the submit path makes, and calling it is
+    # the point rather than an implementation detail. The tick-grid guard was
+    # once written against a field named ``price`` while ``Replace`` carries
+    # ``new_price``, so an amendment walked straight past it and rested off the
+    # grid; routing both paths through one function is what makes that class of
+    # miss impossible rather than merely fixed.
+    price = (
+        _quotable(listing, _price(payload["price"], "price"), "order")
+        if wants_price
+        else None
+    )
+
+    # Counted and refusable, not counted and exempt. A cancel is exempt because
+    # it can only ever reduce the venue's work and the participant's risk; an
+    # amendment can raise both, which is why ``Venue._rate_limited`` exempts
+    # only ``Cancel`` and why this must not pass ``reducing=True``.
+    _throttle(caller.token)
+
+    result = _market().replace(
+        identifier, quantity, price, trader=caller.account, symbol=symbol
+    )
+    if not result.get("ok"):
+        raise _refuse("rejected_by_venue", str(result.get("error", "")))
+
+    # The client's own record follows the amendment, because that record holds
+    # the order *as sent* and an amendment is also something this seat sent.
+    # Leaving the original size there would have
+    # ``GET /v1/orders:by_client_order_id`` report a quantity the client itself
+    # has already superseded.
+    #
+    # Being straight about what this does not fix: if the venue then refuses
+    # the amendment, the record carries a size that never took effect. That is
+    # the same shape ``place_order`` already accepts -- it remembers an order
+    # the venue may refuse a round trip later -- and it is survivable for the
+    # same reason: the ``order`` block published beside it is read from the
+    # engine and stays the authority on what is actually resting, and the
+    # refusal itself is in ``GET /v1/account/fills`` under ``rejections``.
+    #
+    # ``_reconciled`` first, for the reason it is called from every other read
+    # that can name an order: binding client ids only where the list is built
+    # made the answer depend on the order a client happened to call things in.
+    _reconciled(caller)
+    tagged = _client_id_for(caller.token, symbol, identifier)
+    if tagged is not None:
+        record = _client_orders(caller.token)[tagged]
+        record.quantity = quantity
+        if price is not None:
+            record.ticks = int(listing.to_ticks(price))
+
+    return JSONResponse(
+        {
+            "status": "accepted",
+            "account_id": str(caller.account),
+            "symbol": symbol,
+            "order_id": identifier,
+            "client_order_id": tagged,
+            "quantity": quantity,
+            "price": None if price is None else str(price),
+            # What is being replaced, so a client can see the delta it asked
+            # for without having read the order first.
+            "previous": {
+                "quantity": int(order.quantity),
+                "remaining": int(order.remaining),
+                "price": str(listing.from_ticks(order.price)),
+                "ticks": int(order.price),
+            },
+            "accepted_at": _clock_ns(),
+            "note": (
+                "queued to the exchange over this seat's latency link; queue "
+                "priority survives only a strict reduction at an unchanged "
+                "price, and the replace event in GET /v1/account/fills says "
+                "which happened"
+            ),
+        },
+        status_code=202,
+    )
 
 
 @router.delete("/orders/{symbol}/{order_id}")

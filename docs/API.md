@@ -686,7 +686,18 @@ Errors: `auth_required`, `auth_invalid`.
 | `time_in_force` | string | no | `gtc`, `ioc`, `fok`, `post_only` |
 | `stop` | string | no | trigger price for a stop |
 | `display` | integer | no | visible size of an iceberg; 0 means no reserve |
+| `peg` | string | no | `bid`, `ask` or `mid`; makes this a pegged order |
+| `peg_offset` | integer | no | signed ticks from the reference |
 | `client_order_id` | string | no | your own id, echoed back |
+
+A peg cannot carry a `price` (the reference supplies it), a `stop`, or an
+`ioc`/`fok` time in force, and an offset without a reference is refused. Each
+is a 400 naming which combination was wrong.
+
+The offset is in **ticks, not price**. An offset expressed as a price would
+silently change size when the reference moved across a tier boundary on a
+contract with a tiered tick table, which is precisely the thing a peg exists to
+stop happening.
 
 ```
 POST /v1/orders
@@ -736,6 +747,47 @@ Errors: `auth_required`, `auth_invalid`, `invalid_symbol`, `invalid_side`,
 assigned per book, so the id alone does not identify an order.
 
 Errors: `auth_required`, `auth_invalid`, `not_found`, `invalid_symbol`.
+
+`GET /v1/account/fills` also carries an `amendments` stream with its own
+`after_amendment` cursor, because a replace's whole observable outcome is
+whether it kept queue priority and that cannot be inferred from the resulting
+order. It is also the only place a pegged order's repricing is visible: the
+engine emits a replacement on every reprice, so a peg's life is a sequence of
+amendments rather than a single resting order.
+
+### `PATCH /v1/orders/{symbol}/{order_id}`
+
+**Signed.** Amend a resting order in place. Answers 202: the amendment is still
+crossing the latency link when the response is written.
+
+Body carries `quantity`, `price`, or both. Any other field is **refused by
+name rather than ignored** -- silently accepting a `display` here would rebuild
+from the client's side the exact bug where a replace dropped an iceberg's
+display size and published the whole order. Omitting `quantity` re-sends the
+order's current remaining size; omitting both is refused.
+
+PATCH rather than POST or PUT, and the choice is load-bearing rather than
+stylistic. POST on an item URL means "create a subordinate resource" and
+nothing is created here -- the order id survives, which is the entire reason to
+amend instead of cancelling and resubmitting. And PATCH's "send only what
+changes" makes the priority-*preserving* call the natural one to write, where
+PUT's "send the whole representation" would have made the priority-destroying
+one natural.
+
+**What it costs you, measured on this engine** rather than assumed from
+convention:
+
+| Amendment | Priority kept |
+| --- | --- |
+| Shrink the size, same price | **yes** |
+| Grow the size, same price | no |
+| Resend the same size and price | no |
+| Any price change | no |
+
+A non-resting order answers 404. That differs deliberately from `DELETE`,
+which answers 200 for an order that is already gone: cancelling something that
+is already cancelled satisfies the caller's intent, whereas amending something
+that no longer exists does not.
 
 ### `DELETE /v1/orders/{symbol}/{order_id}`
 

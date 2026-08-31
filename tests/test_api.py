@@ -38,8 +38,9 @@ from arena.api.keys import (
     body_bytes,
     sign,
 )
-from arena.exchange.types import TimeInForce
+from arena.exchange.types import PegReference, TimeInForce
 from arena.market.instrument import InstrumentClass
+from arena.portfolio.money import from_money
 from arena.sim.time import Timestamp
 from dashboard.state import MarketConfig, MarketRunner
 
@@ -1583,6 +1584,774 @@ def test_a_stop_and_an_iceberg_reach_the_book_through_the_api(fresh):
     # it makes: visibility for queue priority.
     assert working["ice"]["shown"] == 2
     assert working["ice"]["remaining"] == 10
+
+
+# --------------------------------------------------------------------------
+# Pegged orders: quoting a position rather than a number
+# --------------------------------------------------------------------------
+
+
+def _rest_a_peg(venue: Exchange, trader: "Client", symbol: str, **fields) -> dict:
+    """A buy pegged well behind its reference, so it tracks rather than trades.
+
+    Four hundred ticks behind, and the distance is doing work rather than being
+    a round number: measured, a buy pegged to the bid at ``-2`` on
+    ``ASSASSIN_IDX`` was lifted inside 650ms of simulated time and came back
+    ``remaining=0``, which made every assertion about a *resting* peg a test of
+    a filled one instead.
+    """
+    body = {
+        "symbol": symbol,
+        "side": "buy",
+        "quantity": 2,
+        "peg": "bid",
+        "peg_offset": -400,
+        **fields,
+    }
+    response = trader.post("/v1/orders", body)
+    assert response.status_code == 202, response.text
+    return response.json()
+
+
+def test_a_pegged_order_reaches_the_book_through_the_api(fresh):
+    """The engine has had pegs for as long as it has had stops, and until now
+    this API refused them by name -- ``LiveMarket.submit`` carried no peg
+    reference, so ``type: "pegged"`` came back ``invalid_order_type``. That was
+    a gap in the surface rather than in the exchange, and a person clicking the
+    ticket could reach an order type a program could not."""
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Pegger")
+    symbol = venue.symbols()[0]
+
+    accepted = _rest_a_peg(venue, trader, symbol, client_order_id="peg-1")
+    assert accepted["peg"] == "bid"
+    # A count of ticks, not a price, so it is a JSON number rather than a
+    # string -- a signed integer is exact as JSON already, and quoting it would
+    # tell a client it is the one thing it is not.
+    assert accepted["peg_offset"] == -400
+    assert isinstance(accepted["peg_offset"], int)
+    # A peg names no price of its own. Echoing one would be inventing it.
+    assert accepted["price"] is None
+
+    venue.pump(400, slices=16)
+    working = {row["client_order_id"]: row for row in trader.get("/v1/orders").json()["orders"]}
+    assert "peg-1" in working, working
+    row = working["peg-1"]
+    assert row["remaining"] == 2
+
+    # It rested at a price the client never sent -- the reference plus the
+    # offset -- and the two renderings of that price agree. That it *tracks*
+    # the reference is asserted by the test below; this one asserts only that a
+    # peg reaches a book at all, which it could not do before.
+    listing = venue.venue.registry.require(symbol)
+    assert isinstance(row["ticks"], int)
+    assert Decimal(row["price"]) == listing.from_ticks(row["ticks"])
+
+
+def test_a_pegged_order_keeps_its_id_and_its_seat_across_every_reprice(fresh):
+    """The defect this feature was built on top of, asserted rather than
+    described.
+
+    The engine emits a ``Replaced`` every time a peg's reference moves, and
+    ``TradingAgent._on_private`` treated every event that was not an ack, a
+    fill or a refusal as the end of the order. Measured before the fix, on a
+    buy pegged to the bid at -400 on ``ASSASSIN_IDX``: at the **first** reprice
+    the order was resting for two lots at 4,897.25, the venue was reserving
+    collateral against it, and the account's working orders went empty.
+    ``cancel`` then answered "no such live order", so the one order type whose
+    defining behaviour is that it moves was the one order type that could not
+    be pulled once it had.
+    """
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Tracker")
+    symbol = venue.symbols()[0]
+
+    _rest_a_peg(venue, trader, symbol, client_order_id="peg-track")
+    venue.pump(300, slices=12)
+    resting = trader.get("/v1/orders").json()["orders"]
+    assert resting, "the peg never rested"
+    order_id = resting[0]["order_id"]
+
+    # Run until the reference has moved under it at least once.
+    moves: list[dict] = []
+    for _ in range(20):
+        venue.pump(250, slices=10)
+        moves = trader.get("/v1/account/fills?limit=200").json()["amendments"]
+        if moves:
+            break
+    assert moves, "the reference never moved, so nothing was measured"
+
+    # Same id throughout. A reprice is an amendment, not a new order.
+    assert {entry["order_id"] for entry in moves} == {order_id}
+    assert all(entry["client_order_id"] == "peg-track" for entry in moves)
+    # Prices cross the wire as strings here as everywhere else.
+    assert all(isinstance(entry["price"], str) for entry in moves)
+    # Repricing is a new price and so a new place in the queue. A peg that
+    # tracks a jumpy touch is perpetually at the back of it, and saying so is
+    # the only honest thing to publish.
+    assert all(entry["kept_priority"] is False for entry in moves)
+
+    still = trader.get("/v1/orders").json()["orders"]
+    assert [row["order_id"] for row in still] == [order_id], still
+    assert trader.get(f"/v1/orders/{symbol}/{order_id}").status_code == 200
+
+    pulled = trader.delete(f"/v1/orders/{symbol}/{order_id}")
+    assert pulled.status_code == 200
+    assert pulled.json()["already_done"] is False, "the peg had left its own blotter"
+
+
+def test_a_pegged_order_that_fills_conserves_value_exactly(fresh):
+    """Not "close to" zero. Money is integer minor units at a scale of a
+    million for exactly this reason, and a pegged order is the one that reaches
+    the book at a price nothing above the engine chose -- so if any path
+    reserved against a price that was not the one it traded at, this is where
+    it would show."""
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Crosser")
+    symbol = venue.symbols()[0]
+
+    # Pegged to the offer at zero offset: a buy quoting at the ask is a buy
+    # willing to take, which types.py names as the usual way to write one.
+    placed = trader.post(
+        "/v1/orders",
+        {"symbol": symbol, "side": "buy", "quantity": 2, "peg": "ask", "type": "pegged"},
+    )
+    assert placed.status_code == 202, placed.text
+    venue.pump(600, slices=24)
+
+    fills = trader.get("/v1/account/fills?limit=200").json()["fills"]
+    assert fills, "the peg never crossed"
+    assert all(isinstance(entry["price"], str) for entry in fills)
+
+    conservation = venue.venue.conservation_check()
+    assert isinstance(conservation, int)
+    assert conservation == 0
+    published = venue.client.get("/v1/exchange").json()["conservation"]
+    assert int(published) == 0 and "." not in published
+
+
+@pytest.mark.parametrize("reference", sorted(choice.value for choice in PegReference))
+def test_every_peg_reference_reaches_the_venue(fresh, reference):
+    """The vocabulary comes from ``PegReference`` rather than a list in the API,
+    so a fourth reference added to the exchange is reachable here without
+    anybody editing this file -- and is refused by this test if it is not. The
+    same argument the time-in-force test makes about ``TimeInForce``."""
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader(f"Peg{reference}")
+    symbol = venue.symbols()[0]
+
+    accepted = _rest_a_peg(venue, trader, symbol, peg=reference)
+    assert accepted["peg"] == reference
+    venue.pump(400, slices=16)
+
+    # A peg whose reference does not exist yet is *accepted and waits* -- "there
+    # is no best bid" is a fact about the market and not an error in the order --
+    # so what is asserted is that the venue did not refuse it, not that it
+    # rested. ``mid`` needs both sides and this venue is thin by construction.
+    refusals = trader.get("/v1/account/fills?limit=200").json()["rejections"]
+    assert not [row for row in refusals if row["reason"] == "invalid_peg"], refusals
+
+
+@pytest.mark.parametrize(
+    "fields, code",
+    [
+        # A peg names no price of its own: its price is the reference plus the
+        # offset, recomputed as the reference moves.
+        ({"peg": "bid", "price": "1"}, "invalid_order_type"),
+        ({"peg": "bid", "stop": "1"}, "invalid_order_type"),
+        ({"peg": "sideways"}, "invalid_order_type"),
+        # An offset from nothing is not an instruction. The engine refuses it as
+        # INVALID_PEG; refused here so the client is told which field it forgot.
+        ({"peg_offset": -1}, "invalid_order_type"),
+        ({"peg": "bid", "peg_offset": 1.5}, "invalid_order_type"),
+        # A peg is an instruction to keep tracking and these two say not to rest.
+        ({"peg": "bid", "time_in_force": "ioc"}, "invalid_time_in_force"),
+        ({"peg": "bid", "time_in_force": "fok"}, "invalid_time_in_force"),
+        # The declared type is checked against the fields rather than obeyed.
+        ({"peg": "bid", "type": "limit"}, "invalid_order_type"),
+        ({"type": "pegged"}, "invalid_order_type"),
+    ],
+)
+def test_a_peg_that_cannot_mean_anything_is_refused_in_its_own_terms(
+    exchange, fields, code
+):
+    """Each of these is a permanent fact about the request, so each is a 400
+    here rather than the 422 it would become if it were left to the venue. The
+    catalogue's grouping makes that load-bearing: ``rejected_by_venue`` means
+    "the market may allow it later", and no market will ever allow a pegged
+    order that also names a price."""
+    trader = exchange.trader("BadPeg")
+    symbol = exchange.symbols()[0]
+    response = trader.post("/v1/orders", _order(symbol, **fields))
+    assert response.status_code in (400, 422), response.text
+    assert response.json()["error"]["code"] == code, response.text
+
+
+# --------------------------------------------------------------------------
+# Amending an order: PATCH, and the guards that have to come with it
+# --------------------------------------------------------------------------
+
+
+def _one_increment_below(venue: Exchange, symbol: str, price: Decimal) -> Decimal:
+    """The next price down that this contract can actually rest at.
+
+    Snapped by the same repeated walk ``resting_price`` uses rather than by one
+    subtraction, because one of these contracts carries a tick *table* whose
+    increment changes with the level -- so a single pass can step into a coarser
+    band and land off its grid.
+    """
+    listing = venue.venue.registry.require(symbol)
+    target = price - listing.increment_at(price)
+    for _ in range(8):
+        remainder = target % listing.increment_at(target)
+        if remainder == 0:
+            return target
+        target -= remainder
+    raise AssertionError(f"no on-grid price below {price} on {symbol}")
+
+
+def _rest_one(venue: Exchange, trader: "Client", symbol: str, quantity: int = 10, **extra):
+    """One order resting where nothing else quotes, and its live row."""
+    price = resting_price(venue, symbol, "buy")
+    placed = trader.post(
+        "/v1/orders",
+        {
+            "symbol": symbol,
+            "side": "buy",
+            "quantity": quantity,
+            "price": str(price),
+            **extra,
+        },
+    )
+    assert placed.status_code == 202, placed.text
+    venue.pump(400, slices=16)
+    working = trader.get("/v1/orders").json()["orders"]
+    assert working, "nothing resting to amend"
+    return price, working[0]
+
+
+def test_an_amendment_keeps_the_order_id_and_the_account_can_still_manage_it(fresh):
+    """The blotter defect, at the layer a client sees it.
+
+    Measured before the fix, on a bid for ten amended to six at the same price:
+    the engine held it resting for six, the venue held it and reserved
+    collateral against it, and the *account's own* working orders went empty --
+    so ``GET /v1/orders`` published nothing, ``DELETE`` answered
+    ``already_done: true`` for an order standing in the book, and
+    ``DELETE /v1/orders`` walked a list the order was no longer in and left it
+    there. A successful amendment is the one event that keeps an order alive
+    and it was being read as the end of one.
+    """
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Amender")
+    symbol = venue.symbols()[0]
+    _, order = _rest_one(venue, trader, symbol, quantity=10, client_order_id="amend-1")
+    order_id = order["order_id"]
+
+    amended = trader.request("PATCH", f"/v1/orders/{symbol}/{order_id}", {"quantity": 6})
+    assert amended.status_code == 202, amended.text
+    body = amended.json()
+    assert body["order_id"] == order_id
+    assert body["client_order_id"] == "amend-1"
+    assert body["quantity"] == 6
+    assert body["price"] is None, "no price was sent, so none should be echoed"
+    assert body["previous"]["remaining"] == 10
+
+    venue.pump(400, slices=16)
+
+    working = trader.get("/v1/orders").json()["orders"]
+    assert [row["order_id"] for row in working] == [order_id], working
+    assert working[0]["remaining"] == 6
+    assert working[0]["client_order_id"] == "amend-1"
+
+    # The identifier the client chose still reaches it, and reports the size it
+    # itself amended to rather than the one it originally sent.
+    looked_up = trader.get("/v1/orders:by_client_order_id?id=amend-1").json()
+    assert looked_up["status"] == "working"
+    assert looked_up["quantity"] == 6
+    assert looked_up["order"]["remaining"] == 6
+
+    assert trader.get(f"/v1/orders/{symbol}/{order_id}").status_code == 200
+    pulled = trader.delete(f"/v1/orders/{symbol}/{order_id}")
+    assert pulled.json()["already_done"] is False, "the order had left its own blotter"
+
+    venue.pump(300, slices=12)
+    conservation = venue.venue.conservation_check()
+    assert isinstance(conservation, int)
+    assert conservation == 0
+
+
+def test_queue_priority_survives_a_strict_reduction_and_nothing_else(fresh):
+    """The measurement that decided the method, asserted through the field that
+    publishes it.
+
+    Two bids for ten at 100, ours first, then a sell of five sweeping the
+    level::
+
+        shrink 10 -> 6 at the same price     kept_priority=True    we fill
+        grow   10 -> 14 at the same price    kept_priority=False   they fill
+        10 -> 10 at the same price           kept_priority=False   they fill
+        10 -> 6 at a different price         kept_priority=False   they fill
+
+    The usual summary -- "raising size loses it, lowering it keeps it" -- is
+    right about the two ends and silent about the middle, and the middle is the
+    case a client hits by accident. That is why the route is a PATCH: its
+    contract is "send only what is changing", so the priority-preserving call is
+    the natural one to write, where PUT's "send the whole representation" would
+    have made the priority-destroying one natural instead.
+    """
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Queuer")
+    symbol = venue.symbols()[0]
+    price, order = _rest_one(venue, trader, symbol, quantity=10)
+    order_id = order["order_id"]
+    lower = _one_increment_below(venue, symbol, price)
+    assert lower != price
+
+    seen = 0
+
+    def amend(body: dict) -> bool:
+        nonlocal seen
+        response = trader.request("PATCH", f"/v1/orders/{symbol}/{order_id}", body)
+        assert response.status_code == 202, response.text
+        venue.pump(400, slices=16)
+        moves = trader.get("/v1/account/fills?limit=200").json()["amendments"]
+        seen += 1
+        # Counted rather than assumed. The list is newest first, so reading
+        # ``moves[0]`` after an amendment that had not finished crossing the
+        # latency link would quietly answer with the *previous* one's priority
+        # and the test would pass on the wrong event.
+        assert len(moves) == seen, f"expected {seen} amendments, saw {len(moves)}"
+        return moves[0]["kept_priority"]
+
+    assert amend({"quantity": 6}) is True, "a strict reduction should keep its place"
+    assert amend({"quantity": 8}) is False, "an increase is a new claim on the queue"
+    assert amend({"quantity": 8}) is False, "asking for nothing still costs the place"
+    # A strict reduction *and* a price change. The reduction alone would have
+    # kept the place, so this isolates the price as the thing that costs it.
+    assert amend({"quantity": 4, "price": str(lower)}) is False
+
+    # And every one of them is numbered in a sequence of its own: fill 3,
+    # rejection 3 and amendment 3 are unrelated events, so one ``after``
+    # applied to all three would silently drop from two of them.
+    blotter = trader.get("/v1/account/fills?limit=200").json()
+    ids = [entry["amendment_id"] for entry in blotter["amendments"]]
+    assert len(set(ids)) == len(ids)
+    assert ids == sorted(ids, reverse=True)
+    assert blotter["cursor"]["amendments"]["total"] == max(ids)
+    resumed = trader.get(f"/v1/account/fills?after_amendment={max(ids)}&limit=200").json()
+    assert resumed["amendments"] == []
+    assert resumed["cursor"]["after_amendment"] == max(ids)
+    assert trader.get("/v1/account/fills?after_amendment=-1").status_code == 400
+
+
+def test_an_amendment_carries_an_icebergs_display_size_across(fresh):
+    """A replace once stripped an iceberg of the only property that made it one:
+    the order came back fully displayed and published the size its owner was
+    working in slices precisely so that nobody could see it. The engine carries
+    it now, and an amendment cannot change it -- which is why ``display`` in the
+    body is refused rather than ignored, since silently accepting it would
+    rebuild the same failure from the client's side."""
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Hidden")
+    symbol = venue.symbols()[0]
+    price, order = _rest_one(venue, trader, symbol, quantity=12, display=3)
+    order_id = order["order_id"]
+    assert order["display"] == 3 and order["shown"] == 3
+
+    # A price change takes the branch that rebuilds the order, which is the one
+    # the display size used to fall out of.
+    moved = resting_price(venue, symbol, "buy")
+    amended = trader.request(
+        "PATCH", f"/v1/orders/{symbol}/{order_id}", {"quantity": 12, "price": str(moved)}
+    )
+    assert amended.status_code == 202, amended.text
+    venue.pump(400, slices=16)
+
+    row = trader.get(f"/v1/orders/{symbol}/{order_id}").json()
+    assert row["display"] == 3, "the amendment stripped the iceberg"
+    assert row["shown"] == 3
+    assert row["remaining"] == 12
+
+    refused = trader.request(
+        "PATCH", f"/v1/orders/{symbol}/{order_id}", {"quantity": 6, "display": 1}
+    )
+    assert refused.status_code == 400
+    assert refused.json()["error"]["code"] == "invalid_request"
+    assert refused.json()["error"]["detail"]["refused"] == ["display"]
+
+
+@pytest.mark.parametrize(
+    "body, code",
+    [
+        # Every one of these is a guard the submit path applies. A modification
+        # is a request for a price and for risk exactly as an order is, and
+        # ``Replace`` has walked past one of them before: the tick-grid check
+        # read ``price`` while ``Replace`` carries ``new_price``.
+        ({"quantity": 0}, "invalid_quantity"),
+        ({"quantity": -4}, "invalid_quantity"),
+        ({"quantity": 1.5}, "invalid_quantity"),
+        ({"quantity": True}, "invalid_quantity"),
+        ({"price": 4700.25}, "invalid_price"),
+        ({"price": "9,233.75"}, "invalid_price"),
+        ({"price": "nan"}, "invalid_price"),
+        ({"price": "Infinity"}, "invalid_price"),
+        # Nothing to change. An amendment that changes nothing still costs
+        # queue position, so answering it with success would charge a client
+        # for a call that did nothing it asked for.
+        ({}, "invalid_request"),
+        # Not amendable. ``Replace`` cannot carry any of them.
+        ({"quantity": 4, "side": "sell"}, "invalid_request"),
+        ({"quantity": 4, "time_in_force": "ioc"}, "invalid_request"),
+        ({"quantity": 4, "stop": "1"}, "invalid_request"),
+        ({"quantity": 4, "type": "limit"}, "invalid_request"),
+    ],
+)
+def test_an_amendment_is_refused_in_its_own_terms(fresh, body, code):
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("BadAmend")
+    symbol = venue.symbols()[0]
+    _, order = _rest_one(venue, trader, symbol)
+
+    response = trader.request(
+        "PATCH", f"/v1/orders/{symbol}/{order['order_id']}", body
+    )
+    assert response.status_code in (400, 422), response.text
+    assert response.json()["error"]["code"] == code, response.text
+
+    # And the order is exactly where it was. A refused amendment is not a
+    # cancel: the engine leaves the original resting, and so must this.
+    venue.pump(300, slices=12)
+    still = trader.get("/v1/orders").json()["orders"]
+    assert [row["order_id"] for row in still] == [order["order_id"]], still
+    assert still[0]["remaining"] == 10
+
+
+def test_an_amendment_onto_a_price_the_contract_cannot_rest_at_is_refused(fresh):
+    """The tick grid and the settlement range, which are the venue's own listing
+    rules and the two the replace path has skipped before. Both are applied by
+    the same ``_quotable`` the submit path calls -- routing both through one
+    function is what makes the miss impossible rather than merely fixed."""
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("OffGrid")
+    symbol = venue.symbols()[0]
+    listing = venue.venue.registry.require(symbol)
+    _, order = _rest_one(venue, trader, symbol)
+    path = f"/v1/orders/{symbol}/{order['order_id']}"
+
+    # Half an increment off the grid, derived from the instrument rather than
+    # chosen: a constant would be on one contract's grid and off another's.
+    price = resting_price(venue, symbol, "buy")
+    off_grid = price + listing.increment_at(price) / 2
+    refused = trader.request("PATCH", path, {"price": str(off_grid)})
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["code"] == "invalid_price"
+
+    # And outside what the claim can still settle at. Collateral structurally
+    # cannot catch this: the requirement is the worst case over the settlement
+    # range, so a bid *below* the floor scores as the safest order on the book
+    # -- the venue's central safety mechanism rates the impossible order as the
+    # safe one, which is why the range needs a listing rule of its own.
+    _, high = venue.venue.bounds_in_minor(listing)
+    beyond = from_money(high) + listing.tick_size
+    outside = trader.request("PATCH", path, {"price": str(beyond)})
+    assert outside.status_code == 400, outside.text
+    assert outside.json()["error"]["code"] == "invalid_price"
+
+    # Off-lot size, the other half of the same listing rule. Only askable on a
+    # contract listed in lots of more than one, and skipped rather than faked
+    # elsewhere: on a lot size of one there is no such thing as an off-lot
+    # quantity, and inventing one would be hardcoding a failure.
+    if listing.lot_size > 1:
+        off_lot = trader.request("PATCH", path, {"quantity": listing.lot_size + 1})
+        assert off_lot.status_code == 400
+        assert off_lot.json()["error"]["code"] == "invalid_quantity"
+
+    venue.pump(300, slices=12)
+    still = trader.get("/v1/orders").json()["orders"]
+    assert [row["order_id"] for row in still] == [order["order_id"]]
+    assert still[0]["remaining"] == 10
+
+
+def test_an_amendment_is_refusable_by_the_rate_limit_and_a_cancel_is_not(fresh):
+    """A cancel is exempt because it can only ever reduce the venue's work and
+    the participant's risk. An amendment can raise both -- it is how an account
+    takes on exposure it could not otherwise fund -- so it is counted *and*
+    refusable, exactly as ``Venue._rate_limited`` exempts only ``Cancel``.
+
+    Then the half that matters: a participant refused for the rate must still
+    be able to pull the order it has, or the limiter has trapped it in exposure
+    nobody is permitted to manage."""
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Chatty")
+    symbol = venue.symbols()[0]
+    _, order = _rest_one(venue, trader, symbol)
+    path = f"/v1/orders/{symbol}/{order['order_id']}"
+
+    venue.venue.message_rate = 2
+    accepted = 0
+    refusal = None
+    for size in (9, 8, 7, 6, 5):
+        response = trader.request("PATCH", path, {"quantity": size})
+        if response.status_code == 202:
+            accepted += 1
+        else:
+            refusal = response
+            break
+
+    assert accepted == 2, f"accepted {accepted} against a rate of 2"
+    assert refusal is not None and refusal.status_code == 429
+    assert refusal.json()["error"]["code"] == "rate_limited"
+
+    assert trader.delete(path).status_code == 200
+    assert trader.delete("/v1/orders").status_code == 200
+
+
+def test_a_halted_participant_cannot_amend_and_keeps_what_it_has(fresh):
+    """Tested in the state the control is for, not in a calm one.
+
+    A stopped participant may still cancel -- refusing that too would trap it
+    in the orders it already has, which is the opposite of what stopping it is
+    for -- and ``Venue.submit`` refuses it a ``Replace`` for the same reason it
+    refuses a ``Submit``: an amendment is a request for risk. What this asserts
+    is that the refusal leaves the order resting *and* leaves it in the
+    account's own blotter, which is the half that was broken: the venue's
+    refusal used to delete the order from the agent's view, after which nobody
+    could pull the exposure the halt had just frozen.
+    """
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Stopped")
+    symbol = venue.symbols()[0]
+    _, order = _rest_one(venue, trader, symbol)
+    path = f"/v1/orders/{symbol}/{order['order_id']}"
+
+    # The state directly rather than through ``kill``, which pulls the working
+    # orders on its way in and would leave nothing to amend. The account is
+    # read back through the API rather than taken from the key, because a key
+    # is bound to a *seat* and the account it holds is re-resolved per request.
+    account_id = trader.get("/v1/account").json()["account_id"]
+    venue.venue.halted_participants[account_id] = "test"
+    assert trader.get("/v1/account").json()["halted"] is True
+
+    amended = trader.request("PATCH", path, {"quantity": 4})
+    assert amended.status_code == 202, amended.text
+    venue.pump(400, slices=16)
+
+    refusals = trader.get("/v1/account/fills?limit=200").json()["rejections"]
+    assert "participant_halted" in {row["reason"] for row in refusals}, refusals
+
+    still = trader.get("/v1/orders").json()["orders"]
+    assert [row["order_id"] for row in still] == [order["order_id"]], still
+    assert still[0]["remaining"] == 10, "the refusal moved the order it refused"
+    assert trader.delete(path).json()["already_done"] is False
+
+
+def test_an_amendment_during_a_call_phase_is_refused_and_the_order_is_untouched(fresh):
+    """A call phase is defined by the fact that nothing matches in it, and a
+    replace is the one command that breaks the definition: the engine's replace
+    pulls the old order and re-runs the match unconditionally, never consulting
+    the phase. Measured at the venue: a replace during a halt printed 20 lots at
+    17,000 against an order only resting there because the auction had not run
+    yet, and against market-on-open interest -- which rests at a sentinel so it
+    crosses every candidate -- it printed at -4,611,686,018,427,387,904."""
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Auctioned")
+    symbol = venue.symbols()[0]
+    _, order = _rest_one(venue, trader, symbol)
+    path = f"/v1/orders/{symbol}/{order['order_id']}"
+
+    venue.venue.halt(symbol, "test")
+    assert venue.client.get(f"/v1/instruments/{symbol}").json()["session"] != "continuous"
+
+    amended = trader.request("PATCH", path, {"quantity": 4})
+    assert amended.status_code == 202, amended.text
+    venue.pump(400, slices=16)
+
+    refusals = trader.get("/v1/account/fills?limit=200").json()["rejections"]
+    assert "not_accepted_in_auction" in {row["reason"] for row in refusals}, refusals
+
+    still = trader.get("/v1/orders").json()["orders"]
+    assert [row["order_id"] for row in still] == [order["order_id"]], still
+    assert still[0]["remaining"] == 10
+    # And it can still be withdrawn: cancels stay legal in a call phase so a
+    # participant can tidy up.
+    assert trader.delete(path).json()["already_done"] is False
+
+
+def test_an_amendment_after_the_close_is_refused_and_the_order_is_untouched(fresh):
+    """The other half of the session guard, and the one an expiry reaches.
+
+    ``Venue.submit`` refuses a ``Submit`` and a ``Replace`` on the same line
+    once a symbol stops accepting orders, because once the outcome is
+    determined nobody may take new risk -- and an amendment is new risk. What
+    stays legal is the cancel, so an account can tidy up, and this asserts that
+    the pair still works together: refused amendment, order untouched, order
+    still pullable.
+    """
+    venue = fresh()
+    venue.pump(400, slices=16)
+    trader = venue.trader("Closed")
+    symbol = venue.symbols()[0]
+    _, order = _rest_one(venue, trader, symbol)
+    path = f"/v1/orders/{symbol}/{order['order_id']}"
+
+    venue.venue.close(symbol)
+    assert venue.client.get(f"/v1/instruments/{symbol}").json()["session"] == "closed"
+
+    amended = trader.request("PATCH", path, {"quantity": 4})
+    assert amended.status_code == 202, amended.text
+    venue.pump(400, slices=16)
+
+    refusals = trader.get("/v1/account/fills?limit=200").json()["rejections"]
+    assert "already_terminal" in {row["reason"] for row in refusals}, refusals
+
+    still = trader.get("/v1/orders").json()["orders"]
+    assert [row["order_id"] for row in still] == [order["order_id"]], still
+    assert still[0]["remaining"] == 10
+    assert trader.delete(path).json()["already_done"] is False
+
+
+def test_an_amendment_is_not_a_free_re_collateralisation(fresh):
+    """An amendment is measured as the position it *results in*, not as
+    exposure piled on top of the order it supersedes -- and not as a fresh
+    start either.
+
+    Asserted against a control rather than against a number, because a number
+    would be a hardcoded fact about one contract's price. Two identical
+    accounts, one that works ten lots and amends to twenty and one that works
+    twenty outright, must have reserved exactly the same collateral. Reserving
+    on top of the superseded order would make the first larger; releasing the
+    old reservation and forgetting the position would make it smaller.
+    """
+    venue = fresh()
+    venue.pump(400, slices=16)
+    amender = venue.trader("Grower")
+    control = venue.trader("Control")
+    symbol = venue.symbols()[0]
+
+    price, order = _rest_one(venue, amender, symbol, quantity=10)
+    placed = control.post(
+        "/v1/orders",
+        {"symbol": symbol, "side": "buy", "quantity": 20, "price": str(price)},
+    )
+    assert placed.status_code == 202, placed.text
+
+    grown = amender.request(
+        "PATCH", f"/v1/orders/{symbol}/{order['order_id']}", {"quantity": 20}
+    )
+    assert grown.status_code == 202, grown.text
+    venue.pump(500, slices=20)
+
+    assert amender.get("/v1/orders").json()["orders"][0]["remaining"] == 20
+    assert control.get("/v1/orders").json()["orders"][0]["remaining"] == 20
+    assert (
+        amender.get("/v1/account").json()["collateral"]
+        == control.get("/v1/account").json()["collateral"]
+    )
+
+    # And the ceiling is real. Beyond what the account can fund the venue
+    # refuses, and -- the half that was broken -- leaves the order resting and
+    # in its owner's blotter, so the exposure the refusal protected is still
+    # something its owner can pull.
+    listing = venue.venue.registry.require(symbol)
+    unaffordable = 100_000 * listing.lot_size
+    over = amender.request(
+        "PATCH", f"/v1/orders/{symbol}/{order['order_id']}", {"quantity": unaffordable}
+    )
+    assert over.status_code == 202, over.text
+    venue.pump(400, slices=16)
+
+    refusals = amender.get("/v1/account/fills?limit=200").json()["rejections"]
+    assert "insufficient_collateral" in {row["reason"] for row in refusals}, refusals
+    still = amender.get("/v1/orders").json()["orders"]
+    assert [row["order_id"] for row in still] == [order["order_id"]], still
+    assert still[0]["remaining"] == 20, "the refused amendment moved the order"
+    assert amender.delete(f"/v1/orders/{symbol}/{order['order_id']}").json()[
+        "already_done"
+    ] is False
+
+    venue.pump(300, slices=12)
+    conservation = venue.venue.conservation_check()
+    assert isinstance(conservation, int)
+    assert conservation == 0
+
+
+def test_amending_an_order_that_is_not_yours_answers_as_one_that_never_existed(fresh):
+    """Confirming that an id exists but is not yours tells a stranger something
+    about a stranger's account, which is the argument ``GET`` on the same
+    address already makes. 404 rather than ``DELETE``'s 200, because an
+    amendment to an order that is not resting is not a correct outcome the
+    client asked for -- there is nothing to carry the new terms."""
+    venue = fresh()
+    venue.pump(400, slices=16)
+    owner = venue.trader("Owner")
+    stranger = venue.trader("Stranger")
+    symbol = venue.symbols()[0]
+    _, order = _rest_one(venue, owner, symbol)
+    order_id = order["order_id"]
+
+    theirs = stranger.request(
+        "PATCH", f"/v1/orders/{symbol}/{order_id}", {"quantity": 4}
+    )
+    assert theirs.status_code == 404, theirs.text
+    assert theirs.json()["error"]["code"] == "not_found"
+
+    # An id that never existed anywhere answers with the same code and the same
+    # status. The sentences differ only by the id the caller itself sent back to
+    # it, which discloses nothing: what a stranger must not be able to learn is
+    # whether an id *exists*, and neither answer says.
+    never = stranger.request("PATCH", f"/v1/orders/{symbol}/999999", {"quantity": 4})
+    assert never.status_code == theirs.status_code == 404
+    assert never.json()["error"]["code"] == theirs.json()["error"]["code"]
+
+    mistyped = owner.request("PATCH", "/v1/orders/NOT_A_SYMBOL/1", {"quantity": 4})
+    assert mistyped.status_code == 400
+    assert mistyped.json()["error"]["code"] == "invalid_symbol"
+
+    # Untouched by any of it.
+    venue.pump(300, slices=12)
+    assert owner.get("/v1/orders").json()["orders"][0]["remaining"] == 10
+
+
+def test_no_float_appears_in_an_amendment_or_a_peg_payload(fresh):
+    """Prices cross the wire as strings, in both directions. A JSON number is a
+    double, and this venue's accounting is exact integers precisely so that the
+    conservation check can be exactly zero rather than nearly zero."""
+    venue = fresh()
+    venue.pump(400, slices=16)
+    # Two seats, because ``_rest_one`` reads the first working order of the
+    # account it is given and a peg resting alongside would be that one.
+    pegger = venue.trader("ExactPeg")
+    trader = venue.trader("Exact")
+    symbol = venue.symbols()[0]
+
+    peg = _rest_a_peg(venue, pegger, symbol)
+    assert floats_in(peg) == []
+
+    _, order = _rest_one(venue, trader, symbol)
+    amended = trader.request(
+        "PATCH",
+        f"/v1/orders/{symbol}/{order['order_id']}",
+        {"quantity": 6, "price": str(resting_price(venue, symbol, "buy"))},
+    )
+    assert amended.status_code == 202, amended.text
+    assert floats_in(json.loads(amended.text)) == []
+
+    venue.pump(500, slices=20)
+    blotter = json.loads(trader.get("/v1/account/fills?limit=200").text)
+    assert floats_in(blotter) == [], blotter
 
 
 # --------------------------------------------------------------------------
