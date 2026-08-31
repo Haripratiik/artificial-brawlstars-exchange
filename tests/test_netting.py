@@ -400,6 +400,11 @@ def test_the_venue_charges_gross_unless_asked_otherwise():
     assert market.venue.netting is False
 
 
+# Two full 300-second market simulations, one gross and one netted, because the
+# claim is a DIFFERENCE between two trajectories and neither side can be
+# shortened without changing the number the docstring records. 678 seconds, and
+# it is the single reason the suite cannot be run on every push.
+@pytest.mark.slow
 def test_netting_frees_the_arbitrageur_when_collateral_binds():
     """Its whole business is holding packages that offset.
 

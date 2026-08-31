@@ -50,6 +50,15 @@ testpaths = ["tests"]
 # test runner, and a dedicated directory keeps tmp_path behaviour identical
 # across machines. pytest prunes it automatically, keeping the last few runs.
 addopts = "-q --strict-markers --basetemp=.pytest_tmp"
+# Declared because --strict-markers is on. "slow" means a test whose cost is
+# measured in minutes, not seconds. Nothing is skipped by default: a local
+# `pytest` still runs everything, so the count in the README stays the whole
+# count. The marker exists so CI can run a fast gate on every push and the
+# full suite on a schedule, rather than making every push wait an hour and
+# quietly training everyone to ignore it.
+markers = [
+    "slow: takes minutes. Excluded from the per-push CI gate, run nightly.",
+]
 
 [tool.ruff]
 line-length = 96
