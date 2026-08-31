@@ -21,8 +21,10 @@ from arena.strategies.base import (
     TwoSided,
     snap,
 )
+from arena.strategies.firm import Firm
 
 __all__ = [
+    "Firm",
     "MakerStrategy",
     "MarketView",
     "Quote",
