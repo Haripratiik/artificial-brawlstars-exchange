@@ -1,7 +1,7 @@
 # Artificial Brawl Stars Exchange
 
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=flat&logo=python&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-1092%20passing-2ea44f?style=flat)
+![Tests](https://img.shields.io/badge/tests-1416%20passing-2ea44f?style=flat)
 ![Asset classes](https://img.shields.io/badge/asset%20classes-9-0A0A0A?style=flat)
 ![API](https://img.shields.io/badge/API-REST%20%2B%20WebSocket-0ea5e9?style=flat)
 ![Collateral](https://img.shields.io/badge/collateral-exact%2C%20not%20modelled-8b5cf6?style=flat)
@@ -12,8 +12,8 @@
 It was built to answer one question with evidence rather than opinion: **does a market aggregate dispersed information better than the agents trading inside it?** Answering that needs an instrument precise enough to trust, so the exchange is complete and runs end to end. A deterministic discrete-event kernel with per-agent latency. A price-time book carrying the order types real venues actually list. Opening and closing auctions, circuit breakers and a participant kill switch. A clearing house that nets portfolios exactly. Live settlement against measured game statistics. A population of heterogeneous trading agents. A research harness that runs paired ablations from a manifest. And a browser front end that anyone can log into and trade on.
 
 ```
-24,000 lines of exchange, agents and research     1,092 tests, all passing
-14,000 lines of tests                             47 listed instruments
+31,000 lines of exchange, agents and research     1,416 tests, all passing
+27,000 lines of tests                             47 listed instruments
 9 asset classes on one matching engine            conservation: integer zero
 bit-identical replay from a seed                  collateral: exact, not modelled
 ```
@@ -29,7 +29,8 @@ bit-identical replay from a seed                  collateral: exact, not modelle
 - **The market ties the simple mean of its agents and loses to precision weighting.** 200 paired trials scored against a *known* true probability, which no field study can do. Squared error to truth: market **0.03108**, simple mean 0.02957 (p = 0.59, indistinguishable), precision-weighted 0.01436 (**market 2.2x worse**, p < 0.0001), best agent chosen with hindsight 0.00272. See [Findings](#findings).
 - **Experiment 2 rules out the matching rule.** The natural reading of Experiment 1 is that a limit order book aggregates by capital, since it needs a counterparty for every trade. So Experiment 2 built an LMSR venue, which always quotes and needs no counterparty. It lands in the same place, p = 0.97, which leaves the agents' balance sheets as the binding constraint.
 - **Concentrating information makes the price worse.** Holding total evidence fixed at 10,319 battles and moving all of it into a single trader raises market error **2.7x**, because one agent has one balance sheet. The usual intuition about an informed monopolist runs the other way.
-- **A programmatic API.** 19 REST routes plus a streaming socket, covering market data, candles, accounts, positions, fills and the whole order lifecycle across every asset class through one code path. The stream resumes after a disconnect and replays what you missed instead of restarting its sequence, so an algorithm that drops a connection keeps its state. HMAC-SHA256 signing covers the timestamp, method, path and body together, so a captured signature cannot be moved onto a different order. An API order is enqueued onto the same agent, crosses the same latency link and meets the same collateral check as one clicked in the browser. See [docs/API.md](docs/API.md).
+- **A programmatic API.** 20 REST routes plus a streaming socket, covering market data, candles, accounts, positions, fills and the whole order lifecycle across every asset class through one code path. The stream resumes after a disconnect and replays what you missed instead of restarting its sequence, so an algorithm that drops a connection keeps its state. HMAC-SHA256 signing covers the timestamp, method, path and body together, so a captured signature cannot be moved onto a different order. An API order is enqueued onto the same agent, crosses the same latency link and meets the same collateral check as one clicked in the browser. See [docs/API.md](docs/API.md).
+- **A strategy testbed.** Write a market maker or a buy-side strategy against one interface, run it inside the live market, and get back a number you are entitled to believe. A strategy reads a view and returns intents, and never touches the venue, so it cannot reach the settlement level, another participant's position, or a book it was never told about. The book it does read is honestly stale by its own latency, which is the phenomenon rather than an inconvenience. Six reference strategies ship against it: a fixed-spread control, Glosten-Milgrom, Avellaneda-Stoikov, Gueant-Lehalle-Fernandez-Tapia, a Kelly-sized Bayesian and a static arbitrageur, plus a firm that budgets collateral per netting group. Comparisons run as paired trials on common random numbers, and the harness reports whether pairing actually helped instead of assuming it: measured, it removed **93% of the variance** in one configuration and **made things 3% worse** in another. See [docs/STRATEGIES.md](docs/STRATEGIES.md).
 - **Nine asset classes on one matching engine.** Futures, binaries, calls, puts, calendar spreads, an index, commodities, equities and a volatility contract, 47 listed instruments in total. They share one collateral rule because they all reduce to a bounded payoff function.
 
 ---
