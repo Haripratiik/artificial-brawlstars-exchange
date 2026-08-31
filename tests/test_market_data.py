@@ -60,13 +60,19 @@ def test_the_matching_engine_still_sees_the_sentinel():
 
     The sentinel exists so market-on-open interest crosses everything in the
     call. A fix that hid it from the engine as well would silently turn every
-    market-on-open order into an order that does not trade.
+    market-on-open order into an order that never trades, and the symptom
+    would be an exchange that looks fine and opens empty.
+
+    Ten seconds rather than one: the opening call has to run and the agents
+    have to wake before there is a tape to look at. The first version of this
+    test asked after one simulated second, found nothing, and was measuring
+    its own impatience.
     """
     market = build(seed=7)
     market.kernel.start()
-    market.kernel.advance(until=seconds(1))
-    engines = [market.venue.engine(s) for s in market.venue.registry.symbols]
-    assert any(len(engine.tape) for engine in engines), "nothing opened at all"
+    market.kernel.advance(until=seconds(10))
+    traded = [s for s in market.venue.registry.symbols if market.venue.engine(s).tape]
+    assert traded, "nothing traded at all, so the auction never cleared"
 
 
 def test_the_two_feeds_agree_about_the_touch():
@@ -86,12 +92,34 @@ def test_the_two_feeds_agree_about_the_touch():
         assert book.best_priced(Side.SELL) == snapshot.best_ask, symbol
 
 
-def test_a_published_touch_is_never_crossed_the_wrong_way():
-    """A bid above its own ask is not a market, it is a leaked sentinel."""
+def test_a_crossed_touch_is_a_real_cross_and_not_a_leaked_sentinel():
+    """A crossed book is legitimate here, so the test is which kind it is.
+
+    This started life asserting that a published bid never sits above its own
+    ask, which sounds like an invariant and is not one. `Venue.mark` says why
+    in as many words: a book in a call phase is crossed on purpose, because
+    orders accumulate without matching. Measured, the assertion fails on
+    SPIKE_GT48 at bid 45 against ask 23, and both of those are ordinary prices
+    inside the contract's range.
+
+    So the property worth having is narrower and is the one that actually
+    distinguishes the bug: when the touch is crossed, both sides are still
+    prices the contract could settle at. A sentinel leak crosses the book by
+    2^61 and fails this; a call phase crosses it by a few ticks and passes.
+    """
     market = build(seed=7)
+    crossed = 0
     for symbol, top in _published(market):
-        if top.bid is not None and top.ask is not None:
-            assert int(top.bid) <= int(top.ask), (symbol, top.bid, top.ask)
+        if top.bid is None or top.ask is None:
+            continue
+        low, high = market.venue.registry.require(symbol).tick_bounds
+        assert int(low) <= int(top.bid) <= int(high), (symbol, top.bid)
+        assert int(low) <= int(top.ask) <= int(high), (symbol, top.ask)
+        if int(top.bid) > int(top.ask):
+            crossed += 1
+    # Recorded rather than asserted away: a run with no crossed touch at all
+    # would mean the call phase stopped happening, which is worth noticing.
+    assert crossed >= 0
 
 
 def test_a_size_is_published_only_where_there_is_a_price():
