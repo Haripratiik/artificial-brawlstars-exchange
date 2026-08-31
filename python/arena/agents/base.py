@@ -19,13 +19,21 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from arena.exchange.events import Acknowledged, Cancel, Filled, Rejected, Submit
+from arena.exchange.events import (
+    Acknowledged,
+    Cancel,
+    Filled,
+    Rejected,
+    Replaced,
+    Submit,
+)
 from arena.exchange.types import (
     AgentId,
     OrderId,
     OrderType,
     Price,
     Quantity,
+    RejectReason,
     Side,
     TimeInForce,
 )
@@ -36,6 +44,25 @@ from arena.sim.messages import Feed, PrivateEvent, Subscribe, TopOfBook, TradePr
 from arena.sim.time import Duration, Timestamp
 
 __all__ = ["TradingAgent", "LocalBook"]
+
+
+# The refusals that mean the order itself is gone, as opposed to the ones that
+# mean an *amendment* to it was refused while it carried on resting.
+#
+# The distinction cannot be read off a ``Rejected`` event, because the engine
+# reports a refused Submit and a refused Replace with the same shape and the
+# same order id. It can be read off what the agent sent, which is why
+# ``note_replace`` exists. These three are the reasons that are true about the
+# order rather than about the command: an id the engine has never heard of, an
+# order already finished, and an order belonging to somebody else are all
+# statements that there is nothing of ours resting under that id.
+_ORDER_IS_GONE = frozenset(
+    {
+        RejectReason.UNKNOWN_ORDER,
+        RejectReason.ALREADY_TERMINAL,
+        RejectReason.NOT_ORDER_OWNER,
+    }
+)
 
 
 @dataclass(slots=True)
@@ -149,9 +176,30 @@ class TradingAgent:
         self._intent: dict[tuple[str, Side], tuple[int, int]] = {}
         # Orders known to be finished, so a late message cannot revive one.
         self._completed: dict[tuple[str, OrderId], None] = {}
+        # Amendments this agent has sent and not yet had answered, counted per
+        # order. It is the only thing that tells a refused *replace* -- after
+        # which the original is still resting -- from a refused *submit*, after
+        # which nothing is. The engine reports both as ``Rejected`` carrying the
+        # same order id, and an agent may not ask the book which it was.
+        #
+        # Measured, on an order resting for ten lots amended to a million: the
+        # venue refused it INSUFFICIENT_COLLATERAL and left the order exactly
+        # where it was -- the engine held it, the venue held it and reserved
+        # collateral against it -- and the agent dropped it, after which
+        # ``cancel`` answered "no such live order". Every guard on the replace
+        # path ended in exposure its owner was no longer allowed to manage,
+        # which is the outcome the venue's own rate limiter goes out of its way
+        # to avoid, arriving by the other door.
+        self._amending: dict[tuple[str, OrderId], int] = {}
         self.position: dict[str, int] = dict.fromkeys(instruments, 0)
         self.fills = 0
         self.rejects = 0
+        # Amendments answered, counted for the reason ``fills`` and ``rejects``
+        # are: ``_numbered`` derives a monotonic, eviction-proof cursor from a
+        # counter rather than from a position in a log that gets trimmed. A
+        # replace is a third sequence and not a member of either of theirs --
+        # fill 3, rejection 3 and amendment 3 are unrelated events.
+        self.amendments = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -251,18 +299,118 @@ class TradingAgent:
             self.position[symbol] = self.position.get(symbol, 0) + signed
             if int(event.remaining) == 0:
                 self._complete(key)
+        elif isinstance(event, Replaced):
+            # A replace keeps the order id and keeps the order. Falling through
+            # to the branch below -- which is where this landed, because
+            # ``Replaced`` is neither an ack nor a fill nor a refusal -- treated
+            # a successful amendment as the end of the order.
+            #
+            # Measured, on a bid for ten amended to six at the same price: the
+            # engine held it resting for six, the venue held it and reserved
+            # collateral against it, and the agent's working orders went
+            # **empty**. ``cancel`` and ``replace`` then both answered "no such
+            # live order", the snapshot's blotter showed nothing, and
+            # ``cancel_all`` walked a list the order was no longer in and left
+            # it standing in the book.
+            #
+            # It is worse for a peg, which is the whole point of a peg: the
+            # engine emits a ``Replaced`` every time the reference moves, so an
+            # order pegged to the bid became uncancellable at its **first**
+            # reprice. Measured, two lots resting at 4,889.00 with the venue
+            # reserving against them and the agent tracking none of it.
+            #
+            # Counted before anything else, and unconditionally, because the
+            # counter is a cursor over the log and the log gets one entry per
+            # private event whatever this method then decides about it.
+            self.amendments += 1
+            self._resolve_amendment(key)
+            if key is not None and key not in self._completed:
+                self.live_orders[key] = symbol
+                side = self.order_side.get(key)
+                if side is not None:
+                    # The result, not the request -- the same argument the
+                    # acknowledgement above makes. A peg that reprices has moved
+                    # the quote this agent believes it is working, and an intent
+                    # left pointing at the old price is an agent that sees no
+                    # reason to requote an order that is no longer there.
+                    self._intent[(symbol, side)] = (
+                        int(event.price),
+                        int(event.quantity),
+                    )
         elif isinstance(event, Rejected):
             self.rejects += 1
-            self._complete(key)
+            # A refusal is not always a removal, and which one it is depends on
+            # what was refused rather than on anything in the event. The engine
+            # refuses a replace it dislikes and leaves the original exactly
+            # where it was -- the same fact ``Venue._track_working`` records,
+            # which it settles by asking the engine's book. An agent may not
+            # ask the book, so it asks itself: an outstanding amendment on this
+            # order, refused for a reason that is about the command rather than
+            # about the order, leaves the order resting.
+            #
+            # ``key in self.live_orders`` covers the race the other way. A fill
+            # that finished the order while the amendment was in flight has
+            # already completed it, and a refusal arriving afterwards must not
+            # bring it back.
+            amended = self._resolve_amendment(key)
+            if not (
+                amended
+                and key in self.live_orders
+                and event.reason not in _ORDER_IS_GONE
+            ):
+                self._complete(key)
         else:
             self._complete(key)
         self.on_private(ctx, event)
+
+    def note_replace(self, symbol: str, order_id: OrderId) -> None:
+        """Record that this agent has sent an amendment for one order.
+
+        **Anything that sends a ``Replace`` on this agent's behalf must call
+        this.** ``HumanAgent.enqueue`` does it by reading the command it is
+        about to send, which is why ``LiveMarket.replace`` does not have to
+        remember to. An agent that skips it still trades correctly; what it
+        loses is the ability to tell a refused *amendment* -- after which its
+        order is still resting -- from a refused *order*, and it will drop a
+        live order from its own book the first time a guard fires.
+
+        Counted rather than flagged, so two amendments in flight on one order
+        are answered by two events and the second answer does not read as an
+        answer to a command nobody sent.
+        """
+        key = (symbol, order_id)
+        self._amending[key] = self._amending.get(key, 0) + 1
+        if len(self._amending) > 4096:
+            # Bounded for the reason ``_completed`` is. An amendment goes
+            # unanswered when the command never reached a book at all -- an
+            # unknown symbol is refused without an order id -- and a long
+            # session must not accumulate those without limit.
+            for stale in list(self._amending)[:2048]:
+                del self._amending[stale]
+
+    def _resolve_amendment(self, key: Any) -> bool:
+        """Consume one outstanding amendment. True if there was one to consume."""
+        if key is None:
+            return False
+        outstanding = self._amending.get(key, 0)
+        if outstanding <= 0:
+            return False
+        if outstanding > 1:
+            self._amending[key] = outstanding - 1
+        else:
+            del self._amending[key]
+        return True
 
     def _complete(self, key: Any) -> None:
         if key is None:
             return
         self.live_orders.pop(key, None)
         self.order_side.pop(key, None)
+        # Nothing further can be answered about an order that is finished, so
+        # any amendment still counted against it never will be. Dropped here
+        # rather than left to the bound, or an order filled while two replaces
+        # were in flight leaks an entry for the rest of the session.
+        self._amending.pop(key, None)
         # A dict rather than a set, purely for its insertion order. Trimming a
         # set to "the last 2048" is a sentence with no meaning -- ``list(set)``
         # yields hash order -- so the old bound discarded an arbitrary half of
