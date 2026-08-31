@@ -45,6 +45,8 @@ from typing import Any
 
 from arena.agents.base import TradingAgent
 from arena.exchange.events import Filled
+from arena.portfolio.account import Account
+from arena.portfolio.money import MONEY_SCALE, from_money
 from arena.exchange.types import AgentId, Side, TimeInForce
 from arena.market.instrument import Instrument
 from arena.sim.kernel import SimulationContext
@@ -111,7 +113,25 @@ class StrategyAgent(TradingAgent):
         self.taker = taker
         self.requote_on_fill = requote_on_fill
         self.starting_cash = starting_cash
-        self.cash = starting_cash
+        # The strategy's own book, kept with the venue's own arithmetic.
+        #
+        # An agent is never told its cash, so it adds its fills up, exactly as a
+        # desk reconciles its own book against the clearer's. Using `Account`
+        # rather than a hand-rolled tally is not a shortcut: it is public
+        # arithmetic on this agent's own fills, the same way `worst_case` is,
+        # and it is the only way the two agree by construction.
+        #
+        # The first version of this debited notional on every fill, which is
+        # spot accounting on a venue that does not do spot. `Account.apply_fill`
+        # says why in as many words: a futures position is a collateralised
+        # commitment rather than a purchase, so only realised P&L and fees move
+        # cash before settlement. Measured against the venue after 120 simulated
+        # seconds, the hand-rolled version was 125,564 light on cash and, worse,
+        # charged 242,354 of collateral where the venue charged 144,392, because
+        # it valued the requirement at the current mid instead of the basis the
+        # position actually holds. A strategy sizing off that under-trades by
+        # two thirds.
+        self._book = Account(f"shadow-{agent_id}", self._minor(starting_cash))
         # Fills of this agent's own, waiting for the markout horizon to pass.
         self._open_markouts: deque[_OpenMarkout] = deque()
         self._markout: dict[tuple[str, Side], float] = {}
@@ -164,42 +184,35 @@ class StrategyAgent(TradingAgent):
             rng=getattr(ctx, "rng", None),
         )
 
+    @staticmethod
+    def _minor(amount: Decimal) -> int:
+        return int(amount * MONEY_SCALE)
+
+    @property
+    def cash(self) -> Decimal:
+        """Realised P&L against the starting balance, not a purchase ledger."""
+        return from_money(self._book.cash)
+
     def posted_collateral(self) -> Decimal:
         """What this agent's open positions cost to hold.
 
-        Per contract and ungrossed, which is what the venue charges today. It
-        is computed here rather than asked for, because the arithmetic is
-        public -- the same bounded worst case the collateral engine uses -- and
-        an agent that had to ask would be an agent with a channel to privileged
-        state.
+        Charged against each position's own basis, which is what it would
+        actually lose, and per contract rather than netted, because that is
+        what the venue charges today. Computed here rather than asked for: the
+        arithmetic is public, and an agent that had to ask would be an agent
+        with a channel to privileged state.
         """
-        total = Decimal(0)
-        for symbol, quantity in self.position.items():
-            if not quantity:
-                continue
-            book = self.books[symbol]
-            instrument = self.instruments[symbol]
-            reference = book.mid if book.mid is not None else book.last
-            price = (
-                instrument.from_ticks(int(reference))
-                if reference is not None
-                else sum(instrument.spec.value_bounds) / 2
-            )
-            total += instrument.collateral_for(quantity, price)
-        return total
+        return from_money(sum(self._book.collateral.values(), start=0))
 
     def unrealized(self) -> Decimal:
-        total = Decimal(0)
-        for symbol, quantity in self.position.items():
-            if not quantity:
-                continue
+        marks = {}
+        for symbol, instrument in self.instruments.items():
             book = self.books[symbol]
-            instrument = self.instruments[symbol]
             reference = book.mid if book.mid is not None else book.last
             if reference is None:
                 continue
-            total += instrument.from_ticks(int(reference)) * quantity
-        return total
+            marks[symbol] = instrument.price_in_minor(int(reference))
+        return from_money(self._book.equity(marks)) - self.cash
 
     # -- measuring its own fills -------------------------------------------
 
@@ -221,7 +234,17 @@ class StrategyAgent(TradingAgent):
             return
         instrument = self.instruments[symbol]
         signed = int(quantity) * (1 if side is Side.BUY else -1)
-        self.cash -= instrument.from_ticks(int(price)) * signed
+        # Fee zero, because a `Filled` does not carry one and the venue never
+        # tells an agent what it was charged. That is realistic rather than a
+        # gap -- a desk reconciles fees afterwards -- but it means this book is
+        # pre-fee and will sit slightly above the venue's. Measured on the
+        # incumbent makers, fees were 0.3% of P&L.
+        self._book.apply_fill(
+            symbol,
+            signed,
+            instrument.price_in_minor(int(price)),
+            instrument.bounds_in_minor,
+        )
 
         book = self.books[symbol]
         mid = book.mid if book.mid is not None else float(int(price))
@@ -291,7 +314,14 @@ class StrategyAgent(TradingAgent):
             # range clamp and the grid snap. Repeating that test here against a
             # differently-rounded number would report a move that is not one.
             price = snap(instrument, side, quote.price)
-            self.post(ctx, symbol, side, instrument.to_ticks(price), int(quote.size))
+            self.post(
+                ctx,
+                symbol,
+                side,
+                instrument.to_ticks(price),
+                int(quote.size),
+                TimeInForce.POST_ONLY if quote.post_only else TimeInForce.GTC,
+            )
 
     def _apply_take(self, ctx: SimulationContext, intent: Any) -> None:
         symbol = intent.symbol

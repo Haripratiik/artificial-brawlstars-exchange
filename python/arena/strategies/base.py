@@ -84,6 +84,19 @@ class Quote:
 
     price: Decimal
     size: int
+    # Refuse this order outright rather than let it cross. The engine has
+    # always supported it and the venue has always had a rejection reason for
+    # it; the strategy layer simply had no way to ask, so every quote went out
+    # good-till-cancelled and a maker whose fair value was through the touch
+    # took liquidity instead of providing it.
+    #
+    # Off by default because it is not free. Measured on a 180s run: the
+    # aggressive share of a fixed-spread maker's fills falls from 30.7% to
+    # 1.4%, but 31,804 orders are refused, fills drop from 26,131 to 4,872,
+    # and its P&L gets worse. A maker that cannot cross also cannot exit, so
+    # this is a choice a strategy makes per quote and not a policy imposed on
+    # every strategy.
+    post_only: bool = False
 
     def __post_init__(self) -> None:
         if self.size <= 0:

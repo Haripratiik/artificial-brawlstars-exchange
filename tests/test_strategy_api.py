@@ -351,6 +351,60 @@ def test_an_unchanged_quote_keeps_its_place_in_the_queue():
     assert {k: v for k, v in agent.live_orders.items() if v == symbol} == working
 
 
+def test_a_maker_can_refuse_to_cross():
+    """Post-only, which the engine has always had and the strategy layer had not.
+
+    A maker whose fair value is through the touch takes liquidity instead of
+    providing it, and until a quote could carry a time-in-force there was no
+    way to say otherwise: every quote went out good-till-cancelled. Measured
+    over 60 simulated seconds with a strategy that deliberately quotes through
+    the touch on both sides, fills fall from 10,818 to 99.
+
+    It is not free and so it is not the default. The orders that do not cross
+    are refused rather than repriced, and a maker that cannot cross also
+    cannot exit its inventory, so this is a choice per quote.
+    """
+
+    class Crosser:
+        def __init__(self, post_only):
+            self.post_only = post_only
+
+        def symbols(self, view):
+            return list(view.symbols)
+
+        def quote(self, view, symbol):
+            v = view[symbol]
+            reference = v.reference
+            if reference is None:
+                return TwoSided()
+            low, high = v.bounds
+            edge = (high - low) * Decimal("0.01")
+            # Bid above and ask below the reference, so both sides cross.
+            return TwoSided(
+                bid=Quote(reference + edge, 5, post_only=self.post_only),
+                ask=Quote(reference - edge, 5, post_only=self.post_only),
+            )
+
+    crossing, _ = _market(Crosser(False))
+    crossing.kernel.start()
+    crossing.kernel.advance(until=seconds(60))
+    freely = next(a for a in crossing.agents if a.agent_id == "strat-1").fills
+
+    refusing, _ = _market(Crosser(True))
+    refusing.kernel.start()
+    refusing.kernel.advance(until=seconds(60))
+    refused = next(a for a in refusing.agents if a.agent_id == "strat-1").fills
+
+    assert freely > 10 * refused
+    assert crossing.venue.conservation_check() == 0
+    assert refusing.venue.conservation_check() == 0
+
+
+def test_a_quote_is_good_till_cancelled_unless_it_says_otherwise():
+    """The default has to stay what every existing strategy already assumed."""
+    assert Quote(Decimal(1), 1).post_only is False
+
+
 class _LiveCtx:
     """A context that records sends instead of making them."""
 
