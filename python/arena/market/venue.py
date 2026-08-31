@@ -310,6 +310,22 @@ class Venue:
         # filled *me*", and that has to survive everyone else's activity.
         self.fills_log: dict[str, list[dict[str, Any]]] = {}
 
+        # An optional observer of every print, with both sides named. `None`
+        # by default and costing one attribute test per trade, because a market
+        # should not pay for a measurement nobody asked for.
+        #
+        # It exists because identities cannot be recovered afterwards. Prices
+        # and mids can be sampled from outside at any time -- that is what
+        # `research.recorder` does, and being outside is what makes it unable
+        # to perturb what it measures. But an order id resolves to an agent
+        # only while the order is still in the book, so *who traded* has to be
+        # taken here or not at all, which is the same reason
+        # `_record_counterparties` runs where it does.
+        #
+        # The entry passed is the one in `fills_log` and is shared with the
+        # other side of the trade. An observer must not mutate it.
+        self.trade_observer: Callable[[dict[str, Any]], None] | None = None
+
     # -- listing and accounts ---------------------------------------------
 
     def list_instrument(self, instrument: Instrument) -> None:
@@ -1095,6 +1111,8 @@ class Venue:
             log.append(entry)
             if len(log) > 60:
                 del log[:-60]
+        if self.trade_observer is not None:
+            self.trade_observer(entry)
 
     def counterparties_for(self, agent_id: AgentId, limit: int = 40) -> list[dict[str, Any]]:
         """The other side of this agent's recent fills, most recent first."""
