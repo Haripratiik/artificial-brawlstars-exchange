@@ -25,7 +25,7 @@ here is a measurement, not an argument, and keeping the paper's behaviour
 intact is what makes the measurement mean anything.
 
 A related measurement is worth putting at the top, because it reverses
-something this repository already believed. AGENTS.md records widening backfiring
+something this repository already believed. CONTRIBUTING.md records widening backfiring
 twice on this venue, by 9.4x and by 2.2x, and explains why: three makers are
 roughly 98% of the book, so widening *them* widens the mid everybody else
 prices off, and the informed traders size by ``|edge| / uncertainty`` and
@@ -55,7 +55,7 @@ is documented as "``None`` where the calendar has not been wired", and
 ``StrategyAgent._symbol_view`` passes ``seconds_to_expiry=None`` unconditionally,
 so a strategy running under the adapter never learns ``T``. A model whose
 central term is an input nobody supplies is a guard whose input was never
-wired, which is the sixth bug class in AGENTS.md.
+wired, which is the sixth bug class in CONTRIBUTING.md.
 
 The deep reason is that ``(T - t)`` is time to *liquidation at the mid*, and
 nothing here is liquidated at the mid. Every contract on this venue settles as
@@ -220,7 +220,7 @@ def place(
     the model asked for, and :func:`on_increment` finishes the grid where the
     contract carries a tick table. What is added on top is the option of
     refusing to quote through the other side of the book, and it is applied to
-    each side separately: the AGENTS.md table records that clamping the
+    each side separately: the CONTRIBUTING.md table records that clamping the
     *centre* of a quote makes the mid a function of the half-spread, so two
     worthless calls priced 40 points apart.
 
@@ -433,7 +433,7 @@ class AvellanedaStoikov:
         # `1 / k`, so 0.2 asks for 5.0 ticks a side. The measured median
         # half-spread of this book over 47 contracts and 600s on seed 7 is 6.0
         # ticks, p10 4.5 and p90 9.0, so this quotes just inside the median
-        # rather than wider than it. AGENTS.md records both attempts at
+        # rather than wider than it. CONTRIBUTING.md records both attempts at
         # widening on this venue making the loss worse.
         self.k_ticks = k_ticks
         # Twelve lots against the incumbents' 30, 22 and 14, and a 90 lot bound
@@ -492,7 +492,7 @@ class AvellanedaStoikov:
         # specific failure that produced the makers here aggressive on 61% of
         # their fills.
         #
-        # AGENTS.md records clamping to the touch costing the incumbents 9.4x,
+        # CONTRIBUTING.md records clamping to the touch costing the incumbents 9.4x,
         # so this was measured rather than inherited. Over 300s on seeds 7 and
         # 11, crossing takes the passive share of this strategy's own lots from
         # 66.3% and 61.1% down to 19.1% and 19.5%, and the lots it trades from
@@ -585,7 +585,7 @@ class AvellanedaStoikov:
         span = high - low
 
         # Each side is placed on its own. Clamping the *centre* into the range
-        # was tried on this venue and is in the AGENTS.md table of things that
+        # was tried on this venue and is in the CONTRIBUTING.md table of things that
         # look like improvements: it makes the mid a function of the
         # half-spread, so two contracts worth the same amount price 40 points
         # apart.

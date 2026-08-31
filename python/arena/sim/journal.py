@@ -55,7 +55,7 @@ canonical JSON: sorted keys, no insignificant whitespace, ASCII escaped.
 because a persisted 0.1 is not 0.1 and this project's conservation check
 returns an exact integer zero. ``Decimal`` and ``tuple`` because JSON would
 quietly hand them back as ``str`` and ``list``: that is bug class 1 in
-``AGENTS.md`` (a value crossing a boundary in a form its label does not claim,
+``CONTRIBUTING.md`` (a value crossing a boundary in a form its label does not claim,
 one consumer compensating, every other consumer wrong), and a journal is the
 widest boundary in the system. Money is integer minor units, time is integer
 nanoseconds, prices are integer ticks.
@@ -254,7 +254,7 @@ def _check_persistable(value: Any, path: str = "payload") -> None:
     *Silent type changes.* ``json`` turns a ``Decimal`` into whatever a custom
     encoder says, a ``tuple`` into a ``list``, and an integer dict key into a
     string. Every one of those round-trips without complaint and comes back a
-    different type, which is bug class 1 in ``AGENTS.md`` verbatim: a value
+    different type, which is bug class 1 in ``CONTRIBUTING.md`` verbatim: a value
     crossing a boundary in a form its label does not claim. Refusing at write
     time costs the caller one conversion and buys exact equality on replay.
     """
@@ -966,7 +966,7 @@ def repair(path: str | os.PathLike[str]) -> int:
     Raises rather than truncating if the damage is mid-file, because a
     checksum failure with valid records behind it means loss, not an interrupted
     write, and silently discarding the records after it would be exactly the
-    "dropping instead of delaying" failure ``AGENTS.md`` calls out.
+    "dropping instead of delaying" failure ``CONTRIBUTING.md`` calls out.
     """
     target = os.fspath(path)
     with open(target, "rb") as probe:

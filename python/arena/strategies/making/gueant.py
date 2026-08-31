@@ -32,7 +32,7 @@ been hurt contributes nothing.
 Where the model is applied is a measurement, not the paper
 ---------------------------------------------------------
 
-AGENTS.md records two attempts to defend the makers on this venue by width,
+CONTRIBUTING.md records two attempts to defend the makers on this venue by width,
 both of which made the loss worse: clamping quotes so they never cross the
 touch was 9.4x worse, and widening each side by half the measured markout was
 2.2x worse. The second of those is literally the ``xi/2`` term above, so it was
@@ -52,7 +52,7 @@ brake, and on a venue where adverse selection runs at 124% and 140% of this
 strategy's own loss the most valuable thing a maker can do is trade less. Worth
 saying plainly, because "5.7x better" invites the wrong fix.
 
-The two findings agree about the mechanism. AGENTS.md gives the reason widening
+The two findings agree about the mechanism. CONTRIBUTING.md gives the reason widening
 failed there, and the reason is a feedback loop: the three incumbents are
 roughly 98% of the book, so widening *them* widens the mid the informed traders
 price off, and those traders size by ``|edge| / uncertainty``, so the wider mid
@@ -73,7 +73,7 @@ Both earn it: with the width term on, dropping the skew half cost 1.5x and
 1.05x when it was measured, -2,763,780 and -3,940,565 becoming -4,108,570 and
 -4,136,353.
 
-The third channel is size, which the paper does not have and which AGENTS.md
+The third channel is size, which the paper does not have and which CONTRIBUTING.md
 points at directly: a fill at distance ``d`` on a side whose measured markout
 is ``xi`` earns ``d - xi``, so a side whose edge has gone is a side to show
 less on, or none at all. ``TwoSided`` is built for that. Its own docstring says
@@ -206,7 +206,7 @@ class GueantLehalleFT:
         self.quote_size = quote_size
         self.inventory_bound = inventory_bound
         # Whether to spend the measured markout on width, which is the paper's
-        # own prescription and is the intervention AGENTS.md records as 2.2x
+        # own prescription and is the intervention CONTRIBUTING.md records as 2.2x
         # worse when it was applied to the incumbent makers. Measured again for
         # this strategy on a 20,000,000 seat over 300s, and it is 5.7x and 4.1x
         # *better* on seeds 7 and 11: -12,559,906 and -12,962,477 become
@@ -243,7 +243,7 @@ class GueantLehalleFT:
         # -3,940,565 to -19,592,181 and -14,020,819, the passive share of its
         # own lots from 75.3% and 71.5% to 14.9% and 14.8%, and the orders the
         # venue refuses for collateral from 127 and 165 to 12,019 and 3,344.
-        # AGENTS.md records clamping to the touch costing the incumbents 9.4x
+        # CONTRIBUTING.md records clamping to the touch costing the incumbents 9.4x
         # and that is a different experiment: they are the book, and a maker
         # that cannot cross has nowhere to unwind into.
         self.cross_touch = cross_touch
@@ -387,7 +387,7 @@ class GueantLehalleFT:
                 size = max(1, round(size * (edge / distance)))
             offset = -distance if side is Side.BUY else distance
             # Each side snapped and clamped on its own. Clamping the centre
-            # into the range instead is in the AGENTS.md table of things that
+            # into the range instead is in the CONTRIBUTING.md table of things that
             # look like improvements and are not: it makes the mid a function
             # of the half-spread, so two contracts worth the same amount price
             # 40 points apart.

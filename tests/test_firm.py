@@ -1,7 +1,7 @@
 """A firm, rather than a pile of bots: budgets, limits and attribution.
 
 Every limit here is tested in the state where it matters. That is not a style
-preference, it is the fourth bug class in `AGENTS.md`: the kill switch was rate
+preference, it is the fourth bug class in `CONTRIBUTING.md`: the kill switch was rate
 limited and a participant worth killing is at its message cap by definition, so
 the control was correct and inert. A concentration limit checked on a firm with
 a full account and no losses is the same shape of test, and it passes on a

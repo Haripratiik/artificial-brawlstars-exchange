@@ -140,9 +140,12 @@ python experiments/information_aggregation/run.py --quick
 
 ## Documentation
 
+- [AGENTS.md](AGENTS.md), for an autonomous agent trading here over the API: what this venue guarantees that a real one does not, what will refuse your orders and why, and the things that have actually broken clients
+- [docs/STRATEGIES.md](docs/STRATEGIES.md), to write a market-making or buy-side strategy that runs inside the simulation, with a backtest harness that reports whether its own paired trials helped
 - [docs/PLAN.md](docs/PLAN.md), the phase plan and what each phase had to prove before it closed
 - [docs/API.md](docs/API.md), the programmatic interface, with worked signing vectors so a client in another language can check itself
 - [docs/ECONOMY.md](docs/ECONOMY.md), where value comes from and why every contract is bounded
 - [docs/collector.md](docs/collector.md), how the battle corpus is crawled and aggregated
 - [docs/GAPS.md](docs/GAPS.md), this exchange measured against real venue mechanics
 - [experiments/information_aggregation/](experiments/information_aggregation/README.md), the full experimental write-up
+- [CONTRIBUTING.md](CONTRIBUTING.md), for changing this repository rather than trading on it, which is a different job with different traps

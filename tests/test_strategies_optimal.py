@@ -47,7 +47,7 @@ selection is 124% and 140% of GLFT's loss and 142% and 141% of A-S's, against
 the 117% the incumbents run at. The quoting rule is not what is wrong here.
 
 The one large lever is GLFT's ``xi`` width term, section 5.2's own
-prescription, which AGENTS.md records as 2.2x *worse* when it was applied to
+prescription, which CONTRIBUTING.md records as 2.2x *worse* when it was applied to
 the incumbents and which is 5.7x and 4.1x **better** here. Per lot it is
 slightly worse, -43.3 and -46.5 becoming -46.3 and -61.5; the whole of the gain
 is that it trades a sixth as many lots. Width is a brake rather than a better
@@ -56,7 +56,7 @@ widening them widens the mid the informed price off and those traders size by
 |edge|/uncertainty.
 
 None of those numbers is asserted anywhere below. They move with the listing,
-with the seed, and with anything else added to the market, and AGENTS.md is
+with the seed, and with anything else added to the market, and CONTRIBUTING.md is
 explicit that a number like that gets re-measured rather than loosened.
 """
 
@@ -203,7 +203,7 @@ def test_reservation_price_is_the_papers_equation(listed, symbol, inventory):
     )
     # And the same statement in the contract's own price units, because a model
     # that is right in normalised space and wrong at the boundary is the first
-    # bug class in AGENTS.md.
+    # bug class in CONTRIBUTING.md.
     low, _ = instrument.spec.value_bounds
     assert float(low) + solved.reservation * span == pytest.approx(
         float(low) + level * span - inventory * gamma * variance * span
@@ -443,7 +443,7 @@ def test_xi_is_the_measured_markout_and_only_its_adverse_half(listed):
 def test_xi_splits_into_a_width_half_and_a_skew_half(listed):
     """Turning the width off leaves the centre free to move, and only that.
 
-    AGENTS.md records widening each side by half the measured markout, which is
+    CONTRIBUTING.md records widening each side by half the measured markout, which is
     literally this term, costing 2.2x on this venue. The symmetric part of
     ``xi`` is the whole of that width and the antisymmetric part is skew, so
     they are separable and the evidence says to spend one and not the other.
@@ -610,7 +610,7 @@ def test_every_quote_is_a_decimal_on_the_grid_inside_the_bounds(
     inventories out past the bound, because the failure this catches is a
     strategy that is correct in the middle and quotes a price the contract
     cannot pay at the edge. The range clamp is applied to each side separately:
-    clamping the *centre* is in the AGENTS.md table of things that look like
+    clamping the *centre* is in the CONTRIBUTING.md table of things that look like
     improvements, since it makes the mid a function of the half-spread.
     """
     for instrument in listed.values():
@@ -733,7 +733,7 @@ def test_reference_price_reads_a_mid_of_exactly_zero(listed):
 def test_not_crossing_the_touch_holds_each_side_independently(listed):
     """The centre never moves to keep a side inside the book.
 
-    Clamping the centre of a quote is in the AGENTS.md table of things that
+    Clamping the centre of a quote is in the CONTRIBUTING.md table of things that
     look like improvements and are not: it makes the mid a function of the
     half-spread, so two calls both worth nothing marked 40 points apart. Each
     side is held on its own here, and a side with no room left is dropped
@@ -805,7 +805,7 @@ def test_the_strategy_trades_and_conservation_stays_zero(strategy_class):
 
     Conservation is checked as an exact integer, because it is one:
     ``venue.conservation_check()`` returns ``int`` and returns ``0``, and
-    AGENTS.md is explicit that a tolerance here would be hiding a bug
+    CONTRIBUTING.md is explicit that a tolerance here would be hiding a bug
     elsewhere.
 
     What it traded is in the module docstring. Nothing about the size of the

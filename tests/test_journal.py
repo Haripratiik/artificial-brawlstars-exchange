@@ -338,7 +338,7 @@ def test_persisted_records_refuse_lossy_values(payload, needle):
     be undone, and this project's conservation check returns an exact integer
     zero. A ``Decimal`` or a ``tuple`` is worse than wrong: it round-trips
     without complaint as a ``str`` or a ``list``, which is bug class 1 in
-    AGENTS.md -- a value crossing a boundary in a form its label does not claim.
+    CONTRIBUTING.md -- a value crossing a boundary in a form its label does not claim.
     """
     journal = Journal.in_memory(engine_version=ENGINE)
     with pytest.raises(TypeError, match=needle):
@@ -435,7 +435,7 @@ def test_corrupt_middle_record_raises_instead_of_truncating():
     """Mid-file damage is loss, not wear.
 
     Truncating here would silently discard every record behind the damage, which
-    is the "dropping instead of delaying" failure AGENTS.md names: the consumer
+    is the "dropping instead of delaying" failure CONTRIBUTING.md names: the consumer
     is never told what it lost.
     """
     data = bytearray(build_journal())
