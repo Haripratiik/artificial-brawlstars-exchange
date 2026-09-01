@@ -292,8 +292,13 @@ def run_trial(config: TrialConfig) -> TrialResult:
     engine = venue.engine(SYMBOL)
     for i in range(1, total_steps + 1):
         kernel.advance(until=Timestamp(i * step))
-        bid = engine.book.best_price(Side.BUY)
-        ask = engine.book.best_price(Side.SELL)
+        # `best_priced`, not `best_price`. Market-on-open interest rests at a
+        # sentinel so that it crosses everything in the call, and this loop is
+        # sampling the mid that *becomes the market's forecast*. A single
+        # sentinel sample would put 2^62 into the average and the trial would
+        # report it as the market's opinion.
+        bid = engine.book.best_priced(Side.BUY)
+        ask = engine.book.best_priced(Side.SELL)
         mids.append(None if bid is None or ask is None else (int(bid) + int(ask)) / 2)
     kernel.finish()
 
