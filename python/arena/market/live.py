@@ -521,14 +521,21 @@ class LiveMarket:
         blotter it is reading already shows both; without one, the lookup falls
         back to a search and refuses if it is ambiguous.
         """
-        self._record(
-            "cancel",
-            {
-                "order_id": int(order_id),
-                "trader": None if trader is None else str(trader),
-                "symbol": symbol,
-            },
-        )
+        # Only a well-formed address is recorded. Callers reach this with a
+        # `(symbol, id)` key as well as a bare id, and the lookup below refuses
+        # the former on its own terms; coercing it here raised instead, turning
+        # a refusal into a crash on a path that had worked for as long as it
+        # existed. An input the venue cannot even address is not one a replay
+        # could apply, so it is left out rather than recorded unusably.
+        if isinstance(order_id, int):
+            self._record(
+                "cancel",
+                {
+                    "order_id": int(order_id),
+                    "trader": None if trader is None else str(trader),
+                    "symbol": symbol,
+                },
+            )
         who = self.trader(trader)
         if symbol is None:
             matches = [key for key in who.live_orders if key[1] == order_id]
@@ -585,16 +592,19 @@ class LiveMarket:
         never existed -- confirming that an id exists but belongs to another
         account tells a stranger something about that account.
         """
-        self._record(
-            "replace",
-            {
-                "order_id": int(order_id),
-                "quantity": int(quantity),
-                "price": None if price is None else str(price),
-                "trader": None if trader is None else str(trader),
-                "symbol": symbol,
-            },
-        )
+        # Same guard as `cancel`, for the same reason: instrumentation must not
+        # be able to fail a command that would otherwise have been refused.
+        if isinstance(order_id, int):
+            self._record(
+                "replace",
+                {
+                    "order_id": int(order_id),
+                    "quantity": int(quantity),
+                    "price": None if price is None else str(price),
+                    "trader": None if trader is None else str(trader),
+                    "symbol": symbol,
+                },
+            )
         who = self.trader(trader)
         if symbol is None:
             matches = [key for key in who.live_orders if key[1] == order_id]

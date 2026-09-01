@@ -209,3 +209,34 @@ def test_the_clock_moves_before_the_command_lands():
     apply_input(market, At30())
     assert market._sim_seconds == pytest.approx(30.0)
     assert int(market.kernel.now) >= int(seconds(30))
+
+
+def test_recording_cannot_fail_a_command_that_would_have_been_refused():
+    """Instrumentation must not change what the venue does, including failing.
+
+    `cancel` is reached with a `(symbol, id)` key as well as a bare id, and the
+    lookup refuses the former on its own terms. Building the journal payload
+    coerced it eagerly, so `int(("SPIKE_WR_FUT", 4))` raised and a refusal
+    became a crash, on a path that had worked for as long as it existed, and on
+    a market with no journal attached at all.
+
+    Asserted both ways round, because the property is that the two markets
+    behave identically rather than that either one succeeds.
+    """
+    plain = build(seed=7)
+    plain.kernel.start()
+    plain.kernel.advance(until=seconds(10))
+
+    watched = build(seed=7)
+    watched.journal = Journal.in_memory(
+        engine_version=ENGINE_VERSION, metadata={"seed": 7}
+    )
+    watched.kernel.start()
+    watched.kernel.advance(until=seconds(10))
+
+    malformed = ("SPIKE_WR_FUT", 4)
+    assert plain.cancel(malformed) == watched.cancel(malformed)
+    assert plain.replace(malformed, 1) == watched.replace(malformed, 1)
+
+    # And nothing unreplayable was written.
+    assert [r.kind for r in read_records(watched.journal.to_bytes())] == []
