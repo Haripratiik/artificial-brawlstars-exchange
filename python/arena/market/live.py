@@ -84,6 +84,18 @@ def _indicative_price(venue, instrument, symbol: str) -> str | None:
     return str(instrument.from_ticks(result.price))
 
 
+# What a journal has to agree with before its records may be replayed here.
+#
+# Not a package version. It identifies the deterministic behaviour of this
+# market, so it has to change whenever a replay of the same inputs would
+# produce a different exchange: the agent population, the seeding, the order
+# the kernel runs things in, or the meaning of a recorded input. A journal
+# whose header disagrees is refused rather than replayed, because the failure
+# it prevents is silent -- the same commands land in a different market and the
+# rebuilt state is wrong in ways nothing downstream can detect.
+ENGINE_VERSION = "arena-live-1"
+
+
 class HumanAgent(TradingAgent):
     """A person at a browser, as an ordinary participant.
 
@@ -172,6 +184,22 @@ class LiveMarket:
     # behaves exactly as it did, which is to say nothing ever expires.
     calendar: Any = None
     settlement_source: Any = None
+    # Where exogenous input is written so a restart can rebuild this market.
+    #
+    # Optional, and `None` by default, so every existing caller and every test
+    # behaves exactly as before. Nothing is journalled unless somebody asks for
+    # it, and asking is one field.
+    #
+    # Only *exogenous* input goes here, which is the whole reason this is cheap.
+    # Agent behaviour regenerates from the seed, because the kernel seeds each
+    # agent from `_stable_seed(seed, "agent", agent_id)` and its draws do not
+    # depend on join order. What the seed cannot regenerate is what came from
+    # outside: somebody taking a seat, and the orders they sent. Those are the
+    # six methods below and nothing else.
+    journal: Any = None
+    # Simulated seconds at the last clock record, so the heartbeat below stays
+    # coarse instead of writing one per browser frame.
+    _journalled_seconds: float = -1.0
     _wall_last: float = 0.0
     _sim_seconds: float = 0.0
     _running: bool = False
@@ -194,6 +222,7 @@ class LiveMarket:
         server hands out an opaque one. Two people with the same name get two
         accounts, because a name is not an identity.
         """
+        self._record("seat", {"name": name})
         index = len(self.traders)
         agent_id = AgentId(f"you-{index}")
         while agent_id in self.traders:
@@ -229,6 +258,19 @@ class LiveMarket:
         self._sim_seconds = 0.0
         self._running = True
 
+    def _record(self, kind: str, payload: dict[str, Any]) -> None:
+        """Write one exogenous input, stamped with the clock replay will use.
+
+        Simulated nanoseconds, not wall time. Replay advances the kernel to
+        this stamp and then applies the command, which is what makes the rebuilt
+        market the same market rather than a similar one: the wall clock a
+        session ran against is not reproducible and does not need to be, but
+        the simulated instant a command landed at is both.
+        """
+        if self.journal is None:
+            return
+        self.journal.append(kind, int(self._sim_seconds * 1_000_000_000), payload)
+
     def step(self) -> int:
         """Advance simulated time to match the wall clock. Returns events run.
 
@@ -248,6 +290,21 @@ class LiveMarket:
         delta = min(1.0, max(0.0, now - self._wall_last))
         self._wall_last = now
         self._sim_seconds += delta * self.speed
+        # A clock record, at most one per simulated second.
+        #
+        # Without it a journal records commands and not the passage of time, so
+        # a rebuild lands at the last command rather than where the session
+        # actually stopped. Measured on a session whose final input was at t=40
+        # and which then ran to t=45: every account's positions differed,
+        # because five seconds of agent activity had no record saying they
+        # happened. The commands were all there and the market was still wrong.
+        #
+        # One a second rather than one a step: `step` runs on the browser's
+        # frame clock, and a record per frame would be logging the wall clock
+        # rather than the market.
+        if self.journal is not None and self._sim_seconds - self._journalled_seconds >= 1.0:
+            self._journalled_seconds = self._sim_seconds
+            self._record("clock", {})
         target = Timestamp(int(self._sim_seconds * 1_000_000_000))
         # The contract calendar moves with simulated time, not wall time. Done
         # before the kernel runs so a contract whose window closes during this
@@ -335,6 +392,24 @@ class LiveMarket:
         offset expressed as a price would silently change size as the reference
         moved -- which is precisely the thing a peg exists to stop happening.
         """
+        self._record(
+            "submit",
+            {
+                "symbol": symbol,
+                "side": side,
+                "quantity": int(quantity),
+                # Prices go in as strings for the same reason they cross the
+                # wire as strings: a Decimal that becomes a float on the way to
+                # disk comes back as a different price.
+                "price": None if price is None else str(price),
+                "tif": tif,
+                "trader": None if trader is None else str(trader),
+                "stop": None if stop is None else str(stop),
+                "display": int(display),
+                "peg": None if peg is None else getattr(peg, "value", str(peg)),
+                "peg_offset": int(peg_offset),
+            },
+        )
         instrument = self.venue.registry.get(symbol)
         if instrument is None:
             return {"ok": False, "error": f"unknown symbol {symbol}"}
@@ -446,6 +521,14 @@ class LiveMarket:
         blotter it is reading already shows both; without one, the lookup falls
         back to a search and refuses if it is ambiguous.
         """
+        self._record(
+            "cancel",
+            {
+                "order_id": int(order_id),
+                "trader": None if trader is None else str(trader),
+                "symbol": symbol,
+            },
+        )
         who = self.trader(trader)
         if symbol is None:
             matches = [key for key in who.live_orders if key[1] == order_id]
@@ -502,6 +585,16 @@ class LiveMarket:
         never existed -- confirming that an id exists but belongs to another
         account tells a stranger something about that account.
         """
+        self._record(
+            "replace",
+            {
+                "order_id": int(order_id),
+                "quantity": int(quantity),
+                "price": None if price is None else str(price),
+                "trader": None if trader is None else str(trader),
+                "symbol": symbol,
+            },
+        )
         who = self.trader(trader)
         if symbol is None:
             matches = [key for key in who.live_orders if key[1] == order_id]
@@ -533,6 +626,7 @@ class LiveMarket:
 
     def cancel_all(self, trader: AgentId | None = None) -> dict[str, Any]:
         """Pull every working order. Distinct from flatten, which closes risk."""
+        self._record("cancel_all", {"trader": None if trader is None else str(trader)})
         who = self.trader(trader)
         for (symbol, order_id), _ in list(who.live_orders.items()):
             who.enqueue(SymbolCommand(symbol, Cancel(who.agent_id, order_id)))
@@ -540,6 +634,7 @@ class LiveMarket:
 
     def flatten(self, trader: AgentId | None = None) -> dict[str, Any]:
         """Close every position at market. The panic button."""
+        self._record("flatten", {"trader": None if trader is None else str(trader)})
         who = self.trader(trader)
         account = self.venue.account(who.agent_id)
         for symbol, position in sorted(account.positions.items()):
@@ -690,3 +785,116 @@ class LiveMarket:
             "counterparties": self.venue.counterparties_for(who.agent_id, limit=25),
             "conservation": str(self.venue.conservation_check()),
         }
+
+
+def apply_input(market: LiveMarket, record: Any) -> None:
+    """Re-apply one journalled input to a market built from the same seed.
+
+    The clock moves first. A record carries the simulated nanosecond its
+    command landed at, and the agents around it have to have run up to that
+    instant before it is applied, or the order meets a different book than the
+    one it originally met and the rebuild diverges from the first record on.
+
+    Raises on a kind it does not recognise, which :func:`journal.replay`
+    documents as this callback's job. Silently skipping an unknown record
+    would rebuild a market missing exactly those inputs and report success,
+    which is the failure mode a recovery path must not have.
+    """
+    seconds_in = record.timestamp_ns / 1_000_000_000
+    if seconds_in > market._sim_seconds:
+        market._sim_seconds = seconds_in
+        if market.calendar is not None:
+            market.calendar.advance_to(seconds_in)
+        market.kernel.advance(until=Timestamp(int(record.timestamp_ns)))
+        market.settle_due()
+
+    body = record.payload
+    kind = record.kind
+    if kind == "clock":
+        # The advance above was the whole of it. A heartbeat carries no
+        # command; it exists so that time itself is replayable.
+        return
+    if kind == "seat":
+        market.seat(body["name"])
+    elif kind == "submit":
+        market.submit(
+            body["symbol"],
+            body["side"],
+            int(body["quantity"]),
+            None if body["price"] is None else Decimal(body["price"]),
+            body.get("tif", ""),
+            body.get("trader"),
+            None if body.get("stop") is None else Decimal(body["stop"]),
+            int(body.get("display", 0)),
+            peg=body.get("peg"),
+            peg_offset=int(body.get("peg_offset", 0)),
+        )
+    elif kind == "cancel":
+        market.cancel(int(body["order_id"]), body.get("trader"), body.get("symbol"))
+    elif kind == "replace":
+        market.replace(
+            int(body["order_id"]),
+            int(body["quantity"]),
+            None if body["price"] is None else Decimal(body["price"]),
+            body.get("trader"),
+            body.get("symbol"),
+        )
+    elif kind == "cancel_all":
+        market.cancel_all(body.get("trader"))
+    elif kind == "flatten":
+        market.flatten(body.get("trader"))
+    else:
+        raise ValueError(f"journal holds an input this market cannot apply: {kind!r}")
+
+
+def rebuild(
+    market: LiveMarket,
+    source: Any,
+    *,
+    engine_version: str,
+    until_sim_seconds: float | None = None,
+    **kwargs: Any,
+):
+    """Replay a journal onto a market, without journalling it a second time.
+
+    ``until_sim_seconds`` runs the market on to a known stopping point after
+    the last record. The clock heartbeat makes this unnecessary for a session
+    driven through :meth:`step`, and it is here for one driven by hand.
+
+    Detaching the journal for the duration is not tidiness. `submit` and its
+    five siblings record what they are asked to do, so a replay that left the
+    journal attached would append every recovered input back onto the file it
+    was reading, and the next recovery would apply each of them twice.
+    """
+    from arena.sim.journal import replay as _replay
+
+    # The population has to exist before the first record lands. `on_start` is
+    # what schedules every agent's first wakeup, so a replay onto an unstarted
+    # kernel advances a market in which nobody trades: measured, the rebuilt
+    # marks came back at exactly the midpoint of every settlement range, which
+    # is the price of a book that has never printed.
+    #
+    # `kernel.start` rather than `market.start`, which would also reset the
+    # clock to zero and switch on wall-clock stepping. Idempotent, so a caller
+    # that has already started is not punished for it.
+    market.kernel.start()
+
+    attached, market.journal = market.journal, None
+    try:
+        outcome = _replay(
+            source,
+            lambda record: apply_input(market, record),
+            engine_version=engine_version,
+            **kwargs,
+        )
+        if until_sim_seconds is not None and until_sim_seconds > market._sim_seconds:
+            market._sim_seconds = until_sim_seconds
+            if market.calendar is not None:
+                market.calendar.advance_to(until_sim_seconds)
+            market.kernel.advance(
+                until=Timestamp(int(until_sim_seconds * 1_000_000_000))
+            )
+            market.settle_due()
+        return outcome
+    finally:
+        market.journal = attached
