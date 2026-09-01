@@ -614,6 +614,7 @@ def build(
     mechanism: str = "book",
     information_flow: bool = True,
     informed: int = 6,
+    netting: bool = False,
 ) -> LiveMarket:
     # The scoring rule prices a binary and nothing else, so choosing it
     # narrows the exchange to its event contracts. That is not a limitation
@@ -681,6 +682,7 @@ def build(
     venue = venue_class(
         "arena-lmsr" if scoring_rule else "arena",
         clock=calendar.now,
+        netting=netting,
         starting_cash=40_000_000,
         fees=fees,
         price_band=price_band,

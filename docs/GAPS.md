@@ -259,6 +259,68 @@ each item. Struck items link to what actually happened.
    1,874 + 1,859 + 1,875 + 1,869 = 7,477. `CROW_EQ` deliberately has no legs,
    so one share is arbitrage-linked and one is not.
 
+### Still open now, re-measured
+
+Every item above is struck through, so the list was carrying no information.
+These replace it. All six were measured this session and each names how.
+
+1. **There is no C++ kernel.** Zero `.cpp`, `.hpp` or `CMakeLists.txt` files in
+   the repository, against a stated stack of Python for research and C++ for
+   the exchange. `tests/test_differential.py` was built as its acceptance test
+   and has been hardened over roughly 1.2 million fuzzed commands, so the
+   specification exists and the work is the port. This is the largest single
+   item here and the one a reader will notice first.
+
+2. **No real data has been collected.** `data/raw` holds zero files. The
+   collector is written and needs an API key bound to a static IP, which is not
+   something the codebase can supply itself.
+
+3. **Nothing relists, and it is blocked on the item above rather than on
+   effort.** Contracts settle correctly now, so the market drains as they
+   expire: at the default 600 simulated seconds to the trading day, the
+   four-week window runs out after about 4.7 hours. Listing a new series needs
+   data for the new window, and the fixture spans 2026-06-17 to 2026-09-30
+   against a contract window ending 2026-09-28. Two days. Recycling the fixture
+   to keep the market populated would be fabricating evidence, which is the one
+   thing the no-hardcoding rule exists to forbid, so this waits for the
+   collector rather than being worked around.
+
+4. **The netting flag relaxes the gate without changing the bill.**
+   `Venue._portfolio_affords` runs as a fallback when the per-contract check
+   refuses an order and asks the netted question, but `Account.apply_fill` keys
+   collateral by symbol and always posts the gross figure for that one
+   contract. Measured on seed 7 over 300 simulated seconds with it on: the
+   fallback ran 2,535 times and admitted 1,301 orders the per-contract check
+   had refused, and total posted collateral rose from 321,704,201 to
+   341,327,876, because more positions were admitted and every one was still
+   charged in full. So the released-capital figures below describe `worst_case`
+   as a function, not anything this venue charges. Making the flag sound means
+   posting per netting group so the gate and the ledger answer the same
+   question, and that moves every capital number the project reports. Off by
+   default, documented at the flag, and pinned by two tests in
+   `test_netting.py`.
+
+5. **A working order reserves nothing, so affordability can go stale.** The
+   entry check is per symbol and considers positions only, so orders resting
+   across several books are each individually affordable until several of them
+   fill. Measured across four seeds at 300 simulated seconds: one of
+   twenty-four accounts underwater on two of the four, worst 8,358 on a 40
+   million account, which is 0.021 percent of its own capital, with
+   conservation exactly zero throughout. `test_no_account_is_over_committed`
+   asserts the invariant strictly and passes only because its fixture is short.
+   The fee the check was omitting is now counted; the remaining cause is the
+   absence of reservation, and closing it properly refuses orders that are
+   accepted today.
+
+6. **The option surface is too cheap in volatility.** Implied dispersion sits
+   at 0.155 of the remaining distance to settlement, so the maker ends short
+   calls and puts on the same strikes at its position limit. That is a
+   one-directional pricing error rather than a risk outcome, and the existing
+   `delta_limit` is structurally blind to it because a short straddle has
+   roughly zero delta. Blocked on the same two-clocks problem that once stopped
+   contracts expiring at all: the agent cannot compute a settlement horizon, so
+   it cannot scale a one-step forecast error by its square root.
+
 ## Netting, which is the part of a clearing house that matters here
 
 A CCP does two things. It novates -- becoming buyer to every seller so nobody

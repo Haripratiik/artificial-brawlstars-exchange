@@ -460,3 +460,90 @@ def test_netting_frees_the_arbitrageur_when_collateral_binds():
         f"netting left the arbitrageur starved {starved[True]} times against "
         f"{starved[False]} charged gross, so it bought nothing where capital binds"
     )
+
+
+# --------------------------------------------------------------------------
+# What the venue actually charges, which is not what the arithmetic above says
+# --------------------------------------------------------------------------
+
+
+def test_the_venue_charges_gross_whatever_the_netting_flag_says():
+    """The flag relaxes the gate and does not change the bill.
+
+    Everything above measures `worst_case` as a function, and it is exact. This
+    measures what the exchange takes, which is a different question, and the
+    two currently disagree.
+
+    `Venue._portfolio_affords` runs only as a fallback when the per-contract
+    check refuses an order, and it asks the netted question. But
+    `Account.apply_fill` keys collateral by symbol and posts
+    `collateral_for_basis` for that one contract, so the charge is gross.
+
+    Measured on seed 7 over 300 simulated seconds with netting on: the fallback
+    ran 2,535 times and admitted 1,301 orders the per-contract check had
+    refused, and total posted collateral rose from 321,704,201 to 341,327,876,
+    because more positions were admitted and each was still charged in full.
+
+    Pinned rather than fixed. Making the flag sound means posting per netting
+    group, so the gate and the ledger answer the same question, and that
+    changes every capital figure this repository reports.
+    """
+    market = build(seed=7, netting=True)
+    market.kernel.start()
+    market.kernel.advance(until=seconds(60))
+
+    charged = 0
+    for account in market.venue.accounts.values():
+        for symbol, posted in account.collateral.items():
+            # Keyed by contract, never by underlying, which is what says the
+            # ledger has no notion of a group at all.
+            assert symbol in market.venue.registry.symbols
+            position = account.positions.get(symbol)
+            if position is None or not position.quantity:
+                continue
+            charged += 1
+            low, high = market.venue.bounds_in_minor(
+                market.venue.registry.require(symbol)
+            )
+            expected = account.collateral_for_basis(
+                position.quantity, position.cost_basis, (low, high)
+            )
+            assert int(posted) == int(expected), symbol
+
+    assert charged, "no account held a position, so nothing was measured"
+    assert market.venue.conservation_check() == 0
+
+
+def test_a_riskless_package_is_still_charged_for_by_the_venue():
+    """The conversion that nets to zero above is not free to hold here.
+
+    This is the gap stated as a number rather than as prose: the same holdings
+    that `netting_benefit` releases entirely are charged in full by the account
+    that holds them, because the account nets nothing.
+    """
+    listed = {i.symbol: i for i in instruments()}
+    rows = [
+        ("SPIKE_WR_FUT", 10, "4670"),
+        ("SPIKE_P4700", 10, "31"),
+        ("SPIKE_C4700", -10, "1"),
+    ]
+    gross, net = netting_benefit(_holdings(listed, *rows))
+    assert net == 0 and gross > 0
+
+    market = build(seed=7)
+    market.venue.open_account("packager", D(10_000_000))
+    account = market.venue.account("packager")
+    for symbol, quantity, price in rows:
+        instrument = listed[symbol]
+        low, high = market.venue.bounds_in_minor(
+            market.venue.registry.require(symbol)
+        )
+        account.apply_fill(
+            symbol,
+            quantity,
+            instrument.price_in_minor(instrument.to_ticks(D(price))),
+            (low, high),
+        )
+
+    posted = int(sum(account.collateral.values()))
+    assert posted > 0, "a package the arithmetic calls riskless is charged anyway"

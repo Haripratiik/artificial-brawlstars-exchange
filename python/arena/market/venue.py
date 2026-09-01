@@ -288,11 +288,30 @@ class Venue:
         self._internal = False
         # Whether collateral may be netted across contracts on one underlying.
         #
-        # Off by default so every published measurement keeps meaning what it
-        # meant. It is not a softening: the netted figure is the exact worst
-        # case of the portfolio over the whole range the metric can take, and a
-        # portfolio's worst case is never larger than the sum of its parts.
-        # What it stops is charging an account twice for a risk it holds once.
+        # Off by default, and the reason is stronger than caution: **as built,
+        # this flag only relaxes the gate and does not change what is charged**,
+        # so the two disagree.
+        #
+        # `_portfolio_affords` runs as a fallback when the per-contract check
+        # refuses an order, and it asks the netted question: can this account
+        # cover the worst case of the whole group. But `Account.apply_fill`
+        # keys collateral by *symbol* and always posts
+        # `collateral_for_basis` for that one contract, so what the ledger
+        # takes is gross whatever this flag says.
+        #
+        # Measured on seed 7 over 300 simulated seconds with it on: the
+        # fallback ran 2,535 times and admitted 1,301 orders the per-contract
+        # check had refused, and total posted collateral went *up*, from
+        # 321,704,201 to 341,327,876, because more positions were admitted and
+        # every one of them was still charged in full. An order admitted on
+        # netted risk and then charged gross is exactly how an account ends up
+        # holding more than it can back.
+        #
+        # Making it sound means posting per netting group rather than per
+        # symbol, so the gate and the ledger answer the same question. Until
+        # then this stays off, and `netting.py`'s released-capital figures
+        # describe `worst_case` as a function rather than anything this venue
+        # charges.
         self.netting = netting
         # When each paused symbol may reopen.
         self._reopen_at: dict[str, int] = {}
@@ -792,10 +811,18 @@ class Venue:
         # checked here is the figure the fill will produce rather than a second
         # implementation of it.
         released = int(account.collateral.get(symbol, Money(0)))
+        # The fee the fill will cost, at the aggressor rate. A resting order
+        # may well earn the maker rebate instead, but which side of the trade
+        # this order ends up on is not knowable when it is accepted, and the
+        # check has to hold for the worse of the two.
+        buy_fee = int(self.fees.charge(abs(buys * int(worst_buy)), aggressor=True))
+        sell_fee = int(self.fees.charge(abs(sells * int(worst_sell)), aggressor=True))
         if self._survives(
-            account, position, buys, worst_buy, current + buys, released, bounds
+            account, position, buys, worst_buy, current + buys, released, bounds,
+            buy_fee,
         ) and self._survives(
-            account, position, -sells, worst_sell, current - sells, released, bounds
+            account, position, -sells, worst_sell, current - sells, released, bounds,
+            sell_fee,
         ):
             return True
         if not self.netting:
@@ -823,10 +850,11 @@ class Venue:
         resulting: int,
         released: int,
         bounds: tuple[Money, Money],
+        fee: int,
     ) -> bool:
         """Whether the account still covers itself after one scenario fills.
 
-        Two things move, and only one of them was being counted. The scenario
+        Three things move, and for a long time only two of them were counted. The scenario
         posts collateral against the position it creates -- that was counted --
         and it *realises* whatever the closing part of it made or lost, which
         comes straight out of cash the moment the fill books. Checking the
@@ -840,6 +868,21 @@ class Venue:
         104,130,530,000 of cash that became 66,309,630,000 the instant it
         filled -- free cash of **-190,370,000**. Nine of thirty random runs
         finished with some account underwater.
+
+        The third thing is the fee, and it was missing for the same reason the
+        realised figure once was: ``apply_fill`` does ``cash += realised -
+        fee``, so a fill approved at exactly zero free cash goes negative the
+        instant it books. Measured before this counted it, on a 300 second
+        run of the default market, ``fund-5`` finished holding 40,000,000 with
+        free cash of **-8,358**. Small, and the size is not the point: an
+        account whose posted collateral exceeds its cash is an account whose
+        collateral is not there, on a venue whose entire claim is that it is.
+
+        Charged at the aggressor rate. A resting order may earn the maker
+        rebate instead, and under ``MAKER_TAKER`` that rebate is negative, so
+        assuming it would make the check *less* conservative than the outcome.
+        Which side of the trade an order lands on is not knowable when it is
+        accepted, so the check takes the worse one.
 
         The realised figure is derived from ``basis_after`` rather than
         computed alongside it, and the derivation is an identity that holds in
@@ -855,7 +898,7 @@ class Venue:
         basis_now = int(position.cost_basis) if position is not None else 0
         realised = int(projected) - quantity * int(price) - basis_now
         required = int(account.collateral_for_basis(resulting, projected, bounds))
-        return int(account.free_cash) + released + realised >= required
+        return int(account.free_cash) + released + realised - fee >= required
 
     @staticmethod
     def _basis_after(position: Any, quantity: int, price: Money) -> Money:
