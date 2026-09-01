@@ -224,7 +224,7 @@ supplied its own clock.
 python -m pytest -q -p no:warnings
 ```
 
-1,416 tests across 42 files. **The full suite takes roughly 20 to 40 minutes**,
+1,425 tests across 43 files. **The full suite takes roughly 20 to 40 minutes**,
 because many tests run real simulated markets. Run the file you touched first;
 run the whole thing before you commit, in the background, and wait for it.
 
